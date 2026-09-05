@@ -59,6 +59,13 @@ cd "$ROOT"
 AGENTS_DIR="$ROOT/.agents"
 PROMPTS_DIR="$ROOT/.opencode/prompts"
 WT_ROOT="${LOOM_WORKTREES:-$(dirname "$ROOT")/.loom-worktrees/$(basename "$ROOT")}"
+# A task under a fence profile holds paths the fence normally removes, so its
+# worktree lives under a SEPARATE root. Nothing that runs unprofiled — no
+# unprofiled role, and not the shared `_scout` mirror, which stays under
+# $WT_ROOT — is ever handed a directory that CONTAINS a profiled worktree.
+# Derived from $WT_ROOT so LOOM_WORKTREES stays the one knob, and deliberately
+# a sibling, not a child: "$WT_ROOT-profiled" is not under "$WT_ROOT/".
+WT_ROOT_PROFILED="${WT_ROOT}-profiled"
 TIER="${LOOM_TIER:-standard}"
 MAX_ATTEMPTS="${LOOM_MAX_ATTEMPTS:-3}"
 SKIP="${LOOM_SKIP:-}"
@@ -161,7 +168,17 @@ usable() { # usable <model-token>
   else [ -n "$(key_for_provider "$prov")" ] && have opencode; fi
 }
 
-candidates() { local m out=""; for m in $(models_for "$1"); do usable "$m" && out="$out $m"; done; echo "$out"; }
+# `set -f`: a chain is a space-separated list and $LOOM_MODELS_<role> is data,
+# so the split is deliberate and the globbing is not (same bracket as
+# profile_provider_guard). Runs in a subshell at every call site anyway.
+candidates() {
+  local m out=""
+  set -f
+  # shellcheck disable=SC2086  # deliberate word split; globbing is disabled
+  for m in $(models_for "$1"); do usable "$m" && out="$out $m"; done
+  set +f
+  echo "$out"
+}
 pick_model() {
   local c; c="$(candidates "$1")"
   [ -n "${c// /}" ] || die "no usable model for role '$1' at tier '$TIER' (skip='$SKIP') — set an API key or install claude/opencode"
@@ -253,13 +270,18 @@ $prompt" ) < /dev/null > "$log" 2>&1 || rc=$?
     # opencode's `external_directory` permission defaults to "ask", and a
     # headless run auto-REJECTS every ask — a `cd <subdir> && perl -pi …`
     # edit inside the worktree died on it (the parser reported the worktree
-    # parent). Allow it for the worktree root ONLY: every path under it is a
-    # fenced agent worktree, so this does not widen the read-fence; the main
-    # checkout stays "ask" (= rejected). A caller-provided OPENCODE_PERMISSION
-    # wins untouched.
+    # parent). This used to be granted for the whole worktree ROOT, which with
+    # fence profiles is too much: another task's worktree under the same root
+    # may hold paths a profile released to a provider THIS run is not allowed
+    # to be. The grant is now THIS role's own resolved workdir and nothing
+    # else; a profiled worktree lives under a different root entirely
+    # ($WT_ROOT_PROFILED), so it is not even a sibling of an unprofiled one.
+    # If a live opencode ever rejects an in-worktree edit again, see
+    # docs/KNOWN-GAPS.md § 4 for the exact symptom. A caller-provided
+    # OPENCODE_PERMISSION wins untouched.
     local perm="${OPENCODE_PERMISSION:-}"
     if [ -z "$perm" ]; then
-      perm="$(printf '{"external_directory":{"%s/*":"allow","%s/**":"allow"}}' "$WT_ROOT" "$WT_ROOT")"
+      perm="$(printf '{"external_directory":{"%s/*":"allow","%s/**":"allow"}}' "$wd" "$wd")"
     fi
     ( cd "$wd" && OPENCODE_PERMISSION="$perm" opencode run --agent "$role" --model "$model" "$prompt" ) \
       < /dev/null > "$log" 2>&1 || rc=$?
@@ -268,19 +290,34 @@ $prompt" ) < /dev/null > "$log" 2>&1 || rc=$?
   return $rc
 }
 
+# 0 = this workdir is one of `aw`'s own task worktrees (either root).
+in_task_worktree() { # in_task_worktree <dir>
+  [ "${1#"$WT_ROOT"/}" != "$1" ] || [ "${1#"$WT_ROOT_PROFILED"/}" != "$1" ]
+}
+
 run_role() { # run_role <role> <workdir> <prompt> [<logfile>]
   local role="$1" wd="$2" prompt="$3"
   local log="${4:-$(mktemp "${TMPDIR:-/tmp}/aw-$role.XXXXXX")}"
   local m tried=""
-  # Defence in depth. Every caller already reconciles, but this is the last
-  # line before a model is pointed at a directory: any workdir under $WT_ROOT
-  # is checked against the tree once more, and the chain of THIS role against
-  # the profile the operator asserted.
-  if [ "${wd#"$WT_ROOT"/}" != "$wd" ]; then
-    fence_reconcile "$wd" "$FENCE_PROFILE"
-    profile_provider_guard "$role"
-  fi
-  for m in $(candidates "$role"); do
+  local -a chain=()
+  # A chain is a space-separated list, and $LOOM_MODELS_<role> is operator
+  # data: expand it with globbing OFF, into an array, once.
+  set -f
+  # shellcheck disable=SC2086  # deliberate word split; globbing is disabled
+  for m in $(candidates "$role"); do chain+=("$m"); done
+  set +f
+  for m in ${chain[0]+"${chain[@]}"}; do
+    # Defence in depth, and it runs PER ATTEMPT, not once. Attempt 1 can widen
+    # the tree it was handed — `git sparse-checkout disable` costs one command —
+    # and then hit a rate limit; attempt 2 would otherwise inherit that tree on
+    # a different provider. Measured in round 2: GLM relaxed the sparse checkout
+    # and returned 429, and DeepSeek saw core/. So: any workdir under either
+    # worktree root is re-checked against the tree, and the chain of THIS role
+    # against the profile the operator asserted, before every single launch.
+    if in_task_worktree "$wd"; then
+      fence_reconcile "$wd" "$FENCE_PROFILE"
+      profile_provider_guard "$role"
+    fi
     tried="yes"
     echo "aw: [$role] running on $m (tier $TIER)"
     if run_headless "$role" "$m" "$wd" "$prompt" "$log"; then
@@ -884,7 +921,49 @@ cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
 }
 
 # ----------------------------------------------------------------- worktrees
-wt_path()   { echo "$WT_ROOT/$1"; }
+# Profiled tasks live under $WT_ROOT_PROFILED, unprofiled ones under $WT_ROOT,
+# and the two roots are siblings (see the definition at the top of the file).
+# Which root a command means follows the profile the OPERATOR asserted on that
+# command line — never a record.
+wt_path() { # wt_path <task>
+  local task="$1"
+  if [ -n "${FLAG_PROFILE}${FENCE_PROFILE}" ]; then echo "$WT_ROOT_PROFILED/$task"; return 0; fi
+  # No flag on this command line. Prefer an existing PROFILED worktree so that
+  # a command given without the flag still finds the task and dies with the
+  # actual reason (require_fence_flag's rule 1), not "no worktree for <task>".
+  if [ ! -d "$WT_ROOT/$task" ] && [ -d "$WT_ROOT_PROFILED/$task" ]; then
+    echo "$WT_ROOT_PROFILED/$task"; return 0
+  fi
+  echo "$WT_ROOT/$task"
+}
+
+# The root this command did NOT choose. A worktree sitting there means the task
+# exists under the other kind of fence, which is never something to reconcile.
+wt_path_other() { # wt_path_other <task>
+  local task="$1" wt; wt="$(wt_path "$task")"
+  case "$wt" in
+    "$WT_ROOT_PROFILED"/*) echo "$WT_ROOT/$task" ;;
+    *)                     echo "$WT_ROOT_PROFILED/$task" ;;
+  esac
+}
+
+refuse_cross_root() { # refuse_cross_root <task>
+  local task="$1" other; other="$(wt_path_other "$task")"
+  [ -d "$other" ] || return 0
+  die "task $task already has a worktree at $other, built under a different fence
+setting than this command asserts. A profile cannot be introduced after 'aw new',
+and it cannot be dropped from a task either. Start clean:
+  aw drop $task && aw new $task${FLAG_PROFILE:+ --fence-profile $FLAG_PROFILE}"
+}
+
+# The worktree for a task that must already have one. Prints its path.
+require_worktree() { # require_worktree <task>
+  local task="$1" wt
+  wt="$(wt_path "$task")"
+  [ -d "$wt" ] || { refuse_cross_root "$task"; die "no worktree for $task"; }
+  echo "$wt"
+}
+
 branch_of() { echo "agent/$1"; }
 base_of()   { git config "branch.$(branch_of "$1").loombase" 2>/dev/null || git rev-parse HEAD; }
 
@@ -1347,7 +1426,9 @@ cmd_ls() {
     [ -n "$br" ] && prof="$(git config "branch.$br.fenceprofile" 2>/dev/null || true)"
     if [ -n "$prof" ]; then printf '%s  fence-profile:%s\n' "$line" "$prof"
     else                    printf '%s\n' "$line"; fi
-  done < <(git worktree list | grep -F "$WT_ROOT" || true)
+    # Both roots: a profiled worktree is a sibling of the unprofiled root, not
+    # a child of it, so one -F pattern would miss half the list.
+  done < <(git worktree list | grep -F -e "$WT_ROOT/" -e "$WT_ROOT_PROFILED/" || true)
   [ -n "$found" ] || echo "(no agent worktrees)"
 }
 
@@ -1377,7 +1458,11 @@ file outside .agents/."
 
 # Scout normally reads your working tree directly. With a fence configured it
 # must not, so it gets a persistent detached mirror at $WT_ROOT/_scout with the
-# fenced paths removed, reset to the current HEAD on every call (cheap).
+# fenced paths removed, reset to the current HEAD on every call (cheap). It
+# stays under the UNPROFILED root on purpose: the mirror is shared by every
+# task and always carries the full fence, and nothing that runs against it —
+# including opencode, whose external_directory grant is this workdir — may be
+# given a directory that contains a profiled worktree.
 scout_root() {
   local wt="$WT_ROOT/_scout" head
   has_fence || { echo "$ROOT"; return 0; }
@@ -1517,10 +1602,16 @@ cmd_doctor() {
         pass "fence profile '$pname': releases ${prel//,/ } to providers ${pprov//,/ }"
         for role in implementer reviewer; do
           bad=""
+          # Same `set -f` bracket as profile_provider_guard and candidates: a
+          # chain is a space-separated list, and $LOOM_MODELS_<role> is data
+          # that must not glob against $ROOT.
+          set -f
+          # shellcheck disable=SC2086  # deliberate word split; globbing is off
           for m in $(models_for "$role"); do
             mp="$(provider_of "$m")"
             case ",$pprov," in *",$mp,"*) ;; *) bad="$bad $m" ;; esac
           done
+          set +f
           [ -n "$bad" ] && note "fence profile '$pname': the $role chain at tier $TIER reaches providers this profile does not allow:$bad — a task on this profile needs LOOM_MODELS_$role"
         done
       done < <(zones_py profiles 2>/dev/null || true)
