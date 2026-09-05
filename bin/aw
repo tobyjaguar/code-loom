@@ -30,6 +30,8 @@
 #   LOOM_MAX_ATTEMPTS=3            implementer gate retries
 #   LOOM_LOOP_ROUNDS=2             review rounds in `aw loop`
 #   LOOM_MODELS_<role>="m1 m2"     replace one role's chain outright
+#   LOOM_CLAUDE_ALLOWED_TOOLS=...  what an implementer on claude-sub may run
+#                                  in a shell (default: the gate script only)
 #   LOOM_WORKTREES=/path           where worktrees live
 #   LOOM_LAND=merge|pr             land by merging here, or by pushing a branch
 #                                  for review (--pr / --merge win over this)
@@ -125,6 +127,11 @@ key_for_provider() {
 
 provider_of() { case "$1" in claude-sub) echo "claude" ;; codex-sub) echo "codex" ;; *) echo "${1%%/*}" ;; esac; }
 
+# Roles that EDIT their working directory. `build` runs under your eye in your
+# own tree; `implementer` (which `aw loop`'s auto-fix rounds also go through)
+# owns one worktree. Everything else — reviewer, scout, architect — reads.
+writes_role() { case "$1" in implementer|build) return 0 ;; *) return 1 ;; esac; }
+
 skipped() { # skipped <provider>
   local p
   for p in $SKIP; do
@@ -163,21 +170,48 @@ looks_rate_limited() { # looks_rate_limited <logfile>
 # /dev/null guarantees EOF for both legs.
 run_headless() { # run_headless <role> <model> <workdir> <prompt> <logfile>
   local role="$1" model="$2" wd="$3" prompt="$4" log="$5" rc=0 last=""
+  # The edit permission is granted per ROLE, never per model: a reviewer keeps
+  # the read-only sandbox on every provider, an implementer-class role gets one
+  # that can write, confined to $wd. Measured, not assumed: `claude -p` with no
+  # mode flag denies every permission prompt (nobody is there to answer) and
+  # writes nothing — "I need permission to write these files"; `acceptEdits`
+  # pre-approves the edits and the gate run. `codex exec` already runs with
+  # approval policy "never", so the sandbox flag is the whole story there:
+  # read-only refuses the patch, workspace-write applies it.
+  local -a claude_flags=(-p)
+  local -a cflags=(--sandbox read-only)
+  if writes_role "$role"; then
+    claude_flags+=(--permission-mode acceptEdits)
+    # acceptEdits pre-approves file edits, but a Bash call still asks — and a
+    # `-p` run has nobody to answer, so it is denied. Measured: the implementer
+    # wrote its files and then reported "every attempt to run the gate script
+    # was denied by the session's permission mode". The gate is the one command
+    # the implementer protocol requires, so it is allowlisted by name; widen
+    # deliberately with LOOM_CLAUDE_ALLOWED_TOOLS (same syntax as
+    # `claude --allowedTools`) if a repo's implementer needs more shell.
+    claude_flags+=(--allowedTools "${LOOM_CLAUDE_ALLOWED_TOOLS:-Bash(./.agents/gate.sh),Bash(./.agents/gate.sh:*),Bash(bash ./.agents/gate.sh:*),Bash(.agents/gate.sh:*)}")
+    cflags=(--sandbox workspace-write)
+    # codex's workspace-write sandbox keeps the workspace's dot-directories
+    # read-only, so without this the implementer cannot write its done/blocked
+    # notes — measured: "Could not write `.agents/reviews/<task>-done.md`
+    # because `.agents` is read-only in this workspace". The writable roots
+    # stay inside the worktree either way.
+    [ -d "$wd/.agents" ] && cflags+=(--add-dir "$wd/.agents")
+  fi
   if [ "$model" = claude-sub ]; then
-    ( cd "$wd" && claude -p \
+    ( cd "$wd" && claude "${claude_flags[@]}" \
         --append-system-prompt "$(cat "$PROMPTS_DIR/$role.md")" \
         "$prompt" ) < /dev/null > "$log" 2>&1 || rc=$?
   elif [ "$model" = codex-sub ]; then
     # `codex exec` has no --append-system-prompt, so the role prompt is
-    # prepended to the message instead. read-only sandbox: a reviewer reads a
-    # diff, it never writes. --skip-git-repo-check because a worktree parked
+    # prepended to the message instead. --skip-git-repo-check because a worktree parked
     # under $WT_ROOT can read as "outside a repository"; harmless in one.
     # The transcript is banner + answer + "tokens used", but cmd_check copies
     # the log verbatim into the review file, so the final message goes to a
     # sidecar and replaces the log on success. A failed run keeps the
     # transcript: looks_rate_limited reads it.
     last="$(mktemp "${TMPDIR:-/tmp}/aw-codex.XXXXXX")"
-    ( cd "$wd" && codex exec --sandbox read-only --skip-git-repo-check \
+    ( cd "$wd" && codex exec "${cflags[@]}" --skip-git-repo-check \
         --output-last-message "$last" \
         "$(cat "$PROMPTS_DIR/$role.md")
 
