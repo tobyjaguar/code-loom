@@ -67,7 +67,7 @@ own. That is not worth plugging: the entire hook is dominated by `git commit
 
 ## 2. `loom plan` runs the architect unfenced, in your own tree
 
-**Where.** `bin/loom:2588`, in `cmd_plan` (`bin/loom:2569`):
+**Where.** `bin/loom:2593`, in `cmd_plan` (`bin/loom:2574`):
 `run_role architect "$ROOT" "$prompt"` (and the
 interactive leg, `claude --append-system-prompt … "$prompt"`, likewise in
 `$ROOT`). The architect's chain at every tier ends in cheap third-party
