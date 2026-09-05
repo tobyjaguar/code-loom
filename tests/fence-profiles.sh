@@ -77,6 +77,11 @@ JSON
 export AW_TEST_TMP="$TMP"
 export PATH="$TMP/stubs:$PATH"
 export LOOM_WORKTREES="$TMP/wt"
+# Two roots, because a profiled task's worktree holds released paths and must
+# not sit inside the directory an unprofiled run (or the scout mirror) is
+# pointed at. $WTP is a SIBLING of $WTU, never a child.
+WTU="$TMP/wt"                 # unprofiled worktree root  (= $LOOM_WORKTREES)
+WTP="$TMP/wt-profiled"        # profiled worktree root
 export LOOM_ENV="$TMP/empty.env"          # never source the developer's real keys
 export CODEX_HOME="$TMP/codex"
 export XDG_CACHE_HOME="$TMP/cache"
@@ -144,10 +149,10 @@ echo "fence profiles"
 # --- (a) no profile: everything fenced, guard blocks a fenced/hand path -----
 out="$("$AW" new 0001-a 2>&1)"; rc=$?
 want_eq   "(a) aw new without a profile succeeds"      "$rc" "0"
-want_absent "(a) core/ is fenced out"                  "$TMP/wt/0001-a/core/lib.rs"
-want_absent "(a) ios/ is fenced out"                   "$TMP/wt/0001-a/ios/App.swift"
-want_absent "(a) docs/audits/ is fenced out"           "$TMP/wt/0001-a/docs/audits/a.md"
-want_file   "(a) the working surface is present"       "$TMP/wt/0001-a/backend/main.go"
+want_absent "(a) core/ is fenced out"                  "$WTU/0001-a/core/lib.rs"
+want_absent "(a) ios/ is fenced out"                   "$WTU/0001-a/ios/App.swift"
+want_absent "(a) docs/audits/ is fenced out"           "$WTU/0001-a/docs/audits/a.md"
+want_file   "(a) the working surface is present"       "$WTU/0001-a/backend/main.go"
 
 git checkout -q -b agent/guard-a
 echo "// touched" >> core/lib.rs
@@ -159,17 +164,19 @@ git reset -q --hard
 git checkout -q master 2>/dev/null || git checkout -q main
 
 # --- (b) a profile with a chain that reaches a disallowed provider ---------
-# shellcheck disable=SC2012  # the worktree names here are task ids we chose
-before="$(ls "$TMP/wt" 2>/dev/null | tr '\n' ' ')"
+roots_listing() { # every task worktree under BOTH roots, one line
+  # shellcheck disable=SC2012  # the worktree names here are task ids we chose
+  { ls "$WTU" 2>/dev/null; ls "$WTP" 2>/dev/null; } | sort | tr '\n' ' '
+}
+before="$(roots_listing)"
 out="$(LOOM_MODELS_implementer="deepseek/deepseek-v4-pro" LOOM_MODELS_reviewer="codex-sub" \
        "$AW" new 0002-b --fence-profile codex 2>&1)"; rc=$?
 want_eq  "(b) dies on a disallowed implementer chain"  "$rc" "1"
 want_in  "(b) the message names the role"              "$out" "implementer chain"
 want_in  "(b) the message names the model"             "$out" "deepseek/deepseek-v4-pro"
 want_in  "(b) the message names the override"          "$out" "LOOM_MODELS_implementer"
-want_absent "(b) no worktree was created"              "$TMP/wt/0002-b"
-# shellcheck disable=SC2012  # the worktree names here are task ids we chose
-want_eq  "(b) nothing else appeared under the worktree root" "$(ls "$TMP/wt" 2>/dev/null | tr '\n' ' ')" "$before"
+want_absent "(b) no worktree was created"              "$WTP/0002-b"
+want_eq  "(b) nothing else appeared under EITHER worktree root" "$(roots_listing)" "$before"
 # ... and the same for the reviewer chain. A DIFFERENT task id on purpose: a
 # second `aw new 0002-b` would die on "worktree already exists" if the first
 # leg ever stopped dying, and the assertion would pass for the wrong reason.
@@ -177,15 +184,15 @@ out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MODELS_reviewer="zai-coding-pla
        "$AW" new 0007-h --fence-profile codex 2>&1)"; rc=$?
 want_eq  "(b) dies on a disallowed reviewer chain"     "$rc" "1"
 want_in  "(b) the message names the reviewer role"     "$out" "reviewer chain"
-want_absent "(b) no worktree for the reviewer leg either" "$TMP/wt/0007-h"
+want_absent "(b) no worktree for the reviewer leg either" "$WTP/0007-h"
 
 # --- (c) a profile with allowed chains: released paths are present ---------
 out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MODELS_reviewer="codex-sub" \
        "$AW" new 0003-c --fence-profile codex 2>&1)"; rc=$?
 want_eq   "(c) aw new under the profile succeeds"      "$rc" "0"
-want_file "(c) core/ is released into the worktree"    "$TMP/wt/0003-c/core/lib.rs"
-want_file "(c) docs/audits/ is released"               "$TMP/wt/0003-c/docs/audits/a.md"
-want_absent "(c) ios/ is still fenced"                 "$TMP/wt/0003-c/ios/App.swift"
+want_file "(c) core/ is released into the worktree"    "$WTP/0003-c/core/lib.rs"
+want_file "(c) docs/audits/ is released"               "$WTP/0003-c/docs/audits/a.md"
+want_absent "(c) ios/ is still fenced"                 "$WTP/0003-c/ios/App.swift"
 want_eq   "(c) the profile is recorded on the branch"  \
           "$(git config branch.agent/0003-c.fenceprofile)" "codex"
 out="$("$AW" ls 2>&1)"
@@ -241,7 +248,7 @@ want_in "(c2) ... and it says why"                           "$out" "cannot be i
 
 # --- (d) the guard under a profile, IN the agent's own worktree ------------
 # The guard is a pre-commit hook: it runs where the agent commits.
-GW="$TMP/wt/0003-c"
+GW="$WTP/0003-c"
 echo "// touched again" >> "$GW/core/lib.rs"
 git -C "$GW" add core/lib.rs
 out="$(cd "$GW" && "$AW" guard 2>&1)"; rc=$?
@@ -267,7 +274,8 @@ rm -f "$GW/ios/App.swift"
 out="$("$AW" new 0004-e --fence-profile nope 2>&1)"; rc=$?
 want_eq "(e) an unknown profile dies"                     "$rc" "1"
 want_in "(e) the message says which are defined"          "$out" "unknown fence profile 'nope'"
-want_absent "(e) no worktree was created"                 "$TMP/wt/0004-e"
+want_absent "(e) no worktree was created"                 "$WTU/0004-e"
+want_absent "(e) ... under either root"                   "$WTP/0004-e"
 
 # --- (f) the task file declares, the FLAG consents -------------------------
 out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MODELS_reviewer="codex-sub" \
@@ -275,8 +283,8 @@ out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MODELS_reviewer="codex-sub" \
 want_eq   "(f) declaration + matching flag opts in"       "$rc" "0"
 want_eq   "(f) it is recorded on the branch"              \
           "$(git config branch.agent/0005-f.fenceprofile)" "codex"
-want_file "(f) the released path is present"              "$TMP/wt/0005-f/core/lib.rs"
-want_absent "(f) the unreleased fenced path is not"       "$TMP/wt/0005-f/ios/App.swift"
+want_file "(f) the released path is present"              "$WTP/0005-f/core/lib.rs"
+want_absent "(f) the unreleased fenced path is not"       "$WTP/0005-f/ios/App.swift"
 # The same task, with a disallowed chain, must still die.
 out="$(LOOM_MODELS_implementer="deepseek/deepseek-v4-pro" "$AW" check 0005-f --fence-profile codex 2>&1)"; rc=$?
 want_eq "(f) a later command re-checks the chain"         "$rc" "1"
@@ -287,7 +295,7 @@ want_eq "(f) a later command re-checks the chain"         "$rc" "1"
 printf 'Fence-profile: codex\n' >> .agents/tasks/0001-a.md
 out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0001-a 2>&1)"; rc=$?
 want_eq "(g) a task file edited after aw new changes nothing" "$rc" "0"
-want_absent "(g) and releases nothing into the worktree"      "$TMP/wt/0001-a/core/lib.rs"
+want_absent "(g) and releases nothing into the worktree"      "$WTU/0001-a/core/lib.rs"
 git checkout -q -- .agents/tasks/0001-a.md
 
 # --- (h) fail-closed parsing ----------------------------------------------
@@ -317,19 +325,30 @@ out="$(AW_FENCE_PROFILE=codex "$AW" zone core/lib.rs 2>&1)"; rc=$?
 want_eq "(i) the environment cannot activate a profile"   "$rc" "0"
 want_in "(i) core/ is still reported as fenced"           "$out" "fenced"
 
-# --- (k) the record is REMOVED: the tree still decides --------------------
+# --- (k) the record is REMOVED: rule 3 is ABSOLUTE, there is no escape -----
+# There used to be one: a worktree holding exactly what the flag releases was
+# read as corroboration, the record was restored and the command ran. A
+# worktree is a directory the agent can write (`git sparse-checkout disable`),
+# so that corroborated nothing. Restoring a lost record is now an operator act.
 out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MODELS_reviewer="codex-sub" \
        "$AW" new 0008-k --fence-profile codex 2>&1)"; rc=$?
 want_eq   "(k) setup: a profiled worktree exists"         "$rc" "0"
-want_file "(k) setup: it holds the released path"         "$TMP/wt/0008-k/core/lib.rs"
+want_file "(k) setup: it holds the released path"         "$WTP/0008-k/core/lib.rs"
 git config --unset branch.agent/0008-k.fenceprofile
 out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0008-k 2>&1)"; rc=$?
 want_eq "(k) without the flag, a released tree is refused"   "$rc" "1"
 want_in "(k) ... naming the paths it found on disk"          "$out" "core/lib.rs"
 want_not_in "(k) ... and no reviewer was launched"           "$out" "running on"
 out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0008-k --fence-profile codex 2>&1)"; rc=$?
-want_eq "(k) with the flag, the tree corroborates and it runs" "$rc" "0"
-want_in "(k) ... loudly, because the record was gone"         "$out" "Restoring it from your flag"
+want_eq "(k) with the flag and no record it STILL dies"       "$rc" "1"
+want_in "(k) ... the tree is not evidence"                    "$out" "is not evidence"
+want_not_in "(k) ... nothing is restored on the operator's behalf" "$out" "Restoring it"
+want_not_in "(k) ... and no reviewer was launched"            "$out" "running on"
+want_eq "(k) ... the record is still absent"                  \
+        "$(git config branch.agent/0008-k.fenceprofile 2>/dev/null || true)" ""
+want_in "(k) ... and it says how to restore it BY HAND"       "$out" \
+        "git config branch.agent/0008-k.fenceprofile codex"
+want_in "(k) ... or start clean"                              "$out" "aw drop 0008-k"
 
 # --- (l) the record is SWAPPED to another legitimate profile --------------
 out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MODELS_reviewer="codex-sub" \
@@ -346,31 +365,34 @@ want_in "(l) ... and says so"                             "$out" "contradicts th
 # --- (m) an agent writes the branch record from inside its worktree -------
 out="$("$AW" new 0010-m 2>&1)"; rc=$?
 want_eq   "(m) setup: an UNPROFILED worktree"             "$rc" "0"
-want_absent "(m) setup: core/ is fenced out of it"        "$TMP/wt/0010-m/core/lib.rs"
-git -C "$TMP/wt/0010-m" config branch.agent/0010-m.fenceprofile codex   # the agent forges it
+want_absent "(m) setup: core/ is fenced out of it"        "$WTU/0010-m/core/lib.rs"
+git -C "$WTU/0010-m" config branch.agent/0010-m.fenceprofile codex   # the agent forges it
 out="$("$AW" run 0010-m 2>&1)"; rc=$?
 want_eq "(m) a forged record cannot authorise: no flag, no run" "$rc" "1"
 want_in "(m) ... it can only refuse"                      "$out" "--fence-profile codex"
 out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MODELS_reviewer="codex-sub" \
        "$AW" run 0010-m --fence-profile codex 2>&1)"; rc=$?
 want_eq "(m) and the flag cannot introduce a profile either"   "$rc" "1"
-want_in "(m) ... because the tree was not built under it"      "$out" "holds none of the paths"
-want_absent "(m) nothing was released into the worktree"       "$TMP/wt/0010-m/core/lib.rs"
+want_in "(m) ... the task already exists under the OTHER root" "$out" "already has a worktree at"
+want_in "(m) ... and says why that is refused"                 "$out" "cannot be introduced after"
+want_absent "(m) nothing was released into the worktree"       "$WTU/0010-m/core/lib.rs"
+want_absent "(m) and no profiled worktree was built for it"    "$WTP/0010-m"
 
 # --- (n) a task-file declaration alone is not consent ---------------------
 out="$("$AW" new 0011-n 2>&1)"; rc=$?
 want_eq "(n) a 'Fence-profile:' line without the flag dies"    "$rc" "1"
 want_in "(n) ... asking for confirmation on the command line"  "$out" "aw new 0011-n --fence-profile codex"
-want_absent "(n) and no worktree was created"                  "$TMP/wt/0011-n"
+want_absent "(n) and no worktree was created"                  "$WTU/0011-n"
+want_absent "(n) ... under either root"                        "$WTP/0011-n"
 out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MODELS_reviewer="codex-sub" \
        "$AW" new 0011-n --fence-profile codex 2>&1)"; rc=$?
 want_eq   "(n) the same line WITH the matching flag is fine"   "$rc" "0"
-want_file "(n) ... and releases the path"                      "$TMP/wt/0011-n/core/lib.rs"
+want_file "(n) ... and releases the path"                      "$WTP/0011-n/core/lib.rs"
 
 # --- (o) a Fence-profile line inside a code fence is not a declaration ----
 out="$("$AW" new 0012-o 2>&1)"; rc=$?
 want_eq   "(o) a fenced-off code block is ignored"        "$rc" "0"
-want_absent "(o) ... nothing was released"                "$TMP/wt/0012-o/core/lib.rs"
+want_absent "(o) ... nothing was released"                "$WTU/0012-o/core/lib.rs"
 want_eq   "(o) ... and nothing was recorded"              \
           "$(git config branch.agent/0012-o.fenceprofile 2>/dev/null || true)" ""
 
@@ -379,8 +401,8 @@ out="$("$AW" new 0013-p 2>&1)"; rc=$?
 want_eq "(p) setup: a plain worktree"                     "$rc" "0"
 mkdir -p "$TMP/outside-agents/reviews"
 cp "$REPO/.agents/gate.sh" "$TMP/outside-agents/gate.sh"
-mv "$TMP/wt/0013-p/.agents" "$TMP/wt/0013-p/.agents-real"
-ln -s "$TMP/outside-agents" "$TMP/wt/0013-p/.agents"
+mv "$WTU/0013-p/.agents" "$WTU/0013-p/.agents-real"
+ln -s "$TMP/outside-agents" "$WTU/0013-p/.agents"
 codex_before="$(wc -l < "$TMP/called-codex.log" 2>/dev/null || echo 0)"
 out="$(LOOM_MODELS_implementer="codex-sub" LOOM_MAX_ATTEMPTS=1 "$AW" run 0013-p 2>&1)"; rc=$?
 want_eq "(p) a .agents that resolves outside the worktree dies" "$rc" "1"
@@ -435,7 +457,8 @@ restore_zones
 out="$("$AW" new 0004-e --fence-profile= 2>&1)"; rc=$?
 want_eq "(s) --fence-profile= dies"                       "$rc" "1"
 want_in "(s) ... naming the missing value"                "$out" "empty value"
-want_absent "(s) and creates nothing"                     "$TMP/wt/0004-e"
+want_absent "(s) and creates nothing"                     "$WTU/0004-e"
+want_absent "(s) ... under either root"                   "$WTP/0004-e"
 out="$("$AW" check 0003-c --fence-profile= 2>&1)"; rc=$?
 want_eq "(s) ... on every command"                        "$rc" "1"
 out="$("$AW" check 0003-c --fence-profile 2>&1)"; rc=$?
