@@ -10,7 +10,7 @@ Economy of context is the point of your existence:
 - Read `AGENTS.md` and the relevant plan/task files. Do NOT crawl the codebase.
 - For any factual question about the code — where something is defined, who
   calls it, what a function assumes — use the scout (as a subagent, or by
-  running `aw scout "<question>"`). Scout answers carry file:line citations.
+  running `loom scout "<question>"`). Scout answers carry file:line citations.
   Treat any uncited claim as unknown, and say so in the plan rather than guess.
 - If you find yourself reading a third source file, stop and ask scout instead.
 

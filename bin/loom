@@ -11,7 +11,7 @@
 #   aw run   0007-c                  run the implementer in that worktree
 #   aw check 0007-c                  cheap cross-provider review of the diff
 #   aw loop  0007-c                  run, review, feed REVISE back, review again
-#   aw diff  0007-c                  write + open the task diff read-only in $EDITOR
+#   aw diff  0007-c                  write the task diff, then show it (pager, or $LOOM_DIFF_CMD)
 #   aw land  0007-c                  gate, merge, clean up, tick the checkbox
 #   aw land  0007-c --pr             gate, push agent/0007-c, print PR next steps
 #   aw drop  0007-c [--keep-branch]  discard worktree (and branch, unless kept)
@@ -50,6 +50,10 @@
 #   LOOM_WORKTREES=/path           where worktrees live
 #   LOOM_LAND=merge|pr             land by merging here, or by pushing a branch
 #                                  for review (--pr / --merge win over this)
+#   LOOM_DIFF_CMD="delta"          how `aw diff` shows a patch; the patch path
+#                                  is appended. Default: git's own pager. Split
+#                                  on whitespace, no quoting — wrap a path with
+#                                  spaces in a one-line script.
 #   LOOM_ENV=<file>                provider keys, sourced if present
 #                                  (default ~/.config/loom/env)
 #
@@ -897,14 +901,23 @@ eff = [g for g in fence if g not in released]   # the fence this run applies
 def fence_sanity():
     """Fencing the contract layer would disable the very things that police
     the agent: no zones.toml in the worktree means every path resolves to
-    "assist" and `aw guard` exits 0, and no gate.sh means the gate exits 127
-    and burns every attempt. Refuse instead of silently disarming."""
-    for essential in (".agents/zones.toml", ".agents/gate.sh"):
+    "assist" and `aw guard` exits 0; no gate.sh means the gate exits 127
+    and burns every attempt; no .agents/reviews/ means the gate log the
+    dispatcher writes there sits outside the sparse-checkout definition, so
+    `git add -A` fails after a green gate and nothing is committed. Refuse
+    instead of silently disarming. The directory is checked by probing a
+    file the dispatcher will create in it, so `dir/*` patterns count too."""
+    essentials = (
+        (".agents/zones.toml", ".agents/zones.toml", "which disables the zone guard"),
+        (".agents/gate.sh",    ".agents/gate.sh",    "which disables the gate"),
+        (".agents/reviews/",   ".agents/reviews/0000-x-gate.log",
+         "which the dispatcher writes the gate log, patch and review into"),
+    )
+    for shown, probe, why in essentials:
         for g in fence:
-            if hit(essential, g):
+            if hit(probe, g):
                 die("fence pattern '%s' would remove %s from agent worktrees, "
-                    "which disables the zone guard and the gate — narrow the pattern"
-                    % (g, essential))
+                    "%s — narrow the pattern" % (g, shown, why))
 
 def zone_of(path):
     for zone in ("hand", "assist", "auto"):
@@ -1581,7 +1594,21 @@ cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
   fi
 }
 
+# The pre-commit hook git actually runs: honours core.hooksPath and, from
+# inside a linked worktree, resolves to the shared common dir. May be
+# relative — fine, aw cd's to $ROOT at startup and never leaves it.
+hook_path() { git rev-parse --git-path hooks/pre-commit; }
+
 # ----------------------------------------------------------------- worktrees
+# git cannot track an empty directory, so .agents/reviews/ is absent from a
+# fresh worktree unless the repo happens to keep a .gitkeep in it. Every write
+# into it (gate log, patch, review) would then fail on the redirect — which
+# `aw run` reads as a red gate and burns all its attempts on. Create it.
+#
+# It is also where `aw check` and `aw diff` put the review patch, which is why
+# wt_dirty excludes it and why a consuming repo should gitignore it.
+reviews_dir() { mkdir -p "$1/.agents/reviews"; }
+
 # Profiled tasks live under $WT_ROOT_PROFILED, unprofiled ones under $WT_ROOT,
 # and the two roots are siblings (see the definition at the top of the file).
 # Which root a command means follows the profile the OPERATOR asserted on that
@@ -2030,6 +2057,7 @@ cmd_run() {
   # operator asserted do not line up. The tree cannot authorise anything; it
   # can only contradict the flag, and a contradiction is a dead stop.
   fence_reconcile "$wt" "$FENCE_PROFILE"
+  reviews_dir "$wt"          # the implementer writes -done/-blocked there on attempt 1
   title="$(head -1 "$AGENTS_DIR/tasks/$task.md" | sed 's/^#[[:space:]]*//')"
   load_fence; fnote="$(fence_note)"; pnote="$(profile_note)"
 
@@ -2052,7 +2080,12 @@ fix failures until it exits 0. Write brief notes on what you did to \
     # the one whose verdict `aw` acts on.
     if ( cd "$wt" && "$STATE_MAIN_ROOT/.agents/gate.sh" > "$wt/.agents/reviews/$task-gate.log" 2>&1 ); then
       echo "aw: gate green"
-      ( cd "$wt" && git add -A && git commit -q -m "agent($task): $title" )
+      # Checked explicitly: from `aw loop` this function runs under `|| rc=$?`,
+      # which switches set -e off, and a failed add/commit (sparse-checkout
+      # refusal, a hook, nothing to commit) would otherwise print "committed"
+      # over an unchanged branch.
+      ( cd "$wt" && git add -A && git commit -q -m "agent($task): $title" ) \
+        || die "commit failed in $wt (nothing to commit, or git refused) — nothing landed on $br"
       echo "aw: committed on $br — review with: aw check $task && aw diff $task"
       return 0
     fi
@@ -2088,7 +2121,7 @@ cmd_check() {
   # One base, one endpoint, and neither is read from the worktree: the patch
   # handed to the reviewer is exactly the range the history check just cleared,
   # cut against the SHA that range was cleared for.
-  mkdir -p "$wt/.agents/reviews"
+  reviews_dir "$wt"
   git -C "$ROOT" diff "$base" "$PINNED_TIP" > "$wt/.agents/reviews/$task.patch" \
     || die "cannot write the review patch for $task"
   review="$wt/.agents/reviews/$task-review.md"
@@ -2213,10 +2246,25 @@ cmd_diff() {
   base="$(security_base "$task")"
   fence_reconcile_history "$task" "$base" "$FENCE_PROFILE"
   patch="$wt/.agents/reviews/$task.patch"
-  mkdir -p "$wt/.agents/reviews"
+  reviews_dir "$wt"
   git -C "$ROOT" diff "$base" "$PINNED_TIP" > "$patch" \
     || die "cannot write the diff for $task"
-  ${EDITOR:-vim} -R -c 'set filetype=diff' "$patch"
+  echo "aw: patch at $(relpath "$patch")" >&2
+  # No editor is assumed. LOOM_DIFF_CMD takes the patch path as its last
+  # argument (`delta`, `bat`, `less`, `code --wait`, `vim -R` — whatever you
+  # use); otherwise git shows it through its own pager, honouring your
+  # color.diff and core.pager settings. Either way it is the SAME range the
+  # history check just cleared: base..$PINNED_TIP, read in $ROOT.
+  if [ -n "${LOOM_DIFF_CMD:-}" ]; then
+    # Word-split on purpose: the value is a command line, not one filename.
+    # shellcheck disable=SC2086
+    set -- $LOOM_DIFF_CMD
+    [ "$#" -gt 0 ] || die "LOOM_DIFF_CMD is blank — the patch is at $patch"
+    have "$1" || die "LOOM_DIFF_CMD: '$1' is not on PATH — the patch is at $patch"
+    "$@" "$patch"
+  else
+    git -C "$ROOT" diff "$base" "$PINNED_TIP"
+  fi
 }
 
 cmd_land() {
@@ -2692,10 +2740,29 @@ cmd_doctor() {
       fail "zones.toml unreadable (agent/* commits are BLOCKED until this is fixed): ${perr#aw: }"
     fi
   else note "no zones.toml — everything defaults to assist"; fi
-  [ -x "$ROOT/.git/hooks/pre-commit" ] && pass "pre-commit hook installed" || note "pre-commit hook not installed (aw install-hooks)"
-  if [ -x "$ROOT/.git/hooks/pre-commit.pre-loom" ]; then
+  # A hook written before the aw→loom rename calls `aw guard`, and its own
+  # "not on PATH" branch exits 0 — so the hand-zone guard is silently disarmed
+  # rather than broken. That has to read as a failure, not a warning.
+  local hookf; hookf="$(hook_path)"
+  if [ -x "$hookf" ]; then
+    if grep -q 'aw guard' "$hookf"; then
+      fail "pre-commit hook still calls the pre-rename 'aw' dispatcher — with aw off PATH the hand-zone guard skips silently. Fix with: aw install-hooks"
+    else
+      pass "pre-commit hook installed"
+    fi
+  else
+    note "pre-commit hook not installed (aw install-hooks)"
+  fi
+  if [ -x "$hookf.pre-loom" ]; then
     pass "pre-existing pre-commit hook chained (pre-commit.pre-loom)"
   fi
+  # install.sh never overwrites these, so a pre-rename repo keeps `aw` in them;
+  # the VS Code tasks and the AGENTS.md scout line actually invoke it.
+  local stale_f stale_list=""
+  for stale_f in .vscode/tasks.json AGENTS.md .opencode/opencode.json .agents/zones.toml; do
+    if [ -f "$ROOT/$stale_f" ] && grep -qw aw "$ROOT/$stale_f"; then stale_list="$stale_list $stale_f"; fi
+  done
+  if [ -n "$stale_list" ]; then note "still say the pre-rename 'aw' command — edit by hand:$stale_list"; fi
   if [ "${LOOM_LAND:-merge}" = pr ]; then
     have gh && pass "LOOM_LAND=pr — gh on PATH ($(command -v gh)); aw prints the command, never runs it" \
              || note "LOOM_LAND=pr — gh not on PATH; open the PR from the printed branch by hand"
@@ -2741,8 +2808,19 @@ cmd_doctor() {
 }
 
 cmd_install_hooks() {
-  local hook="$ROOT/.git/hooks/pre-commit"
-  local prev="$hook.pre-loom"
+  local hook prev; hook="$(hook_path)"; prev="$hook.pre-loom"
+  # Under core.hooksPath the hook may live in a tracked directory (.githooks/):
+  # that file is the team's, and rewriting it would ride into the next commit.
+  # Refuse and say what to add by hand. A RELATIVE hooksPath is also
+  # per-worktree, so agent worktrees only see a hook that is committed.
+  if git ls-files --error-unmatch "$hook" >/dev/null 2>&1; then
+    die "$hook is tracked by git (core.hooksPath) — add this line to it by hand instead: aw guard || exit \$?"
+  fi
+  case "$(git config core.hooksPath 2>/dev/null || true)" in
+    "") ;;
+    /*) echo "aw: note — core.hooksPath is set; installing the guard at $hook" >&2 ;;
+    *)  echo "aw: note — core.hooksPath is relative, so agent worktrees will only run this hook once it is committed: $hook" >&2 ;;
+  esac
   mkdir -p "$(dirname "$hook")"
   # Never silently eat somebody else's hook: move it aside and chain to it.
   # Re-running is a no-op because our own hook carries the marker string.

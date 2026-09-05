@@ -2,7 +2,7 @@
 # first match wins; unmatched paths default to assist.
 #
 #   hand    agents may READ and may PROPOSE (tutor mode), never edit.
-#           Your learning surface. Enforced by the pre-commit hook (aw install-hooks).
+#           Your learning surface. Enforced by the pre-commit hook (loom install-hooks).
 #   assist  agents edit, you review every diff line by line.
 #   auto    agents edit, you review the summary.
 #

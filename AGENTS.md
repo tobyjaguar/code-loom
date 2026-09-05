@@ -28,5 +28,5 @@ human-only — propose via tutor-mode tasks, never edit them.
 
 ## Scout
 For "where is X / who calls Y" questions, use the scout agent
-(`aw scout "<question>"`) instead of crawling source. Its answers carry
+(`loom scout "<question>"`) instead of crawling source. Its answers carry
 file:line citations; treat uncited claims as unknown.
