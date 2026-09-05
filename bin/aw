@@ -413,6 +413,32 @@ def probes(g):
 # [fence].paths. A release that matched nothing would look like it worked and
 # quietly leave the path fenced (or, worse, read as a release of something
 # else under the two glob dialects).
+# The providers this harness can ever name. Kept deliberately small and
+# honest — it is exactly what provider_of() can return:
+#   * its two special cases, `claude` (claude-sub) and `codex` (codex-sub),
+#     the subscription CLIs;
+#   * the opencode providers `aw` carries a key for (key_for_provider):
+#     zai, zai-coding-plan, moonshotai, deepseek — the prefixes of every model
+#     ID in the built-in chains;
+#   * plus every provider this repo declares under `provider` in
+#     .opencode/opencode.json, which is how a project adds one.
+# Anything else in a `providers` list can never match a running model, so it is
+# a typo with the shape of a policy. Keep in sync with provider_of() and
+# key_for_provider() in bin/aw.
+known_providers = {"claude", "codex", "zai", "zai-coding-plan",
+                   "moonshotai", "deepseek"}
+_ocjson = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(zf))),
+                       ".opencode", "opencode.json")
+if os.path.exists(_ocjson):
+    try:
+        import json
+        with open(_ocjson) as _f:
+            _oc = json.load(_f)
+        if isinstance(_oc, dict) and isinstance(_oc.get("provider"), dict):
+            known_providers |= set(str(k) for k in _oc["provider"])
+    except Exception:
+        pass          # a broken opencode.json is `aw doctor`'s business
+
 profiles = data.get("fence_profiles", {})
 if not isinstance(profiles, dict):
     die("%s: [fence_profiles] must be a table of profiles" % zf)
@@ -438,9 +464,24 @@ for _name, _p in profiles.items():
         if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_.@-]*$", _x):
             die("%s: [fence_profiles.%s].providers contains %r — a provider name is "
                 "letters, digits, '_', '.', '@' and '-' only: no spaces, no glob "
-                "characters, not empty. Use provider_of() names, one per entry: "
-                "claude, codex, deepseek, moonshotai, zai, zai-coding-plan"
-                % (zf, _name, _x))
+                "characters, not empty. Use provider_of() names, one per entry: %s"
+                % (zf, _name, _x, ", ".join(sorted(known_providers))))
+        # The character set is not enough. "Claude" and "claude-sub" both pass
+        # it and neither can ever equal a provider_of() value, so a profile
+        # written that way allows NOTHING while reading as though it allowed
+        # something — the failure mode is a confused operator, not a refusal.
+        if _x not in known_providers:
+            _hint = ""
+            if _x.endswith("-sub"):
+                _hint = (" '%s' is a MODEL token; provider_of('%s') is '%s'."
+                         % (_x, _x, _x[:-4]))
+            elif _x.lower() in known_providers:
+                _hint = " Provider names are lower case: did you mean '%s'?" % _x.lower()
+            die("%s: [fence_profiles.%s].providers contains %r, which is not a provider "
+                "this harness can ever produce.%s A provider is what provider_of() "
+                "returns: %s — plus anything declared under `provider` in "
+                ".opencode/opencode.json."
+                % (zf, _name, _x, _hint, ", ".join(sorted(known_providers))))
     for _g in _p["release"]:
         if _g not in fence:
             die("%s: [fence_profiles.%s].release lists '%s', which is not one of "
@@ -459,6 +500,22 @@ for _name, _p in profiles.items():
                         "'%s' still covers it — the release could not take effect, while "
                         "the commit guard would start accepting it. Release '%s' as well, "
                         "or narrow the fence." % (zf, _name, _g, _h, _h))
+    # ... and the same trap the other way round, which the loop above cannot
+    # see: fence = ["core/**", "core/wallet-sdk/**"], release = ["core/**"].
+    # Nothing that stays fenced covers the RELEASED pattern, so the check above
+    # is happy — but "core/wallet-sdk/**" stays in the effective fence, so those
+    # files never arrive in the worktree, while `is_released` answers yes for
+    # them and the commit guard starts accepting commits to a subsystem that is
+    # not there. Probe every STAYING pattern against every released one.
+    for _h in _stay:
+        for _probe in probes(_h):
+            for _g in _p["release"]:
+                if hit(_probe, _g):
+                    die("%s: [fence_profiles.%s].release lists '%s', which also covers "
+                        "[fence] pattern '%s' — and that one stays fenced, so its paths "
+                        "never reach the worktree while the commit guard would start "
+                        "accepting commits to them. Release '%s' as well, or narrow the "
+                        "release." % (zf, _name, _g, _h, _h))
 
 prof = os.environ.get("AW_FENCE_PROFILE", "").strip()
 if prof and prof not in profiles:
