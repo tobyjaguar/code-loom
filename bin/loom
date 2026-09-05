@@ -2324,7 +2324,7 @@ Commit it in the worktree, or discard it, then re-run:  loom check $task"
 commits this would publish. Run it first:  loom check $task${FENCE_PROFILE:+ --fence-profile $FENCE_PROFILE}"
   [ "$reviewed" = "$PINNED_TIP" ] || die "the branch moved since it was reviewed:
   reviewed at loom check: $reviewed
-  $br is now:           $PINNED_TIP
+  $br is now:      $PINNED_TIP
 Landing would publish commits nobody read. Re-run the review, then land:
   loom check $task${FENCE_PROFILE:+ --fence-profile $FENCE_PROFILE}"
   [ -n "$FENCE_PROFILE" ] && echo "loom: fence profile '$FENCE_PROFILE' — this diff may touch $FENCE_RELEASED"
@@ -2456,6 +2456,11 @@ record a base this branch does not descend from. Inspect $wt, do not re-run."
   # being reviewable: it is upstream now. Judged through the FULL [fence] and
   # the FULL [hand] — a fence profile releases paths for the TASK's own commits,
   # and nobody consented to a release for whatever arrived from upstream.
+  #
+  # In an active repo this fires often, and that is the intended shape rather
+  # than a bug: your OWN commits to the hand zone, merged upstream while the
+  # task ran, are a hit. --accept-upstream is a one-word confirmation that you
+  # have read what is landing underneath, not an override of a security rule.
   history_paths "$ROOT" "$old_base" "$new_base"
   if [ "${#HIST_PATHS[@]}" -gt 0 ] && [ -z "$accept" ]; then
     bad_f="$(zones_py_full history-fence "${HIST_PATHS[@]}")" \

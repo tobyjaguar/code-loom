@@ -372,7 +372,10 @@ part of the branch that still changes your runs:
   upstream — and a hit refuses the rebase, printing the paths and `git log
   --oneline old_base..new_base`, leaving the base where it was and the branch
   where it was. `--accept-upstream` is the operator saying "I have read those
-  commits and I accept them under the base"; it prints them too. A failed `git
+  commits and I accept them under the base"; it prints them too. In an active
+  repo it will fire on your *own* hand-zone commits merged upstream while the
+  task ran — that is the intended shape, not a bug: the flag is a one-word
+  confirmation, not an override. A failed `git
   fetch` is a refusal for the same reason: replaying onto a stale upstream
   succeeds quietly.
 - **`remote.origin.url` is pinned to the task.** Recorded at `loom new`;

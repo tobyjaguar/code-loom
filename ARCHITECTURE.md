@@ -478,7 +478,10 @@ Semantics:
   untouched and resetting the branch back to `$PINNED_TIP`, so the refusal
   leaves the task exactly as it found it. `--accept-upstream` is the operator's
   "I have read those commits and I accept them under the base", and prints them
-  as well. `git fetch` losing its `|| true` belongs to the same rule: replaying
+  as well. It will fire on ordinary work too — your own `[hand]` commits, merged
+  upstream while the task ran, are a hit — and that is the intended shape: the
+  flag is a confirmation, not an override, and the alternative is a base that
+  moves over unread commits. `git fetch` losing its `|| true` belongs to the same rule: replaying
   onto a stale upstream succeeds quietly. And `remote.origin.url` is recorded at
   `loom new`, with `loom rebase` (before the fetch) and `loom land --pr` (before the
   push) refusing when it has changed.
