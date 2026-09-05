@@ -251,8 +251,23 @@ pays that cost with nothing to replace it: opencode there runs on its own
 global config, and `--agent <role>` falls back to opencode's default agent. A
 repo that wants role definitions must keep them in the operator's copy.
 
-**The residual.** `$ROOT/.opencode/opencode.json` is a file in *your* checkout.
-Nothing an agent runs touches your checkout — except `loom plan`'s architect,
-which is gap 2 above, and anything that gets to `.agents/loom.env`, which is
-gap 3. Closing this one does not close those, and the same file is the reason
-they matter slightly more than they did.
+**The residual.** `$ROOT/.opencode/opencode.json` is a file in *your* checkout,
+and "your checkout" is not out of an agent's reach. Three routes lead there,
+and only the third was ever narrow:
+
+1. **A landed agent branch.** `loom land` merges the branch INTO your checkout,
+   so a commit that rewrote `.opencode/opencode.json` on the branch becomes
+   your copy — the one every later task's opencode runs against, provider
+   `baseURL` and role prompts included. What stops it is the `[hand]` zone:
+   `.opencode/**` is a hand path in the shipped `.agents/zones.toml`, the
+   pre-commit guard blocks the commit, and `loom land` re-checks the branch's
+   COMMITS against `[hand]` because the guard runs in the agent's own context
+   where `--no-verify` exists. That check is the lock; the guard is the
+   seatbelt. A consuming repo that has not copied the entry has neither
+   (`docs/fence-profile-consumer-snippet.md` § 1b).
+2. **`.agents/loom.env`**, which is `.`-sourced as shell in your environment —
+   gap 3 above, and a `[hand]` path for the same reason.
+3. **`loom plan`'s architect**, which runs unfenced in `$ROOT` — gap 2 above.
+
+Closing this one does not close those, and the same file is the reason they
+matter slightly more than they did.

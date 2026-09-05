@@ -86,7 +86,7 @@ providers = ["claude", "codex"]
 scope v1 and cannot be gated locally at all, and `spike/**` is unreviewed
 exploratory code including live-key harnesses.
 
-## 1b. `.agents/zones.toml` — three paths that belong in `[hand]`
+## 1b. `.agents/zones.toml` — four paths that belong in `[hand]`
 
 Check that `[hand].paths` in the consuming repo lists the control plane itself,
 and add what is missing:
@@ -95,9 +95,10 @@ and add what is missing:
   ".agents/gate.sh",
   ".agents/zones.toml",
   ".agents/loom.env",
+  ".opencode/**",
 ```
 
-An agent may **propose** a change to any of the three — that is what the hand
+An agent may **propose** a change to any of the four — that is what the hand
 zone means — and may never commit one, because each is an input to the checks
 that judge the agent's own work:
 
@@ -111,9 +112,19 @@ that judge the agent's own work:
   (`--no-verify`), not a lock.
 * `.agents/loom.env` is `.`-sourced as shell, in your environment, on every
   `loom` invocation (`docs/KNOWN-GAPS.md` § 3).
+* `.opencode/**` is the provider **identity** and every role prompt.
+  `provider.<name>.options.baseURL` in `opencode.json` decides which host
+  answers as `deepseek` — the fact this profile's `providers` list is built on
+  — and the agent definitions there supply each role's system prompt. `loom`
+  points every opencode run at the **main checkout's** copy and turns the
+  worktree's own project config off, so a rewritten worktree copy is inert
+  *while the task runs*; a landed one is the copy every later task uses.
 
 `loom land` checks the branch's commits against `[hand]` regardless of what the
-guard did, so this is the entry that actually holds.
+guard did, so this is the entry that actually holds. None of `.agents/gate.sh`,
+`.agents/zones.toml` or `.opencode/**` may be put in `[fence]` either — `loom`
+refuses a fence pattern covering them, because a worktree (or a harness)
+without them disarms the checks that judge the agent.
 
 ## 2. The chains for a profiled task — per command, not in `loom.env`
 
@@ -250,7 +261,9 @@ or up to date. Two consequences worth knowing before you rely on it:
 # the record for a task, if you ever want to read one:
 cat "${XDG_CONFIG_HOME:-$HOME/.config}/loom/repos/"*"/tasks/<some-task>"
 #   base=<commit>  profile=<name>  branch=agent/<task>  created=<iso>
-#   origin=<remote.origin.url at loom new>  reviewed=<tip loom check last reviewed>
+#   reviewed=<tip loom check last reviewed>
+#   origin=<remote.origin.url at loom new>
+#   fetch=<remote.origin.fetch at loom new>
 ```
 
 Then read [`docs/KNOWN-GAPS.md`](KNOWN-GAPS.md) in the harness repo, in full:

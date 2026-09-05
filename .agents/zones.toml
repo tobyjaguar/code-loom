@@ -33,12 +33,23 @@ paths = [
   #              that could commit it could widen its own zone.
   #   loom.env   is `.`-sourced as shell, in your environment, on every `loom`
   #              invocation (docs/KNOWN-GAPS.md § 3).
+  #   .opencode/ is the provider IDENTITY and every role prompt.
+  #              `provider.<name>.options.baseURL` in opencode.json decides
+  #              which host answers as "deepseek", which is the fact a fence
+  #              profile's `providers` list is built on, and the agent
+  #              definitions there supply each role's system prompt. `loom`
+  #              points every opencode run at the MAIN checkout's copy — so a
+  #              worktree copy is inert while the task runs, and would become
+  #              the main checkout's copy the moment it LANDED.
   #
   # Keep them here even if you fence nothing: the fence is optional, the guard
-  # is not.
+  # is not. Three of them may not be FENCED either — `loom` refuses a [fence]
+  # pattern covering zones.toml, gate.sh or .opencode/, because a worktree (or
+  # a harness) without them disarms the very checks that judge the agent.
   ".agents/gate.sh",
   ".agents/zones.toml",
   ".agents/loom.env",
+  ".opencode/**",
 ]
 
 [assist]

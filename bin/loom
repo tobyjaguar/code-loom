@@ -1053,14 +1053,20 @@ def fence_sanity():
     "assist" and `loom guard` exits 0; no gate.sh means the gate exits 127
     and burns every attempt; no .agents/reviews/ means the gate log the
     dispatcher writes there sits outside the sparse-checkout definition, so
-    `git add -A` fails after a green gate and nothing is committed. Refuse
-    instead of silently disarming. The directory is checked by probing a
-    file the dispatcher will create in it, so `dir/*` patterns count too."""
+    `git add -A` fails after a green gate and nothing is committed; and
+    .opencode/ carries the provider identity a fence profile's `providers`
+    list is built on (`provider.<name>.options.baseURL`) together with every
+    role prompt, all of which the harness has to be able to read. Refuse
+    instead of silently disarming. A directory is checked by probing a file
+    inside it, so `dir/*` patterns count too."""
     essentials = (
         (".agents/zones.toml", ".agents/zones.toml", "which disables the zone guard"),
         (".agents/gate.sh",    ".agents/gate.sh",    "which disables the gate"),
         (".agents/reviews/",   ".agents/reviews/0000-x-gate.log",
          "which the dispatcher writes the gate log, patch and review into"),
+        (".opencode/",         ".opencode/prompts/implementer.md",
+         "which carries every role prompt and the provider identity a fence "
+         "profile is built on"),
     )
     for shown, probe, why in essentials:
         for g in fence:
