@@ -198,7 +198,7 @@ for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p \
          0041-ar2 \
          0043-at 0044-at2 0045-at3 0046-au 0047-au2 0048-av 0049-av2 \
          0050-loom 0051-ax 0052-ax2 0053-au3 \
-         0054-az 0055-az2 0056-az3 0057-ba 0058-bb 0059-bc 0060-bd; do mk_task "$t"; done
+         0054-az 0055-az2 0056-az3 0057-ba 0058-bb 0059-bc 0060-bd 0061-ba2; do mk_task "$t"; done
 mk_task 0040-ar  codex
 mk_task 0042-as  codex
 mk_task 0005-f codex
@@ -1489,6 +1489,74 @@ want_eq "(az) ... and on a key a record does not have"    "$rc" "1"
 want_in "(az) ... naming it"                              "$out" "not a field a record has"
 want_not_in "(az) ... and no reviewer was launched"       "$out" "running on"
 "$LOOM" drop 0056-az3 > /dev/null 2>&1 || true
+
+# --- (ba) the rebase fetch names its refspec, and the refspec is pinned ----
+# `remote.origin.fetch` decides which local ref a `git fetch origin` updates,
+# and it lives in the shared .git/config beside the URL. Pointed at
+# `refs/remotes/decoy/*` the fetch succeeds while touching nothing under
+# refs/remotes/origin/ — so a forged `refs/remotes/origin/main` survives it and
+# the rebase replays onto the forgery. Forged at the branch's OWN tip, that
+# re-points the recorded base to the branch's own work, which then slides under
+# the base where no fence check, no hand check and no review patch looks again.
+# Two locks: the recorded refspec, and a fetch that does not depend on it.
+git init -q --bare "$TMP/origin-ba.git"
+git remote add origin "$TMP/origin-ba.git"
+git push -q origin main
+out="$("$LOOM" new 0057-ba 2>&1)"; rc=$?
+want_eq "(ba) setup: a task cut against a real origin"    "$rc" "0"
+want_eq "(ba) ... with the refspec in the operator record" \
+        "$(state_field 0057-ba fetch)" "+refs/heads/*:refs/remotes/origin/*"
+BAW="$WTU/0057-ba"
+echo "benign" > "$BAW/backend/ba.txt"
+git -C "$BAW" add backend/ba.txt
+git -C "$BAW" commit -qm "benign work on ba"
+ba_tip="$(git rev-parse agent/0057-ba)"
+ba_base_before="$(state_field 0057-ba base)"
+git config remote.origin.fetch "+refs/heads/*:refs/remotes/decoy/*"   # the agent
+git -C "$BAW" update-ref refs/remotes/origin/main "$ba_tip"           # ... and the ref
+out="$("$LOOM" rebase 0057-ba origin/main 2>&1)"; rc=$?
+want_eq "(ba) rebase refuses a rewritten remote.origin.fetch" "$rc" "1"
+want_in "(ba) ... naming the setting"                     "$out" "remote.origin.fetch"
+want_in "(ba) ... the refspec recorded at loom new"       "$out" "refs/remotes/origin/*"
+want_in "(ba) ... and the decoy configured now"           "$out" "refs/remotes/decoy/*"
+want_eq "(ba) ... the recorded base did not move"         "$(state_field 0057-ba base)" "$ba_base_before"
+want_ne "(ba) ... and was never re-pointed at the branch's own tip" \
+        "$(state_field 0057-ba base)" "$ba_tip"
+want_eq "(ba) ... nor did the branch"                     "$(git rev-parse agent/0057-ba)" "$ba_tip"
+
+# ... and with the decoy refspec RECORDED — so the pin above has nothing to
+# refuse — the explicit refspec is what defeats the forged ref: loom names both
+# ends of the fetch itself, so the real remote's refs/heads/main overwrites
+# refs/remotes/origin/main whatever the config says a fetch is for.
+out="$("$LOOM" new 0061-ba2 2>&1)"; rc=$?
+want_eq "(ba) setup: a task created while the refspec IS the decoy" "$rc" "0"
+want_eq "(ba) ... so the record pins the decoy, and nothing refuses it" \
+        "$(state_field 0061-ba2 fetch)" "+refs/heads/*:refs/remotes/decoy/*"
+BA2W="$WTU/0061-ba2"
+echo "benign" > "$BA2W/backend/ba2.txt"
+git -C "$BA2W" add backend/ba2.txt
+git -C "$BA2W" commit -qm "benign work on ba2"
+ba2_tip="$(git rev-parse agent/0061-ba2)"
+echo "later" > backend/ba2-upstream.txt          # what the REAL origin has
+git add backend/ba2-upstream.txt
+git commit -qm "upstream: the real main moved"
+ba2_up="$(git rev-parse HEAD)"
+git push -q origin main
+git -C "$BA2W" update-ref refs/remotes/origin/main "$ba2_tip"   # the agent forges
+out="$("$LOOM" rebase 0061-ba2 origin/main 2>&1)"; rc=$?
+want_eq "(ba) the explicit-refspec fetch overwrites the forged ref" "$rc" "0"
+want_eq "(ba) ... so the base is the REAL upstream tip"   "$(state_field 0061-ba2 base)" "$ba2_up"
+want_ne "(ba) ... never the branch's own tip"             "$(state_field 0061-ba2 base)" "$ba2_tip"
+want_in "(ba) ... and the buried range is printed"        "$out" "upstream: the real main moved"
+want_not_in "(ba) ... holding none of the branch's own work" "$out" "benign work on ba2"
+want_in "(ba) ... with the fenced list shown"             "$out" "fenced paths:"
+want_in "(ba) ... and the hand-zone list"                 "$out" "hand-zone paths:"
+want_in "(ba) ... both empty"                             "$out" "(none)"
+want_in "(ba) the branch's own work is still ABOVE the base" \
+        "$(git diff --name-only "$(state_field 0061-ba2 base)" agent/0061-ba2)" "backend/ba2.txt"
+git config --unset-all remote.origin.fetch
+git remote remove origin
+git update-ref -d refs/remotes/origin/main 2>/dev/null || true
 
 # --- (j)/(t) doctor lists the profiles, and touches no network ------------
 out="$(timeout 180 "$LOOM" doctor 2>&1 || true)"

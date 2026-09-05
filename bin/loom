@@ -2574,11 +2574,28 @@ $(printf '%s\n' "$dirty" | sed 's/^/  /')"
   # fetch is that `$upstream` is current, and replaying onto a stale ref moves
   # this task's base onto commits the operator has not seen — silently, because
   # a rebase onto an old tip succeeds perfectly well.
+  #
+  # And for an `origin/<branch>` upstream the REFSPEC is written out here rather
+  # than left to `remote.origin.fetch`. That setting lives in the shared
+  # .git/config like the URL does, and a `git config remote.origin.fetch
+  # +refs/heads/*:refs/remotes/decoy/*` makes a plain `git fetch origin` succeed
+  # while updating nothing under refs/remotes/origin/ — so a forged
+  # `refs/remotes/origin/main` survives the fetch intact and the rebase replays
+  # onto it. `+refs/heads/<b>:refs/remotes/origin/<b>` names both ends, and the
+  # '+' makes the remote's answer overwrite whatever is there. The recorded
+  # `fetch` field (checked by require_recorded_origin above) refuses a changed
+  # refspec outright; this makes the fetch not depend on it in the first place.
   if git remote get-url origin >/dev/null 2>&1; then
-    git fetch -q origin >&2 \
-      || die "git fetch origin failed, so '$upstream' may be stale — and a rebase onto a
-stale upstream moves this task's base onto commits you have not fetched.
-Fix the fetch (network, credentials, the remote URL) and re-run."
+    local fetch_br="" fetch_spec=""
+    case "$upstream" in
+      origin/?*) fetch_br="${upstream#origin/}"
+                 fetch_spec="+refs/heads/$fetch_br:refs/remotes/origin/$fetch_br" ;;
+    esac
+    # shellcheck disable=SC2086  # $fetch_spec is one word or none, deliberately
+    git fetch -q origin $fetch_spec >&2 \
+      || die "git fetch origin${fetch_spec:+ $fetch_spec} failed, so '$upstream' may be stale — and a
+rebase onto a stale upstream moves this task's base onto commits you have not
+fetched. Fix the fetch (network, credentials, the remote URL) and re-run."
   fi
   git -C "$wt" rebase "$upstream" >&2 || die "rebase onto $upstream failed — resolve in $wt, then re-run"
   mb="$(git merge-base "$br" "$upstream")" \
@@ -2612,13 +2629,34 @@ record a base this branch does not descend from. Inspect $wt, do not re-run."
   # than a bug: your OWN commits to the hand zone, merged upstream while the
   # task ran, are a hit. --accept-upstream is a one-word confirmation that you
   # have read what is landing underneath, not an override of a security rule.
+  #
+  # Printed UNCONDITIONALLY whenever the base actually moves — on the refusal
+  # and under `--accept-upstream` alike, and whether or not anything fenced is
+  # in there. Consent to bury commits is only consent if the operator was shown
+  # what they are: the accept leg used to print the subjects and never the
+  # fenced/hand path lists, because it never computed them, and both legs were
+  # gated on the range touching at least one path — so a range of merge commits
+  # slid under the base in silence.
   history_paths "$ROOT" "$old_base" "$new_base"
-  if [ "${#HIST_PATHS[@]}" -gt 0 ] && [ -z "$accept" ]; then
-    bad_f="$(zones_py_full history-fence "${HIST_PATHS[@]}")" \
+  if [ "$new_base" != "$old_base" ]; then
+    bad_f="$(zones_py_full history-fence ${HIST_PATHS[0]+"${HIST_PATHS[@]}"})" \
       || die "cannot tell what the commits under the new base touch — refusing to guess"
-    bad_h="$(zones_py_full history-hand "${HIST_PATHS[@]}")" \
+    bad_h="$(zones_py_full history-hand ${HIST_PATHS[0]+"${HIST_PATHS[@]}"})" \
       || die "cannot tell which zones the commits under the new base touch — refusing to guess"
-    if [ -n "$bad_f$bad_h" ]; then
+    {
+      echo "loom: these commits go UNDER task $task's base — upstream, where no fence"
+      echo "loom: check, no hand check and no review patch looks at them again:"
+      echo ""
+      echo "  $(git rev-parse --short "$old_base")..$(git rev-parse --short "$new_base") ($upstream):"
+      git log --oneline "$old_base..$new_base" 2>/dev/null | sed 's/^/    /'
+      echo ""
+      echo "  fenced paths:"
+      if [ -n "$bad_f" ]; then printf '%s\n' "$bad_f" | sed 's/^/    /'; else echo "    (none)"; fi
+      echo "  hand-zone paths:"
+      if [ -n "$bad_h" ]; then printf '%s\n' "$bad_h" | sed 's/^/    /'; else echo "    (none)"; fi
+      echo ""
+    } >&2
+    if [ -n "$bad_f$bad_h" ] && [ -z "$accept" ]; then
       # Put the branch back first. The rebase has already replayed it, and a
       # branch left sitting on the refused upstream carries those commits in
       # `old_base..tip` — so every later command, INCLUDING the
@@ -2628,19 +2666,8 @@ record a base this branch does not descend from. Inspect $wt, do not re-run."
       git -C "$wt" reset --hard "$PINNED_TIP" >/dev/null 2>&1 \
         || echo "loom: WARNING: could not put $br back at $PINNED_TIP after refusing this
 rebase — the branch is left on $upstream. Inspect $wt." >&2
-      die "the commits this rebase would put UNDER task $task's base touch paths loom will
-not bury silently:
-${bad_f:+
-  fenced:
-$(printf '%s\n' "$bad_f" | sed 's/^/    /')}${bad_h:+
-  hand zone:
-$(printf '%s\n' "$bad_h" | sed 's/^/    /')}
-
-  $(git rev-parse --short "$old_base")..$(git rev-parse --short "$new_base") ($upstream):
-$(git log --oneline "$old_base..$new_base" 2>/dev/null | sed 's/^/    /')
-
-Below the base nothing looks at them again — not the fence check, not the hand
-check, not the review patch. 'origin/main' is one 'git update-ref' away from any
+      die "the commits listed above would go UNDER task $task's base, and they touch paths
+loom will not bury silently. 'origin/main' is one 'git update-ref' away from any
 commit, and unlike your own 'main' a moved 'origin/main' is visible nowhere.
 Nothing changed: the base was not moved and the branch is back at
 $(git rev-parse --short "$PINNED_TIP"). Read those commits, then either accept
@@ -2648,10 +2675,7 @@ them under the base:
   loom rebase $task $upstream${FLAG_PROFILE:+ --fence-profile $FLAG_PROFILE} --accept-upstream
 or throw the task away:  loom drop $task"
     fi
-  fi
-  if [ -n "$accept" ] && [ "${#HIST_PATHS[@]}" -gt 0 ]; then
-    echo "loom: --accept-upstream: these commits go under task $task's base unreviewed:" >&2
-    git log --oneline "$old_base..$new_base" 2>/dev/null | sed 's/^/  /' >&2
+    [ -z "$accept" ] || echo "loom: --accept-upstream: the commits above are accepted under the base, unreviewed." >&2
   fi
   # `reviewed` is deliberately cleared: the branch has been rewritten, so the
   # sha a reviewer read no longer exists on it. `loom land` will ask for a fresh
