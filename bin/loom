@@ -76,6 +76,17 @@
 
 set -euo pipefail
 
+# This script's own path, resolved BEFORE the cd below: `loom help` prints the
+# header block by reading the file back, and a relative `$0` ("./bin/loom",
+# "../bin/loom") stops resolving the moment we cd to $ROOT — which now happens
+# whenever the command is typed anywhere but the main checkout's root.
+SELF="$0"
+case "$SELF" in
+  /*)  ;;
+  */*) SELF="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd -P)/$(basename "$SELF")" ;;
+  *)   SELF="$(command -v "$SELF" 2>/dev/null || printf '%s' "$SELF")" ;;
+esac
+
 # ------------------------------------------------- the root is the MAIN checkout
 # Every file this dispatcher reads POLICY from — .agents/zones.toml (the zones,
 # the fence and its profiles), .agents/loom.env, .agents/gate.sh, .opencode/ —
@@ -2870,6 +2881,6 @@ case "${1:-}" in
   doctor) shift; cmd_doctor "$@" ;;
   guard)  shift; cmd_guard "$@" ;;
   install-hooks) shift; cmd_install_hooks "$@" ;;
-  ""|-h|--help|help) awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0" ;;
+  ""|-h|--help|help) awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$SELF" ;;
   *) die "unknown command '$1' — try: loom help" ;;
 esac

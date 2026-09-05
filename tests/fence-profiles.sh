@@ -1408,6 +1408,17 @@ oc="$(cat "$TMP/called-opencode.log" 2>/dev/null || true)"
 want_eq "(ax) the run succeeds with it in the environment" "$rc" "0"
 want_in "(ax) ... and opencode still never sees it"        "$oc" "OPENCODE_CONFIG_CONTENT=(unset)"
 
+# --- (ay) `loom help` survives a relative invocation ---------------------
+# `loom help` prints its own header block by reading the file back through
+# $0 — and the dispatcher cd's to the MAIN checkout at startup, which is now a
+# real move whenever the command is typed anywhere else. A relative $0 stopped
+# resolving there ("awk: cannot open ./bin/loom").
+rel="$(python3 -c 'import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' "$LOOM" "$REPO/backend")"
+out="$(cd "$REPO/backend" && "$rel" help 2>&1)"; rc=$?
+want_eq "(ay) loom help works from a relative invocation"  "$rc" "0"
+want_in "(ay) ... and prints the command list"            "$out" "loom new"
+want_not_in "(ay) ... with no awk failure"                "$out" "cannot open"
+
 # --- (j)/(t) doctor lists the profiles, and touches no network ------------
 out="$(timeout 180 "$LOOM" doctor 2>&1 || true)"
 want_in "(j) doctor lists the profile"                    "$out" "fence profile 'codex'"
