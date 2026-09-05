@@ -1,8 +1,8 @@
-# Loom: a Vim-native agent system
+# Loom: a multi-provider agent harness
 
 A design for coding with AI agents where the repository stays the only source of
-truth, Vim stays a first-class client, and model choice is a config value rather
-than a lock-in.
+truth, the harness is driven entirely from the command line, and model choice is
+a config value rather than a lock-in.
 
 Built around four goals, in priority order:
 
@@ -18,9 +18,11 @@ Built around four goals, in priority order:
 
 ## 1. The core idea
 
-Most agent tooling fails Vim users for one reason: the agent holds state the
-editor cannot see. Conversation history, file context, pending edits, plan — all
-of it lives inside a chat session. Vim becomes a spectator.
+Most agent tooling has the same flaw: the agent holds state nothing else can
+see. Conversation history, file context, pending edits, the plan — all of it
+lives inside one vendor's chat session. When that session ends, or that vendor
+is rate-limited, or you want a second model to check the first, the state does
+not come with you.
 
 Invert it. **Every durable artifact is a file in the repo.** Plans, task specs,
 architecture decisions, review notes, the agent's own instructions. If it only
@@ -28,7 +30,8 @@ exists in a session, it does not exist.
 
 That single constraint gets you everything else:
 
-- Vim can read and edit any of it, because it is all text on disk.
+- Any tool can read and edit any of it, because it is all text on disk — your
+  editor, `grep`, a script, a different agent next week.
 - Agents are interchangeable, because they read and write files rather than
   holding proprietary state.
 - Cost drops, because a plan written once is re-read for a few hundred tokens
@@ -37,8 +40,8 @@ That single constraint gets you everything else:
   in context.
 
 The second constraint follows from the first: **agents never write to your
-working tree.** They get git worktrees. You review by diff. Your buffer is never
-mutated underneath you.
+working tree.** They get git worktrees. You review by diff. Nothing changes
+under the file you have open.
 
 ---
 
@@ -46,7 +49,7 @@ mutated underneath you.
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│  You + Vim/Neovim        edit, review, hand-write    │
+│  You + your editor       edit, review, hand-write    │
 ├──────────────────────────────────────────────────────┤
 │  Contract layer          .agents/{plans,tasks,...}   │  ← plain markdown
 ├──────────────────────────────────────────────────────┤
@@ -171,10 +174,10 @@ reason = "Client work under NDA — no third-party model sees this tree."
 paths = ["crates/audat-nda/**", "docs/audits/**"]
 ```
 
-Fenced paths are **removed from agent worktrees**. `aw new` creates the worktree
+Fenced paths are **removed from agent worktrees**. `loom new` creates the worktree
 with `--no-checkout`, applies a non-cone sparse checkout (`/*` plus one
 `!<glob>` per fenced set), and only then checks out — so fenced content never
-lands in the agent's tree at all. `aw scout`, which otherwise reads your working
+lands in the agent's tree at all. `loom scout`, which otherwise reads your working
 tree directly, is redirected to a persistent detached mirror at
 `$LOOM_WORKTREES/_scout` under the same rules, reset to `HEAD` on each call.
 The implementer and scout prompts say the paths are absent by policy, so a
@@ -197,26 +200,29 @@ confused agent asks instead of digging.
    across the fence. A fence through the middle of a build graph produces an
    agent that cannot pass a gate it cannot fix.
 3. **Matching is approximate in two dialects.** Sparse checkout applies
-   gitignore semantics (`*` stops at `/`); `aw zone` and `aw doctor` use
+   gitignore semantics (`*` stops at `/`); `loom zone` and `loom doctor` use
    `fnmatch` (`*` crosses `/`). They agree on the plain `subsystem/**` form.
-   Stick to it. `aw doctor` flags a fence pattern that matches no tracked file,
+   Stick to it. `loom doctor` flags a fence pattern that matches no tracked file,
    which catches the usual typo.
 4. **It is per-worktree, not per-repo.** Your own working tree is untouched —
    the sparse config is written to the worktree-scoped config, so nothing
    disappears from under your editor.
 5. **A worktree can predate the fence.** Sparse rules are applied when a
    worktree is built, so one created before `[fence]` existed — or before it
-   was widened — still holds the paths you have since fenced. `aw run` and
-   `aw scout` therefore re-apply and *verify* the fence on every call, and
+   was widened — still holds the paths you have since fenced. `loom run` and
+   `loom scout` therefore re-apply and *verify* the fence on every call, and
    refuse to run if a fenced file survives (git will not remove a file with
    local modifications). Anything you drive by hand rather than through those
    commands gets no such refresh: after changing `[fence]`, treat existing
-   worktrees in `aw ls` as stale and `aw drop` them.
+   worktrees in `loom ls` as stale and `loom drop` them.
 
-Fencing `.agents/**` is refused outright. Removing `zones.toml` from a worktree
-would make every path resolve to `assist` and `aw guard` exit 0 — the fence
-would quietly disarm the hand-zone boundary — and removing `gate.sh` would make
-the gate exit 127 and burn every retry.
+Fencing `.agents/**` is refused outright, as is any pattern that would remove
+`zones.toml`, `gate.sh` or the `reviews/` directory. Removing `zones.toml` from
+a worktree would make every path resolve to `assist` and `loom guard` exit 0 —
+the fence would quietly disarm the hand-zone boundary; removing `gate.sh` would
+make the gate exit 127 and burn every retry; and removing `reviews/` would put
+the gate log outside the sparse-checkout definition, so `git add -A` fails
+after a green gate and nothing is committed.
 
 ---
 
@@ -250,7 +256,7 @@ export LOOM_TIER=deep      # architect AND reviewer on the Claude sub
 
 When you hit a wall, `LOOM_TIER=lean` and keep working, degraded.
 
-**4. Fallback chain.** Each role names an ordered list in `aw`. A model is
+**4. Fallback chain.** Each role names an ordered list in `loom`. A model is
 skipped when its key/CLI is absent, when `LOOM_SKIP` names its provider, or —
 detected at runtime — when its output looks rate-limited (429 / quota /
 overloaded). If the Claude sub is limited, the architect runs on GLM. The plan
@@ -301,43 +307,43 @@ You write that one.
 
 ---
 
-## 8. Vim integration, three tiers
+## 8. No editor integration, on purpose
 
-**Tier 0 works in plain Vim, no plugins.** This is the baseline and it is
-genuinely sufficient.
+The harness ships no editor plugin, and that is a design position rather than an
+omission. An editor layer is the one part of a system like this that is
+guaranteed to rot: it tracks a plugin API you do not control, it duplicates
+state the files already hold, and it quietly becomes the thing you have to fix
+before you can work.
 
-```
-tmux window
-┌────────────────────┬──────────────────┐
-│                    │  opencode TUI    │
-│   vim              ├──────────────────┤
-│                    │  cargo watch     │
-└────────────────────┴──────────────────┘
-```
+The interface is instead the two things every editor already has:
 
-- `:cfile` the gate output into quickfix, `]q` / `[q` to walk errors.
-- `:!git diff agent/0007-c` to review, or `:Gdiffsplit` with fugitive.
-- `:e .agents/plans/0007-*.md`, then `gf` on a path to jump to the source.
-- `:r !aw scout "where is decode_flac called"` to drop an answer into a buffer.
+**Files.** Plans, tasks, reviews, decisions and the gate log are markdown and
+plain text under `.agents/`. Opening one is `:e`, `Cmd-P`, or `cat`. The gate
+writes native tool output to `.agents/reviews/<task>-gate.log`, so any error
+parser — quickfix, the VS Code Problems panel, a CI annotation — reads it
+without translation.
 
-**Tier 1 adds Neovim terminal management.** `agents.nvim` gives each CLI agent a
-persistent terminal buffer you can hide, cycle, and send prompts to without
-losing the running job. It does not invent a chat UI or own your layout, which is
-what you want.
+**Commands.** Every action is one shell command with a task id. Nothing is
+hidden behind a keybinding, which means everything is equally available from a
+terminal, a task runner, a Makefile, a script, or an ssh session on a machine
+you have never configured.
 
-**Tier 2 adds `opencode.nvim`** for a chat panel that captures buffer and
-selection context automatically. Useful, optional, and the thing most likely to
-break on upgrade. Do not build the workflow on it.
+Two optional conveniences ship with the harness. Both are ~40 lines, nothing
+else reads them, and deleting either from your repo changes no behaviour:
 
-Included keymaps in `nvim/loom.lua`:
+- **`.vscode/tasks.json`** — the gate as the default build task, wired to the
+  `$rustc` problem matcher, plus prompted tasks for `loom scout`, `loom run`,
+  `loom check` and `loom doctor`.
+- **`loom-session`** — a tmux window with `$EDITOR`, a shell for `loom`
+  commands, and a gate/watch pane. `LOOM_SESSION_EDITOR` overrides the left
+  pane for anyone whose editor is not in the terminal.
 
-| Key | Action |
-|---|---|
-| `<leader>ag` | run gate, results into quickfix |
-| `<leader>ap` | open current plan |
-| `<leader>ar` | review current task diff in a vertical split |
-| `<leader>as` | ask scout about the word under cursor |
-| `<leader>az` | show which zone the current file is in |
+Diff review has one seam worth naming: `loom diff` writes the patch to
+`.agents/reviews/<task>.patch` and shows it through git's own pager, honouring
+your `color.diff` and `core.pager` config. `LOOM_DIFF_CMD` replaces the viewer
+outright (`delta`, `bat`, `code --wait`, an editor in read-only mode); the patch
+path is appended as the last argument. The file is written either way, so a tool
+that wants to open it can, and a machine with no viewer configured still works.
 
 ---
 
@@ -350,21 +356,21 @@ Included keymaps in `nvim/loom.lua`:
                     ┌────────┴────────┐
               HAND tasks         assist/auto tasks
                     │                 │
-                  you              aw run 0007-c    [cheap]
-                  in vim               │
+                  you              loom run 0007-c  [cheap]
+                  by hand             │
                     │            worktree + gate
                     │                 │
                     │              reviewer         [mid, other provider]
                     │                 │
-                    └───────▶  aw review / aw land
+                    └───────▶  loom check / loom land
 ```
 
-`aw land` merges into your current branch and ticks the plan checkbox. In a
-repo with review gates, land in PR mode instead — `aw land <task> --pr`, or
+`loom land` merges into your current branch and ticks the plan checkbox. In a
+repo with review gates, land in PR mode instead — `loom land <task> --pr`, or
 `LOOM_LAND=pr` in the environment — which runs the same gate, pushes
 `agent/<task>` to `origin`, and prints the `gh pr create` line for you to run.
 It merges nothing, keeps the branch and the worktree, and leaves the checkbox
-for you to tick when the PR actually merges. `aw drop <task> --keep-branch`
+for you to tick when the PR actually merges. `loom drop <task> --keep-branch`
 reclaims the worktree afterwards without deleting the branch you just pushed.
 
 The architect is invoked at the start of a feature and when a plan turns out to
@@ -399,7 +405,7 @@ Land plan updates in the same commit as the code, and treat a stale plan as a bu
 
 **Cheap model thrash.** If an implementer fails the gate three times, stop. Do
 not let it loop. The task spec is probably wrong, which is an architect problem.
-`aw run` enforces a retry cap for this reason.
+`loom run` enforces a retry cap for this reason.
 
 **Zone creep.** Watch for `hand` paths quietly getting reclassified because a task
 was inconvenient. Review `zones.toml` diffs like you would review a security
@@ -413,17 +419,17 @@ architect treat uncited claims as unknown.
 
 ## 12. Setup order
 
-1. `bin/aw` on your `PATH`, `.agents/gate.sh` executable.
+1. `bin/loom` on your `PATH`, `.agents/gate.sh` executable.
 2. `.agents/zones.toml` — five minutes, do it honestly.
 3. `AGENTS.md` at repo root. Keep it under 100 lines. It is read on every call.
 4. `.opencode/opencode.json` — set your API keys as env vars, run
    `opencode models` to confirm current model IDs before trusting the ones in the
    config.
-5. Install the pre-commit hook: `bin/aw install-hooks`. An existing hook is
+5. Install the pre-commit hook: `bin/loom install-hooks`. An existing hook is
    moved to `.git/hooks/pre-commit.pre-loom` and chained after the guard, so
    installing Loom never disables the hook you already had.
 6. Run one small feature end to end before trusting it with anything real.
 
-Model IDs move quickly. Verify them with `aw doctor`: it checks every ID in
+Model IDs move quickly. Verify them with `loom doctor`: it checks every ID in
 the routing chains and `opencode.json` against the public models.dev catalog
 and, where a key is set, against the provider's live `/models` endpoint.

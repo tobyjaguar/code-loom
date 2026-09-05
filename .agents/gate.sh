@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The gate: the deterministic reviewer. Agents are not done until this is green.
 # Auto-detects project type; replace the branch for your repo if you outgrow it.
-# Output stays in native tool format so Vim's :cfile / quickfix can parse it.
+# Output stays in native tool format so your editor's error parser can read it.
 set -uo pipefail
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 

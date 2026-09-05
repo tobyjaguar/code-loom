@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# loom-session — the Tier-0 layout. Plain vim, tmux, nothing else required.
+# loom-session — a three-pane tmux layout for driving the harness.
 #
-#   ┌────────────────────┬──────────────────┐
-#   │                    │  shell (aw ...)  │
-#   │   vim              ├──────────────────┤
-#   │                    │  gate / watch    │
-#   └────────────────────┴──────────────────┘
+#   ┌────────────────────┬────────────────────┐
+#   │                    │  shell (loom ...)  │
+#   │  $EDITOR           ├────────────────────┤
+#   │                    │  gate / watch      │
+#   └────────────────────┴────────────────────┘
+#
+# Editor-agnostic: the left pane runs whatever $EDITOR is. If you drive your
+# editor outside the terminal, set LOOM_SESSION_EDITOR to a shell instead, or
+# just skip this script — nothing else in the harness depends on it.
 #
 #   loom-session [dir]     start or attach to the session for a repo
 set -euo pipefail
@@ -20,7 +24,9 @@ if tmux has-session -t "$name" 2>/dev/null; then
   exec tmux attach -t "$name"
 fi
 
-tmux new-session  -d -s "$name" -c "$dir" -x 220 -y 60 "${EDITOR:-vim}"
+editor="${LOOM_SESSION_EDITOR:-${EDITOR:-${SHELL:-bash}}}"
+
+tmux new-session  -d -s "$name" -c "$dir" -x 220 -y 60 "$editor"
 tmux split-window -h -t "$name" -c "$dir" -l 45%
 tmux split-window -v -t "$name" -c "$dir" -l 40% \
   "command -v cargo-watch >/dev/null 2>&1 && [ -f Cargo.toml ] && cargo watch -s ./.agents/gate.sh || exec ${SHELL:-bash}"
