@@ -4,7 +4,7 @@ Plan: .agents/plans/NNNN-slug.md
 Zone: assist | auto
 <!-- Fence-profile: NAME   optional, and DOCUMENTATION ONLY. Uncomment for a
      task that must read or edit a path in [fence], with a profile that names
-     providers you are willing to send it to. It states the intent; `aw new
+     providers you are willing to send it to. It states the intent; `loom new
      <task> --fence-profile NAME` is what consents to it, and every later
      command for the task repeats that flag. See README § Fence profiles. -->
 

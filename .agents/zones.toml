@@ -26,12 +26,12 @@ paths = [
   # what the hand zone means — and may never commit one, because each of them
   # is an input to the checks that judge the agent's own work:
   #
-  #   gate.sh    decides "green, commit it" and "green, land it". `aw` runs the
+  #   gate.sh    decides "green, commit it" and "green, land it". `loom` runs the
   #              MAIN checkout's copy for both, but a worktree copy that landed
   #              would become that copy on the next task.
   #   zones.toml is this file: the zones, the fence, and the profiles. An agent
   #              that could commit it could widen its own zone.
-  #   loom.env   is `.`-sourced as shell, in your environment, on every `aw`
+  #   loom.env   is `.`-sourced as shell, in your environment, on every `loom`
   #              invocation (docs/KNOWN-GAPS.md § 3).
   #
   # Keep them here even if you fence nothing: the fence is optional, the guard
@@ -72,10 +72,10 @@ paths = [
 # ]
 
 # Optional, and only meaningful with a [fence] above it: a NAMED, per-provider
-# relaxation of the fence. A task opts in with `aw new <task> --fence-profile
+# relaxation of the fence. A task opts in with `loom new <task> --fence-profile
 # <name>`, and EVERY later command for that task repeats the flag (run, check,
 # loop, diff, rebase, land). Its worktree is fenced by [fence] MINUS `release`, and
-# `aw` refuses to run any role there whose model chain (fallbacks included)
+# `loom` refuses to run any role there whose model chain (fallbacks included)
 # reaches a provider outside `providers`. A `Fence-profile: <name>` line in the
 # task file documents the intent but never opts in on its own.
 #

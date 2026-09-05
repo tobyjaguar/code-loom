@@ -1,30 +1,30 @@
 #!/usr/bin/env bash
-# aw — agent worktree dispatcher (Loom)
+# loom — the Loom agent harness dispatcher.
 #
 # One task = one worktree = one branch = one reviewable diff.
 # Your working tree is never touched by an agent.
 #
-#   aw plan  "streaming resampler"   architect session (Claude sub via `claude`)
-#   aw plan -p "topic"               headless plan (falls back to cheap providers)
-#   aw scout "where is decode_flac"  one-shot cheap read-only lookup
-#   aw new   0007-c                  create worktree + branch for a task
-#   aw run   0007-c                  run the implementer in that worktree
-#   aw check 0007-c                  cheap cross-provider review of the diff
-#   aw loop  0007-c                  run, review, feed REVISE back, review again
-#   aw diff  0007-c                  write the task diff, then show it (pager, or $LOOM_DIFF_CMD)
-#   aw land  0007-c                  gate, merge, clean up, tick the checkbox
-#   aw land  0007-c --pr             gate, push agent/0007-c, print PR next steps
-#   aw drop  0007-c [--keep-branch]  discard worktree (and branch, unless kept)
-#   aw rebase 0007-c                 rebase the branch onto origin/main; re-point its diff base
-#   aw rebase 0007-c --accept-upstream   ... even when what arrives under the
+#   loom plan  "streaming resampler"   architect session (Claude sub via `claude`)
+#   loom plan -p "topic"               headless plan (falls back to cheap providers)
+#   loom scout "where is decode_flac"  one-shot cheap read-only lookup
+#   loom new   0007-c                  create worktree + branch for a task
+#   loom run   0007-c                  run the implementer in that worktree
+#   loom check 0007-c                  cheap cross-provider review of the diff
+#   loom loop  0007-c                  run, review, feed REVISE back, review again
+#   loom diff  0007-c                  write the task diff, then show it (pager, or $LOOM_DIFF_CMD)
+#   loom land  0007-c                  gate, merge, clean up, tick the checkbox
+#   loom land  0007-c --pr             gate, push agent/0007-c, print PR next steps
+#   loom drop  0007-c [--keep-branch]  discard worktree (and branch, unless kept)
+#   loom rebase 0007-c                 rebase the branch onto origin/main; re-point its diff base
+#   loom rebase 0007-c --accept-upstream   ... even when what arrives under the
 #                                    base touches a fenced or hand-zone path
-#   aw ls                            list active agent worktrees
-#   aw gate                          run the gate here
-#   aw zone  <path>                  which zone a path belongs to
-#   aw tier  lean|standard|deep      print export line for the model tier
-#   aw doctor                        verify binaries, keys, and MODEL IDS
-#   aw guard                         pre-commit zone check (used by the hook)
-#   aw install-hooks                 install the hand-zone commit guard
+#   loom ls                            list active agent worktrees
+#   loom gate                          run the gate here
+#   loom zone  <path>                  which zone a path belongs to
+#   loom tier  lean|standard|deep      print export line for the model tier
+#   loom doctor                        verify binaries, keys, and MODEL IDS
+#   loom guard                         pre-commit zone check (used by the hook)
+#   loom install-hooks                 install the hand-zone commit guard
 #
 #   --fence-profile <name>           REQUIRED on new, run, check, loop, diff,
 #                                    rebase and land for a task under a fence
@@ -36,21 +36,21 @@
 #                                    with "-profiled" appended). The operator
 #                                    record only checks your flag; it never
 #                                    replaces it, and a missing record is a
-#                                    refusal, not something aw infers from the
+#                                    refusal, not something loom infers from the
 #                                    worktree. (README § Fence profiles)
 #
 # Env:
 #   LOOM_TIER=lean|standard|deep   model tier            (default standard)
 #   LOOM_SKIP="zai deepseek"       providers to skip     (claude|zai|moonshotai|deepseek)
 #   LOOM_MAX_ATTEMPTS=3            implementer gate retries
-#   LOOM_LOOP_ROUNDS=2             review rounds in `aw loop`
+#   LOOM_LOOP_ROUNDS=2             review rounds in `loom loop`
 #   LOOM_MODELS_<role>="m1 m2"     replace one role's chain outright
 #   LOOM_CLAUDE_ALLOWED_TOOLS=...  what an implementer on claude-sub may run
 #                                  in a shell (default: the gate script only)
 #   LOOM_WORKTREES=/path           where worktrees live
 #   LOOM_LAND=merge|pr             land by merging here, or by pushing a branch
 #                                  for review (--pr / --merge win over this)
-#   LOOM_DIFF_CMD="delta"          how `aw diff` shows a patch; the patch path
+#   LOOM_DIFF_CMD="delta"          how `loom diff` shows a patch; the patch path
 #                                  is appended. Default: git's own pager. Split
 #                                  on whitespace, no quoting — wrap a path with
 #                                  spaces in a one-line script.
@@ -65,8 +65,8 @@
 #       tasks/<task>               base=<commit> profile=<name> branch=<br>
 #                                  created=<iso> origin=<url> reviewed=<sha>
 #
-# `aw new` writes it, `aw rebase` re-points its base, `aw check` stamps the tip
-# it had reviewed, `aw drop` deletes it, and every security check (and `aw ls`)
+# `loom new` writes it, `loom rebase` re-points its base, `loom check` stamps the tip
+# it had reviewed, `loom drop` deletes it, and every security check (and `loom ls`)
 # reads it. Mode 0700/0600.
 #
 # Anthropic policy: subscription only, on purpose. The architect runs through
@@ -81,7 +81,7 @@ set -euo pipefail
 # the fence and its profiles), .agents/loom.env, .agents/gate.sh, .opencode/ —
 # comes from the MAIN checkout, and never from the tree the command happened to
 # be typed in. An agent worktree carries its own copy of all of them, and every
-# one of those copies is a file the agent writes: `cd $WT_ROOT/0007-c && aw new
+# one of those copies is a file the agent writes: `cd $WT_ROOT/0007-c && loom new
 # t5` would otherwise fence the new task with the agent's zones.toml (i.e. not
 # at all) and source the agent's loom.env as shell, in your environment.
 #
@@ -89,22 +89,22 @@ set -euo pipefail
 # ABSOLUTE path of the main `.git` from a linked worktree, so its parent is the
 # main checkout either way. That is the same derivation the operator record is
 # keyed by, which is what lets the pre-commit guard — running inside an agent's
-# worktree — read the record `aw new` wrote.
+# worktree — read the record `loom new` wrote.
 #
 # One thing does still come from the invoking tree, and only one:
-# `aw guard`'s subject. The guard judges the commit that is happening HERE, so
+# `loom guard`'s subject. The guard judges the commit that is happening HERE, so
 # it reads the staged files and the tree of $INVOKED_ROOT while reading the
 # policy it judges them by from $ROOT. That is the whole of the split.
 INVOKED_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
-  echo "aw: not inside a git repository" >&2; exit 1; }
+  echo "loom: not inside a git repository" >&2; exit 1; }
 cd "$INVOKED_ROOT"
 INVOKED_ROOT="$(pwd -P)"
 _common="$(git rev-parse --git-common-dir 2>/dev/null)" || {
-  echo "aw: cannot resolve this repository's git directory" >&2; exit 1; }
+  echo "loom: cannot resolve this repository's git directory" >&2; exit 1; }
 [ -n "$_common" ] || {
-  echo "aw: cannot resolve this repository's git directory" >&2; exit 1; }
+  echo "loom: cannot resolve this repository's git directory" >&2; exit 1; }
 ROOT="$(cd "$(dirname "$_common")" 2>/dev/null && pwd -P)" || {
-  echo "aw: cannot resolve this repository's main checkout — refusing to guess where
+  echo "loom: cannot resolve this repository's main checkout — refusing to guess where
 the zones, the fence and the operator record live" >&2; exit 1; }
 unset _common
 cd "$ROOT"
@@ -116,7 +116,7 @@ ROOT_REAL="$ROOT"
 # is answered from the main checkout, which is not where the operator is
 # looking.
 if [ "$INVOKED_ROOT" != "$ROOT" ]; then
-  echo "aw: invoked inside $INVOKED_ROOT — reading zones, fence and env from the main checkout $ROOT" >&2
+  echo "loom: invoked inside $INVOKED_ROOT — reading zones, fence and env from the main checkout $ROOT" >&2
 fi
 
 AGENTS_DIR="$ROOT/.agents"
@@ -129,7 +129,7 @@ MAX_ATTEMPTS="${LOOM_MAX_ATTEMPTS:-3}"
 SKIP="${LOOM_SKIP:-}"
 
 # Provider keys live in one file outside every repo (chmod 600). Sourced here
-# so aw and everything it launches (opencode included) see them without the
+# so loom and everything it launches (opencode included) see them without the
 # keys ever entering a repo or a shell profile.
 LOOM_ENV="${LOOM_ENV:-$HOME/.config/loom/env}"
 if [ -f "$LOOM_ENV" ]; then set -a; . "$LOOM_ENV"; set +a; fi
@@ -160,10 +160,10 @@ for _v in $OC_VARS; do
   _oc_was="${OC_SNAP[$_oc_i]}"; _oc_val="${OC_SNAP[$((_oc_i + 1))]}"
   _oc_i=$((_oc_i + 2))
   if [ "$_oc_was" = 1 ]; then
-    [ "${!_v-}" = "$_oc_val" ] || echo "aw: WARN: .agents/loom.env set $_v — ignored (it decides which config opencode loads); the value you exported is kept" >&2
+    [ "${!_v-}" = "$_oc_val" ] || echo "loom: WARN: .agents/loom.env set $_v — ignored (it decides which config opencode loads); the value you exported is kept" >&2
     export "$_v=$_oc_val"
   else
-    [ -z "${!_v+x}" ] || echo "aw: WARN: .agents/loom.env set $_v — ignored (it decides which config opencode loads, and this file is agent-writable)" >&2
+    [ -z "${!_v+x}" ] || echo "loom: WARN: .agents/loom.env set $_v — ignored (it decides which config opencode loads, and this file is agent-writable)" >&2
     unset "$_v"
   fi
 done
@@ -177,7 +177,7 @@ if [ -n "${ZAI_API_KEY:-}" ] && [ -z "${ZHIPU_API_KEY:-}" ]; then
   export ZHIPU_API_KEY="$ZAI_API_KEY"
 fi
 
-die()  { echo "aw: $*" >&2; exit 1; }
+die()  { echo "loom: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # --------------------------------------------------- operator task state
@@ -189,7 +189,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # `branch.<br>.fenceprofile` used to live) and the refs too —
 # `refs/remotes/origin/main`, `refs/heads/main`, `refs/heads/agent/*` are one
 # `git update-ref` away from whatever the agent wants them to say. None of it
-# can carry a security input. The operator's record can, because `aw new`
+# can carry a security input. The operator's record can, because `loom new`
 # writes it and nothing in a worktree has a reason to touch it.
 #
 #   ${XDG_CONFIG_HOME:-$HOME/.config}/loom/repos/<key>/repo        <- the path
@@ -231,19 +231,19 @@ state_read() { # state_read <task> <key>
   sed -n "s/^$2=//p" "$f" | head -1
 }
 
-# The only writer. `aw new` calls it with a fresh timestamp; `aw rebase` calls
+# The only writer. `loom new` calls it with a fresh timestamp; `loom rebase` calls
 # it with the recorded one, because a re-point is not a new task.
 #
 # Two fields beyond the base and the profile, and both exist to pin something
 # an agent could otherwise move under the operator:
 #
-#   origin=<url>    `remote.origin.url` as it was at `aw new`. `aw rebase` and
-#                   `aw land --pr` refuse when the current URL differs: the
+#   origin=<url>    `remote.origin.url` as it was at `loom new`. `loom rebase` and
+#                   `loom land --pr` refuse when the current URL differs: the
 #                   remote config is in the shared .git, so one `git remote
 #                   set-url` inside a worktree re-aims the fetch a rebase
 #                   replays onto, and the push a --pr landing performs.
-#   reviewed=<sha>  the branch tip `aw check` last handed to a reviewer.
-#                   `aw land` refuses a tip that is not this one.
+#   reviewed=<sha>  the branch tip `loom check` last handed to a reviewer.
+#                   `loom land` refuses a tip that is not this one.
 state_put() { # state_put <task> <base> <profile> <branch> <created> <origin> <reviewed>
   local task="$1" f tmp
   f="$(state_file "$task")"
@@ -270,25 +270,25 @@ state_put() { # state_put <task> <base> <profile> <branch> <created> <origin> <r
 origin_url() { git remote get-url origin 2>/dev/null || true; }
 
 # The origin a task was created against must still be the origin it lands
-# against. Called by `aw rebase` (before the fetch it would replay onto) and by
-# `aw land --pr` (before the push).
+# against. Called by `loom rebase` (before the fetch it would replay onto) and by
+# `loom land --pr` (before the push).
 require_recorded_origin() { # require_recorded_origin <task> <command-name>
   local task="$1" cmd="$2" rec now
   rec="$(state_read "$task" origin)"
   now="$(origin_url)"
   [ "$rec" = "$now" ] && return 0
   die "the 'origin' remote is not the one task $task was created against:
-  recorded at aw new: ${rec:-(none)}
+  recorded at loom new: ${rec:-(none)}
   configured now:     ${now:-(none)}
 'remote.origin.url' lives in the shared .git/config, which every linked worktree
-can write, so aw will not $cmd against a remote it cannot vouch for. Put the URL
-back, or start clean:  aw drop $task && aw new $task"
+can write, so loom will not $cmd against a remote it cannot vouch for. Put the URL
+back, or start clean:  loom drop $task && loom new $task"
 }
 
 state_rm() { rm -f "$(state_file "$1")"; }
 
 # ------------------------------------------------------------ worktree roots
-# Two roots, and `aw` must be able to say where each one physically IS before
+# Two roots, and `loom` must be able to say where each one physically IS before
 # it puts anything in them. A task under a fence profile holds paths the fence
 # normally removes, so its worktree lives under a SEPARATE root: nothing that
 # runs unprofiled — no unprofiled role, and not the shared `_scout` mirror,
@@ -313,7 +313,7 @@ state_rm() { rm -f "$(state_file "$1")"; }
 # out: a repo under a symlinked /tmp is ordinary and not an attack, while a
 # symlink AT the root is caught. Resolution goes through python3 (already
 # required, for zones) rather than `cd && pwd -P`, so that a root which does
-# not exist yet can still be resolved — `aw doctor`, `aw zone` and the
+# not exist yet can still be resolved — `loom doctor`, `loom zone` and the
 # pre-commit guard must not create directories as a side effect of starting up.
 resolve_root() { # resolve_root <literal-dir>  -> its physical path
   local lit="$1" out want real
@@ -426,7 +426,7 @@ relpath() { # relpath <path> [<base>]
 # Ordered fallback chains. "claude-sub" means the `claude` CLI on your
 # subscription and "codex-sub" the `codex` CLI on your ChatGPT one; everything
 # else is opencode's built-in provider/model IDs.
-# Verify IDs with: aw doctor   (they move fast)
+# Verify IDs with: loom doctor   (they move fast)
 models_for() {
   local role="$1" override
   # LOOM_MODELS_reviewer="codex-sub deepseek/deepseek-v4-pro" replaces the whole
@@ -464,7 +464,7 @@ key_for_provider() {
 provider_of() { case "$1" in claude-sub) echo "claude" ;; codex-sub) echo "codex" ;; *) echo "${1%%/*}" ;; esac; }
 
 # Roles that EDIT their working directory. `build` runs under your eye in your
-# own tree; `implementer` (which `aw loop`'s auto-fix rounds also go through)
+# own tree; `implementer` (which `loom loop`'s auto-fix rounds also go through)
 # owns one worktree. Everything else — reviewer, scout, architect — reads.
 writes_role() { case "$1" in implementer|build) return 0 ;; *) return 1 ;; esac; }
 
@@ -511,7 +511,7 @@ looks_rate_limited() { # looks_rate_limited <logfile>
 
 # Headless model calls read stdin for appended message input when it is a
 # non-TTY stream; a caller that keeps stdin open (CI, cron, another agent's
-# shell) therefore hangs the run forever in poll. Found live: `aw run` from a
+# shell) therefore hangs the run forever in poll. Found live: `loom run` from a
 # backgrounded shell sat 100 minutes in ep_poll before the first model call.
 # /dev/null guarantees EOF for both legs.
 run_headless() { # run_headless <role> <model> <workdir> <prompt> <logfile>
@@ -578,7 +578,7 @@ not re-run." ;;
     # the log verbatim into the review file, so the final message goes to a
     # sidecar and replaces the log on success. A failed run keeps the
     # transcript: looks_rate_limited reads it.
-    last="$(mktemp "${TMPDIR:-/tmp}/aw-codex.XXXXXX")"
+    last="$(mktemp "${TMPDIR:-/tmp}/loom-codex.XXXXXX")"
     ( cd "$wd" && codex exec "${cflags[@]}" --skip-git-repo-check \
         --output-last-message "$last" \
         "$(cat "$PROMPTS_DIR/$role.md")
@@ -609,7 +609,7 @@ $prompt" ) < /dev/null > "$log" 2>&1 || rc=$?
     # on lives there — `provider.<name>.options.baseURL` repoints a provider at
     # any endpoint, and the agent definitions carry the role prompts — so an
     # agent could answer as "deepseek" from a host of its choosing, or hand
-    # itself a different role prompt, without `aw` seeing anything change.
+    # itself a different role prompt, without `loom` seeing anything change.
     #
     # opencode 1.x has the two knobs this needs, and BOTH are required:
     #   OPENCODE_CONFIG=<file>            load this config explicitly, and
@@ -621,7 +621,7 @@ $prompt" ) < /dev/null > "$log" 2>&1 || rc=$?
     # a config of their own. It used to, and that was backwards: a repo with no
     # $ROOT/.opencode/opencode.json is exactly the repo where the worktree's
     # copy is the ONLY config, so it is where an agent-written opencode.json
-    # would have been read in full. `aw` names the operator's config when one
+    # would have been read in full. `loom` names the operator's config when one
     # exists and turns the project's off either way; a repo that needs agent
     # definitions must keep them in the operator's copy.
     #
@@ -645,7 +645,7 @@ $prompt" ) < /dev/null > "$log" 2>&1 || rc=$?
     fi
     # OPENCODE_CONFIG_CONTENT is an INLINE config: a whole opencode.json in an
     # environment variable, and therefore a way to hand opencode a provider
-    # baseURL and a set of role prompts without any file `aw` looks at. It is
+    # baseURL and a set of role prompts without any file `loom` looks at. It is
     # stripped from every launch — no caller wins this one, because there is no
     # way to tell the operator's inline config from an inherited one.
     ( cd "$wd" && env -u OPENCODE_CONFIG_CONTENT "${ocenv[@]}" \
@@ -656,14 +656,14 @@ $prompt" ) < /dev/null > "$log" 2>&1 || rc=$?
   return $rc
 }
 
-# 0 = this workdir is one of `aw`'s own task worktrees (either root).
+# 0 = this workdir is one of `loom`'s own task worktrees (either root).
 in_task_worktree() { # in_task_worktree <dir>
   [ "${1#"$WT_ROOT"/}" != "$1" ] || [ "${1#"$WT_ROOT_PROFILED"/}" != "$1" ]
 }
 
 run_role() { # run_role <role> <workdir> <prompt> [<logfile>]
   local role="$1" wd="$2" prompt="$3"
-  local log="${4:-$(mktemp "${TMPDIR:-/tmp}/aw-$role.XXXXXX")}"
+  local log="${4:-$(mktemp "${TMPDIR:-/tmp}/loom-$role.XXXXXX")}"
   local m tried=""
   local -a chain=()
   # A chain is a space-separated list, and $LOOM_MODELS_<role> is operator
@@ -693,13 +693,13 @@ run_role() { # run_role <role> <workdir> <prompt> [<logfile>]
       profile_provider_guard "$role"
     fi
     tried="yes"
-    echo "aw: [$role] running on $m (tier $TIER)"
+    echo "loom: [$role] running on $m (tier $TIER)"
     if run_headless "$role" "$m" "$wd" "$prompt" "$log"; then
       return 0
     elif looks_rate_limited "$log"; then
-      echo "aw: [$role] $m looks rate-limited — falling back" >&2
+      echo "loom: [$role] $m looks rate-limited — falling back" >&2
     else
-      echo "aw: [$role] $m failed (not a rate limit) — see output above" >&2
+      echo "loom: [$role] $m failed (not a rate limit) — see output above" >&2
       return 1
     fi
   done
@@ -719,14 +719,14 @@ zones_py() { # zones_py <mode> [arg]
   #   profiles | profile-release | profile-providers | profile-released <path>
   #   profile-tracked <worktree>
   # The fence modes answer with the EFFECTIVE fence: [fence] minus the
-  # release list of $AW_FENCE_PROFILE, when one is set. `fence-present-full`
+  # release list of $LOOM_FENCE_PROFILE, when one is set. `fence-present-full`
   # is the exception, and the one the reconciler uses: the FULL fence, always.
   # `history-*` take a list of paths (a branch's diff) instead of a worktree.
   python3 - "$AGENTS_DIR/zones.toml" "$@" << 'PY'
 import sys, os, re, fnmatch, subprocess
 
 def die(msg):                        # exit 2 = "cannot answer", never "no"
-    sys.stderr.write("aw: %s\n" % msg)
+    sys.stderr.write("loom: %s\n" % msg)
     raise SystemExit(2)
 
 try:
@@ -774,14 +774,14 @@ def probes(g):
     there is no file list to compare through."""
     if g.endswith("/**"):
         base = g[:-3]
-        return [base, base + "/__aw_probe__"]
+        return [base, base + "/__loom_probe__"]
     return [g]
 
 # ---------------------------------------------------------- fence profiles
 # [fence_profiles.<name>] release = [...]  providers = [...]
 #
 # A task that opts into <name> gets a worktree fenced by [fence] MINUS
-# `release`, and `aw` refuses to run any role there whose model chain reaches
+# `release`, and `loom` refuses to run any role there whose model chain reaches
 # a provider outside `providers`. Parsing is fail-closed like everything else
 # here, with one extra rule: every released pattern must appear VERBATIM in
 # [fence].paths. A release that matched nothing would look like it worked and
@@ -791,14 +791,14 @@ def probes(g):
 # honest — it is exactly what provider_of() can return:
 #   * its two special cases, `claude` (claude-sub) and `codex` (codex-sub),
 #     the subscription CLIs;
-#   * the opencode providers `aw` carries a key for (key_for_provider):
+#   * the opencode providers `loom` carries a key for (key_for_provider):
 #     zai, zai-coding-plan, moonshotai, deepseek — the prefixes of every model
 #     ID in the built-in chains;
 #   * plus every provider this repo declares under `provider` in
 #     .opencode/opencode.json, which is how a project adds one.
 # Anything else in a `providers` list can never match a running model, so it is
 # a typo with the shape of a policy. Keep in sync with provider_of() and
-# key_for_provider() in bin/aw.
+# key_for_provider() in bin/loom.
 known_providers = {"claude", "codex", "zai", "zai-coding-plan",
                    "moonshotai", "deepseek"}
 _ocjson = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(zf))),
@@ -811,7 +811,7 @@ if os.path.exists(_ocjson):
         if isinstance(_oc, dict) and isinstance(_oc.get("provider"), dict):
             known_providers |= set(str(k) for k in _oc["provider"])
     except Exception:
-        pass          # a broken opencode.json is `aw doctor`'s business
+        pass          # a broken opencode.json is `loom doctor`'s business
 
 profiles = data.get("fence_profiles", {})
 if not isinstance(profiles, dict):
@@ -863,7 +863,7 @@ for _name, _p in profiles.items():
                 % (zf, _name, _g))
     # A released pattern that another, still-fenced pattern also covers is a
     # trap in both directions: the path never arrives in the worktree (the
-    # effective fence still hides it), while `aw guard` starts accepting
+    # effective fence still hides it), while `loom guard` starts accepting
     # commits to it. Reject the configuration rather than half-release.
     _stay = [g for g in fence if g not in _p["release"]]
     for _g in _p["release"]:
@@ -891,7 +891,7 @@ for _name, _p in profiles.items():
                         "accepting commits to them. Release '%s' as well, or narrow the "
                         "release." % (zf, _name, _g, _h, _h))
 
-prof = os.environ.get("AW_FENCE_PROFILE", "").strip()
+prof = os.environ.get("LOOM_FENCE_PROFILE", "").strip()
 if prof and prof not in profiles:
     die("unknown fence profile '%s' — %s defines: %s"
         % (prof, zf, ", ".join(sorted(profiles)) or "(none)"))
@@ -901,7 +901,7 @@ eff = [g for g in fence if g not in released]   # the fence this run applies
 def fence_sanity():
     """Fencing the contract layer would disable the very things that police
     the agent: no zones.toml in the worktree means every path resolves to
-    "assist" and `aw guard` exits 0; no gate.sh means the gate exits 127
+    "assist" and `loom guard` exits 0; no gate.sh means the gate exits 127
     and burns every attempt; no .agents/reviews/ means the gate log the
     dispatcher writes there sits outside the sparse-checkout definition, so
     `git add -A` fails after a green gate and nothing is committed. Refuse
@@ -941,7 +941,7 @@ def static_prefix(g):
     A pattern whose FIRST segment globs ('*.key', '*/secrets/**') therefore
     returns '', and present_on_disk then walks the whole worktree for it. That
     is correct and it is not free: it is the cost of a fence pattern that does
-    not start with a literal directory. `aw doctor`'s fence-shape warning
+    not start with a literal directory. `loom doctor`'s fence-shape warning
     already flags every pattern that is not the plain 'subsystem/**' form."""
     out = []
     for seg in g.split("/"):
@@ -996,7 +996,7 @@ def present_on_disk(wt, patterns):
                 if sub == ".git" or sub.endswith("/.git"):
                     continue
                 whole = [g for g in patterns
-                         if hit(sub, g) and hit(sub + "/__aw_probe__", g)]
+                         if hit(sub, g) and hit(sub + "/__loom_probe__", g)]
                 if whole:
                     found.add(sub)          # stands for everything beneath it
                     continue
@@ -1081,7 +1081,7 @@ elif mode == "profiles":       # doctor listing: name \t providers \t release
 elif mode in ("profile-release", "profile-providers", "profile-released",
               "profile-tracked"):
     if not prof:
-        die("internal error: mode '%s' needs AW_FENCE_PROFILE" % mode)
+        die("internal error: mode '%s' needs LOOM_FENCE_PROFILE" % mode)
     pr = profiles[prof]
     if mode == "profile-release":
         for g in pr["release"]:
@@ -1091,7 +1091,7 @@ elif mode in ("profile-release", "profile-providers", "profile-released",
             print(x)
     elif mode == "profile-tracked":
         # Tracked files this profile's release covers, in <worktree>. "None of
-        # these is on disk" is how `aw` tells a worktree that was BUILT under
+        # these is on disk" is how `loom` tells a worktree that was BUILT under
         # the profile from one a profile is being introduced into after the fact.
         for p in tracked_in(args[0] if args else None):
             if any(hit(p, g) for g in pr["release"]):
@@ -1108,11 +1108,11 @@ zone_of() { # zone_of <repo-relative-path>   (fails loudly: callers gate commits
 }
 
 # zones_py with NO profile active, whatever this command asserted. The subshell
-# is the point: `AW_FENCE_PROFILE` is exported, and a caller must not have its
+# is the point: `LOOM_FENCE_PROFILE` is exported, and a caller must not have its
 # own answer changed by asking this question. Used where a release list has no
-# standing — `aw rebase`'s judgement of what arrives from upstream, which nobody
+# standing — `loom rebase`'s judgement of what arrives from upstream, which nobody
 # released anything for.
-zones_py_full() { ( unset AW_FENCE_PROFILE; zones_py "$@" ); }
+zones_py_full() { ( unset LOOM_FENCE_PROFILE; zones_py "$@" ); }
 
 # ------------------------------------------------------------ fence profiles
 # A fence profile is a NAMED, per-provider relaxation of the read fence: the
@@ -1123,9 +1123,9 @@ zones_py_full() { ( unset AW_FENCE_PROFILE; zones_py "$@" ); }
 # Two rules keep it honest, and they are the whole design:
 #
 #   1. The opt-in is a FRESH OPERATOR ACT on every command. `--fence-profile
-#      <name>` must be passed to `aw new`, `run`, `check`, `loop`, `rebase` and
+#      <name>` must be passed to `loom new`, `run`, `check`, `loop`, `rebase` and
 #      `land` alike. The operator record (the state file outside every repo)
-#      keeps the name `aw new` was given, but ONLY as a consistency record: it
+#      keeps the name `loom new` was given, but ONLY as a consistency record: it
 #      may refuse a command, never authorise one. A `Fence-profile:` line in
 #      the task file is documentation of intent; the flag is the consent.
 #   2. Enforcement is a CONSISTENCY CHECK against what is on disk and in the
@@ -1137,15 +1137,18 @@ zones_py_full() { ( unset AW_FENCE_PROFILE; zones_py "$@" ); }
 #      released paths in one command. They refuse; the flag consents.
 #
 # The active profile is NEVER taken from the environment either: an inherited
-# AW_FENCE_PROFILE would widen the fence for whoever exported it. `aw` sets it
-# itself, from the operator's flag, and clears anything it inherited here.
-unset AW_FENCE_PROFILE
+# LOOM_FENCE_PROFILE would widen the fence for whoever exported it. `loom` sets it
+# itself, from the operator's flag, and clears anything it inherited here. Both
+# spellings are cleared: AW_FENCE_PROFILE is what this variable was called
+# before the dispatcher was renamed, and a shell that still exports it is
+# exactly the shell this rule exists for.
+unset LOOM_FENCE_PROFILE AW_FENCE_PROFILE
 FENCE_PROFILE=""      # active profile name; "" = the full fence, today's behaviour
 FENCE_RELEASED=""     # its release patterns, space separated (for prompts/messages)
 
 # Fence lookups fail CLOSED. If zones.toml cannot be read we do not know what is
 # fenced, and "nothing is fenced" would hand a fenced tree to a third-party
-# model. Parsed once per `aw` invocation and cached, so subshells inherit it.
+# model. Parsed once per `loom` invocation and cached, so subshells inherit it.
 FENCE_PATTERNS=""
 FENCE_LOADED=""
 load_fence() {
@@ -1157,12 +1160,12 @@ load_fence() {
 
 has_fence() { load_fence; [ -n "$FENCE_PATTERNS" ]; }
 
-# Turn a profile on for the rest of this `aw` invocation. Dies on an unknown or
+# Turn a profile on for the rest of this `loom` invocation. Dies on an unknown or
 # malformed profile — zones_py validates it — so every caller is fail-closed.
 fence_profile_activate() { # fence_profile_activate <name>
   local name="$1"
   [ -n "$name" ] || return 0
-  export AW_FENCE_PROFILE="$name"
+  export LOOM_FENCE_PROFILE="$name"
   FENCE_RELEASED="$(zones_py profile-release | tr '\n' ' ')" \
     || die "fence profile '$name' is not usable — fix .agents/zones.toml"
   FENCE_RELEASED="${FENCE_RELEASED% }"
@@ -1177,7 +1180,7 @@ fence_profile_activate() { # fence_profile_activate <name>
 profile_releases() { # profile_releases <profile> <path>
   local rc=0
   [ -n "$1" ] || return 1
-  ( export AW_FENCE_PROFILE="$1"; zones_py profile-released "$2" >/dev/null ) || rc=$?
+  ( export LOOM_FENCE_PROFILE="$1"; zones_py profile-released "$2" >/dev/null ) || rc=$?
   case "$rc" in
     0) return 0 ;;
     3) return 1 ;;
@@ -1191,7 +1194,7 @@ is_released() { # is_released <path>
   profile_releases "$FENCE_PROFILE" "$1"
 }
 
-# NOTE on what the tree is worth as evidence. `aw` checks the worktree against
+# NOTE on what the tree is worth as evidence. `loom` checks the worktree against
 # the asserted profile everywhere, and that check is a CONSISTENCY CHECK, not a
 # second signature: an agent inside the worktree can `git sparse-checkout
 # disable`, or simply write the files, so a tree that "looks like" a profile
@@ -1232,7 +1235,7 @@ profile_provider_guard() { # profile_provider_guard <role>...
       die "fence profile '$FENCE_PROFILE' releases fenced paths into this worktree,
 but the $role chain would run '$m' (provider '$p'). The profile allows only: $allowed
 Restrict the chain for this task, e.g.:
-  LOOM_MODELS_$role=\"${hint# }\" aw ..."
+  LOOM_MODELS_$role=\"${hint# }\" loom ..."
     done
   done
 }
@@ -1290,11 +1293,11 @@ fence_verify() { # fence_verify <worktree>
 $(printf '%s\n' "$left" | sed 's/^/  /')
 git will not drop a tracked file with local changes, and a sparse checkout
 never removes an untracked one. Commit or discard the changes in the worktree,
-delete the untracked files, or start clean with: aw drop <task-id>"
+delete the untracked files, or start clean with: loom drop <task-id>"
 }
 
 # (Re-)apply the fence to a worktree that may predate it, then prove it took.
-# No-op when no fence is configured. Called on every `aw run` and `aw scout`,
+# No-op when no fence is configured. Called on every `loom run` and `loom scout`,
 # because a worktree created before a fence was added or widened would
 # otherwise hand the fenced paths straight to the implementer.
 fence_enforce() { # fence_enforce <worktree>
@@ -1323,19 +1326,19 @@ fence_enforce() { # fence_enforce <worktree>
 #      diff and patch file still carry the content into the next model.
 #   3. a profile is asserted but NONE of what it releases is on disk: die.
 #      That tree was not built under the profile, and a profile may not be
-#      introduced after `aw new` — that is how a forged branch record would
+#      introduced after `loom new` — that is how a forged branch record would
 #      otherwise cash out.
 #   4. present, nothing asserted: DIE. Unconditionally.
 #      This rule used to have an arm: if the record named a profile that would
-#      have released exactly these paths, `aw` re-fenced to the full fence,
+#      have released exactly these paths, `loom` re-fenced to the full fence,
 #      printed three warnings and ran. Back then the record was branch config,
 #      so that arm let a `git config` in the worktree turn a refusal into a
 #      warning. The record has moved out of the repo since, and the arm is
 #      still gone: a record only ever refuses, whoever can write it. An
-#      unprofiled tree holding fenced paths is a dead stop; `aw drop` is the
+#      unprofiled tree holding fenced paths is a dead stop; `loom drop` is the
 #      fix.
 #   5. nothing present, nothing asserted: the ordinary path — apply and verify
-#      the full fence, as `aw run` has always done. (Not a rule about a
+#      the full fence, as `loom run` has always done. (Not a rule about a
 #      release; it is the ordinary case, and it is numbered so that the count
 #      above matches the list.)
 fence_reconcile() { # fence_reconcile <worktree> <asserted-profile-or-empty>
@@ -1354,7 +1357,7 @@ fence_reconcile() { # fence_reconcile <worktree> <asserted-profile-or-empty>
     if [ -n "$stray" ]; then
       die "fence profile '$asserted' does not release paths that are present in $wt:$stray
 This worktree was built under a different fence. Start clean:
-  aw drop <task-id> && aw new <task-id> --fence-profile $asserted"
+  loom drop <task-id> && loom new <task-id> --fence-profile $asserted"
     fi
     # Nothing released is on disk. If the profile releases nothing tracked there
     # is nothing to introduce and nothing to check; otherwise this tree predates
@@ -1369,8 +1372,8 @@ This worktree was built under a different fence. Start clean:
     if [ -z "$present" ] && [ -n "$tracked" ]; then
       die "worktree $wt holds none of the paths fence profile '$asserted' releases.
 It was not created under that profile, and a profile cannot be introduced after
-'aw new'. Start clean:
-  aw drop <task-id> && aw new <task-id> --fence-profile $asserted"
+'loom new'. Start clean:
+  loom drop <task-id> && loom new <task-id> --fence-profile $asserted"
     fi
     fence_apply "$wt"
     fence_verify "$wt"
@@ -1380,7 +1383,7 @@ It was not created under that profile, and a profile cannot be introduced after
   # Nothing asserted, and the tree holds fenced paths. Every top-level command
   # has already refused this (require_fence_flag dies when a record exists and
   # the flag does not), so reaching here means either a fence that was widened
-  # under an existing worktree — which dies, `aw drop` is the fix — or a caller
+  # under an existing worktree — which dies, `loom drop` is the fix — or a caller
   # that skipped require_fence_flag, which is what run_role's second call is
   # here to catch. Either way it is a dead stop: the record is not consulted,
   # because a record that could turn this refusal into a warning would be a
@@ -1391,7 +1394,7 @@ asserted for this command:
 $(printf '%s\n' "$present" | sed 's/^/  /')
 Refusing to run a model here. Either name the profile these paths belong to
 (--fence-profile <name>, which must also be the profile the worktree was
-created under), or start clean:  aw drop <task-id>"
+created under), or start clean:  loom drop <task-id>"
   fi
   fence_enforce "$wt"
 }
@@ -1399,22 +1402,22 @@ created under), or start clean:  aw drop <task-id>"
 # ------------------------------------------------- reconcile, over HISTORY
 # fence_reconcile answers "what is in this worktree NOW". That is not the whole
 # question, because a worktree can be re-fenced after the fact: an agent (or an
-# `aw` run) can materialise core/**, commit it, and put the sparse rules back,
+# `loom` run) can materialise core/**, commit it, and put the sparse rules back,
 # and the tree then looks clean while every `git diff`, every
 # .agents/reviews/<task>.patch and every merge still carries the content. So
 # the branch's COMMITS are judged too, wherever history is handed to a role or
-# to the operator: aw check (before the patch is written), aw loop (each
-# round), aw diff, aw land (before merge and before push) and aw rebase.
+# to the operator: loom check (before the patch is written), loom loop (each
+# round), loom diff, loom land (before merge and before push) and loom rebase.
 #
 # BOTH ENDS of that range come from outside the worktree, and neither is the
 # worktree's HEAD:
 #   * the base is the OPERATOR RECORD (security_base), a file outside the repo;
 #   * the endpoint is refs/heads/agent/<task>, read in $ROOT — the same ref
-#     `aw land` merges and `aw land --pr` pushes. The worktree's HEAD is not
+#     `loom land` merges and `loom land --pr` pushes. The worktree's HEAD is not
 #     that: `git checkout --detach HEAD~1` inside the worktree leaves the
 #     fenced commit on the branch while every check measured from HEAD sees a
 #     clean history. (A worktree in that state is refused outright as well —
-#     require_wt_on_branch — because it is not a state `aw` produces.)
+#     require_wt_on_branch — because it is not a state `loom` produces.)
 #
 # Every way of not knowing is a DEATH, never an empty answer. An unresolvable
 # base used to `return 0` with no paths, which reads downstream as "this
@@ -1426,7 +1429,7 @@ history_paths() { # history_paths <dir> <base> <rev>  -> fills $HIST_PATHS
   HIST_PATHS=()
   [ -n "$base" ] || die "internal error: history_paths called with no base"
   git -C "$d" rev-parse --verify --quiet "$base^{commit}" >/dev/null 2>&1 \
-    || die "the base commit '$base' does not resolve in $d, so aw cannot tell what this
+    || die "the base commit '$base' does not resolve in $d, so loom cannot tell what this
 branch's commits touch. Refusing to guess — a base that does not resolve is not
 an empty diff."
   git -C "$d" rev-parse --verify --quiet "$rev^{commit}"  >/dev/null 2>&1 \
@@ -1439,7 +1442,7 @@ an empty diff."
   # A NUL-delimited stream cannot survive a command substitution, and the exit
   # status of a process substitution cannot be read — so it goes through a
   # file, and a git that fails is a refusal rather than an empty path list.
-  local out; out="$(mktemp "${TMPDIR:-/tmp}/aw-hist.XXXXXX")"
+  local out; out="$(mktemp "${TMPDIR:-/tmp}/loom-hist.XXXXXX")"
   if ! { git -C "$d" diff -z --no-renames --name-only "$base" "$rev" \
       && git -C "$d" diff -z --no-renames --name-only --diff-filter=A "$base" "$rev"
        } > "$out" 2>/dev/null; then
@@ -1476,12 +1479,12 @@ The worktree may no longer show them, but the history does, and the diff, the
 review patch and any merge carry their content onward.
 If this task was created under a fence profile that releases these paths, name
 it: --fence-profile <name>. Otherwise the branch is tainted — throw it away:
-  aw drop <task-id>"
+  loom drop <task-id>"
 }
 
 # [hand] paths in the branch's commits that the asserted profile does not
 # release. The pre-commit guard is supposed to stop these, but it runs in the
-# agent's own context where `git commit --no-verify` exists, so `aw land`
+# agent's own context where `git commit --no-verify` exists, so `loom land`
 # checks the commits it is about to publish rather than trusting that it did.
 hand_reconcile_history() { # hand_reconcile_history <dir> <base> <rev>
   local d="$1" base="$2" rev="$3" bad note=""
@@ -1509,7 +1512,7 @@ and are in scope for this task."
 }
 
 cmd_zone() {
-  local p="${1:?usage: aw zone <path>}" z
+  local p="${1:?usage: loom zone <path>}" z
   p="$(relpath "$p")"
   z="$(zone_of "$p")" || die "zone lookup failed for $p"
   if is_fenced "$p"; then
@@ -1543,8 +1546,8 @@ cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
   # `git sparse-checkout disable`, and an unsandboxed agent can write $HOME
   # (KNOWN-GAPS 3). It catches a stale worktree and an honest mistake. What
   # actually decides whether released content ever reaches a provider is the
-  # operator's --fence-profile flag on `aw new`, checked again on every later
-  # command, and `aw land`'s check of the commits themselves.
+  # operator's --fence-profile flag on `loom new`, checked again on every later
+  # command, and `loom land`'s check of the commits themselves.
   local prof present p tracked
   prof="$(state_read "${branch#agent/}" profile 2>/dev/null || true)"
   if [ -n "$prof" ]; then
@@ -1568,7 +1571,7 @@ cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
     if [ -z "$present" ] && [ -n "$tracked" ]; then
       echo "pre-commit: BLOCKED — this task records fence profile '$prof', but none of" >&2
       echo "the paths that profile releases are in this worktree. The record was not" >&2
-      echo "written by the 'aw new' that built this tree; refusing to honour it." >&2
+      echo "written by the 'loom new' that built this tree; refusing to honour it." >&2
       exit 1
     fi
   fi
@@ -1596,16 +1599,16 @@ cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
 
 # The pre-commit hook git actually runs: honours core.hooksPath and, from
 # inside a linked worktree, resolves to the shared common dir. May be
-# relative — fine, aw cd's to $ROOT at startup and never leaves it.
+# relative — fine, loom cd's to $ROOT at startup and never leaves it.
 hook_path() { git rev-parse --git-path hooks/pre-commit; }
 
 # ----------------------------------------------------------------- worktrees
 # git cannot track an empty directory, so .agents/reviews/ is absent from a
 # fresh worktree unless the repo happens to keep a .gitkeep in it. Every write
 # into it (gate log, patch, review) would then fail on the redirect — which
-# `aw run` reads as a red gate and burns all its attempts on. Create it.
+# `loom run` reads as a red gate and burns all its attempts on. Create it.
 #
-# It is also where `aw check` and `aw diff` put the review patch, which is why
+# It is also where `loom check` and `loom diff` put the review patch, which is why
 # wt_dirty excludes it and why a consuming repo should gitignore it.
 reviews_dir() { mkdir -p "$1/.agents/reviews"; }
 
@@ -1639,9 +1642,9 @@ refuse_cross_root() { # refuse_cross_root <task>
   local task="$1" other; other="$(wt_path_other "$task")"
   [ -d "$other" ] || return 0
   die "task $task already has a worktree at $other, built under a different fence
-setting than this command asserts. A profile cannot be introduced after 'aw new',
+setting than this command asserts. A profile cannot be introduced after 'loom new',
 and it cannot be dropped from a task either. Start clean:
-  aw drop $task && aw new $task${FLAG_PROFILE:+ --fence-profile $FLAG_PROFILE}"
+  loom drop $task && loom new $task${FLAG_PROFILE:+ --fence-profile $FLAG_PROFILE}"
 }
 
 # The worktree for a task that must already have one, checked out on that
@@ -1658,8 +1661,8 @@ branch_of()  { echo "agent/$1"; }
 branch_ref() { echo "refs/heads/agent/$1"; }
 
 # Uncommitted work in a task worktree, EXCEPT the dispatcher's own review
-# scratch: `aw check` and `aw diff` write .agents/reviews/<task>.patch and
-# -review.md into the worktree themselves, so counting those would make `aw`
+# scratch: `loom check` and `loom diff` write .agents/reviews/<task>.patch and
+# -review.md into the worktree themselves, so counting those would make `loom`
 # refuse to land after its own review step. Consumers should gitignore
 # .agents/reviews/ (README); this exclusion is what keeps the check honest in
 # the repos that have not.
@@ -1688,7 +1691,7 @@ wt_dirty() { # wt_dirty <worktree>   -> the offending `git status --porcelain` l
 #     main had them counted as the branch's own.
 #
 # So the base is the OPERATOR RECORD: the commit `$ROOT` was checked out at
-# when `aw new` created the task, written by `aw new`, re-pointed by `aw rebase`
+# when `loom new` created the task, written by `loom new`, re-pointed by `loom rebase`
 # (an operator command), and read from a file outside every repo. It is the
 # base of BOTH the security checks and the review patch — there is nothing left
 # to clamp, because there is no second, cheaper base to clamp against.
@@ -1716,14 +1719,14 @@ require_pinned_tip() {
   [ -n "$PINNED_TIP" ] || die "internal error: the branch tip was not pinned for this command"
 }
 
-# The operator record's existence, said in security_base's words. `aw run` needs
+# The operator record's existence, said in security_base's words. `loom run` needs
 # the refusal without the rest of security_base, because a task that has just
 # been created legitimately has nothing past its branch point.
 require_record() { # require_record <task>
   [ -n "$(state_read "$1" base)" ] || die "no operator record for task $1 — created before this version, or
-removed. There is no base to judge this branch's commits against, and aw will
+removed. There is no base to judge this branch's commits against, and loom will
 not derive one from anything a worktree can write. Start clean:
-  aw drop $1 && aw new $1"
+  loom drop $1 && loom new $1"
 }
 
 security_base() { # security_base <task>  -> the recorded base commit, or dies
@@ -1735,23 +1738,23 @@ security_base() { # security_base <task>  -> the recorded base commit, or dies
   base="$(git rev-parse --verify --quiet "$base^{commit}" 2>/dev/null)" \
     || die "the base recorded for task $task does not resolve in $ROOT.
 That commit is what every fence and hand history check is measured from, so
-without it aw cannot tell what this branch's commits touch — and will not guess.
-If the history was rewritten under it:  aw drop $task && aw new $task"
+without it loom cannot tell what this branch's commits touch — and will not guess.
+If the history was rewritten under it:  loom drop $task && loom new $task"
   git merge-base --is-ancestor "$base" "$PINNED_TIP" 2>/dev/null \
     || die "the base recorded for task $task ($(git rev-parse --short "$base")) is not an
 ancestor of $br. This branch is not the one that record was written for — it was
-rebased or reset outside 'aw rebase', or the record belongs to another task.
+rebased or reset outside 'loom rebase', or the record belongs to another task.
 Inspect it, do not land it:  git log --oneline $(git rev-parse --short "$base")..$br"
   # Equal, or behind: there is nothing between the branch point and the branch.
   # An empty review is not something to hand a reviewer, and an empty history
   # check is not evidence of anything.
   ! git merge-base --is-ancestor "$PINNED_TIP" "$base" 2>/dev/null \
     || die "nothing to review/land — the branch has no commits past its branch point
-($(git rev-parse --short "$base")). Run the implementer first:  aw run $task"
+($(git rev-parse --short "$base")). Run the implementer first:  loom run $task"
   printf '%s\n' "$base"
 }
 
-# A worktree `aw` produced is checked out on its own branch. A detached or
+# A worktree `loom` produced is checked out on its own branch. A detached or
 # switched one is not, and it is not a state to reconcile: what a command reads
 # from that tree and what the branch's commits say have come apart, which is
 # the whole trick behind `git checkout --detach HEAD~1` after a fenced commit.
@@ -1760,17 +1763,17 @@ require_wt_on_branch() { # require_wt_on_branch <task> <worktree>
   br="$(branch_of "$task")"
   head="$(git -C "$wt" symbolic-ref -q HEAD 2>/dev/null || true)"
   [ "$head" = "refs/heads/$br" ] || die "the worktree $wt is not on refs/heads/$br
-(HEAD there is '${head:-detached}'). aw never leaves a worktree like that, and it
+(HEAD there is '${head:-detached}'). loom never leaves a worktree like that, and it
 will not judge one: the tree and the branch's commits no longer describe the
 same work. Put it back:
   git -C $wt checkout $br
-or start clean:  aw drop $task"
+or start clean:  loom drop $task"
 }
 
 # --- where a task's fence profile comes from -------------------------------
 # From the operator, on the command line, every single time. `--fence-profile
-# <name>` is required by `aw new`, `run`, `check`, `loop`, `rebase` and `land`
-# alike. The `profile` field of the operator record is written at `aw new` and
+# <name>` is required by `loom new`, `run`, `check`, `loop`, `rebase` and `land`
+# alike. The `profile` field of the operator record is written at `loom new` and
 # is a CONSISTENCY RECORD, not an authorisation: it can refuse a command (the
 # flag is missing, or names a different profile) but it can never supply one.
 # `branch.agent/<task>.fenceprofile` is neither read nor written any more — it
@@ -1778,12 +1781,12 @@ or start clean:  aw drop $task"
 # write it, so it was a claim with the shape of a record.
 #
 # A `Fence-profile: <name>` line in the task file is the third form, and the
-# weakest: it documents the intent of a task, and `aw new` honours it only when
+# weakest: it documents the intent of a task, and `loom new` honours it only when
 # the same name is also passed on the command line. The file is written by
 # whoever wrote the task — an architect agent included.
 # The task file's HEADER BLOCK: the metadata paragraph under the title, where
 # `Zone:` lives. Scanning the whole file would let a `Fence-profile:` line
-# inside a code fence read as a declaration — and `aw loop` appends reviewer
+# inside a code fence read as a declaration — and `loom loop` appends reviewer
 # output, verbatim, to this very file.
 #
 # The title is skipped wherever it is, not only on line 1: a file that opens
@@ -1816,7 +1819,7 @@ task_profile() { # task_profile <task>  -> declared profile, or "" (never fails)
 # Header-block lines that were MEANT to be a `Fence-profile:` declaration and
 # are not one: `Fence-profile :`, `Fence profile:`, `Fence_profile:`. Silence
 # here reads as "the declaration was honoured", which is the one thing it must
-# never read as, so `aw new` says so out loud.
+# never read as, so `loom new` says so out loud.
 task_profile_nearmiss() { # task_profile_nearmiss <task>
   task_header "$1" \
     | grep -i -E '^[[:space:]]*fence[-_ ]?profile[[:space:]]*:' \
@@ -1858,32 +1861,32 @@ require_fence_flag() { # require_fence_flag <task> <command-name>
     rec="$(state_read "$task" profile)"
     if [ -n "$rec" ] && [ -z "$flag" ]; then
       die "this task was created under fence profile '$rec'; pass --fence-profile $rec:
-  aw $cmd $task --fence-profile $rec"
+  loom $cmd $task --fence-profile $rec"
     fi
     if [ -n "$rec" ] && [ "$rec" != "$flag" ]; then
       die "--fence-profile '$flag' contradicts the record for $task ('$rec').
-Use '$rec', or start clean:  aw drop $task && aw new $task --fence-profile $flag"
+Use '$rec', or start clean:  loom drop $task && loom new $task --fence-profile $flag"
     fi
     if [ -z "$rec" ] && [ -n "$flag" ]; then
       # Rule 3, absolute. There used to be an escape here: if the worktree
-      # already held exactly what '$flag' releases, `aw` called that
+      # already held exactly what '$flag' releases, `loom` called that
       # corroboration, restored the record and ran. It is not corroboration.
       # A worktree is a directory an agent can write: `git sparse-checkout
       # disable` materialises the released paths, and so does `git checkout
       # <ref> -- core/`. The tree can only ever refuse; it can never vouch.
       # So: no record, no run. Re-creating the task is the fix, and it is an
-      # OPERATOR act with the same weight as the flag — `aw` does not infer a
+      # OPERATOR act with the same weight as the flag — `loom` does not infer a
       # profile from a directory listing, and it does not write a record for
       # a task it did not create.
       die "task $task has no fence-profile record: the operator record for it names no
 profile, or there is no record at all.
-A profile cannot be introduced after 'aw new', and a worktree that happens to
+A profile cannot be introduced after 'loom new', and a worktree that happens to
 hold the released paths is not evidence — anything running there can create
 them. Start clean:
-  aw drop $task && aw new $task --fence-profile $flag"
+  loom drop $task && loom new $task --fence-profile $flag"
     fi
   fi
-  # No branch yet: nothing to contradict. `aw new` (which run/loop call) applies
+  # No branch yet: nothing to contradict. `loom new` (which run/loop call) applies
   # its own rules to the flag and to the task file's declaration.
   [ -n "$flag" ] && fence_profile_activate "$flag"
   refuse_cross_root "$task"
@@ -1892,36 +1895,36 @@ them. Start clean:
 
 # A worktree that exists without its operator record is a worktree nobody can
 # reason about later — released paths on disk with no record of why, and no
-# base to measure its commits from. `aw new` therefore records while the tree
+# base to measure its commits from. `loom new` therefore records while the tree
 # is still empty, and unwinds the whole thing if anything fails or the operator
 # interrupts it.
 #
 # What this trap deletes, it says out loud, and it deletes a BRANCH only when
-# that branch exists NOW and `aw new` observed it absent before it started.
+# that branch exists NOW and `loom new` observed it absent before it started.
 # Both halves matter:
 #   * `git worktree add -b` creates the branch and THEN fails on the path (a
 #     symlink or a file at $wt is enough), so a run that never reached the
 #     "branch created" line could still leave an orphan behind — which then
 #     made the task id permanently unusable;
 #   * setting $NEW_BR unconditionally before the add is what once deleted a
-#     PRE-EXISTING branch (the state `aw drop --keep-branch` leaves on
+#     PRE-EXISTING branch (the state `loom drop --keep-branch` leaves on
 #     purpose) when the add failed because that branch was already there.
-# `aw new` refuses an existing branch up front, so anything this trap sees is
+# `loom new` refuses an existing branch up front, so anything this trap sees is
 # a branch this command made.
 NEW_WT=""; NEW_BR=""; NEW_STATE=""
 new_abort() {
   [ -n "$NEW_WT$NEW_BR$NEW_STATE" ] || return 0
   [ -n "$NEW_WT" ] && {
-    echo "aw: aborting — removing the half-built worktree $NEW_WT" >&2
+    echo "loom: aborting — removing the half-built worktree $NEW_WT" >&2
     git worktree remove --force "$NEW_WT" >/dev/null 2>&1 || true
     git worktree prune >/dev/null 2>&1 || true
   }
   if [ -n "$NEW_BR" ] && git show-ref --verify --quiet "refs/heads/$NEW_BR"; then
-    echo "aw: aborting — deleting the branch this command created: $NEW_BR" >&2
+    echo "loom: aborting — deleting the branch this command created: $NEW_BR" >&2
     git branch -D "$NEW_BR" >&2 || true
   fi
   if [ -n "$NEW_STATE" ]; then
-    echo "aw: aborting — removing the operator record this command wrote: $NEW_STATE" >&2
+    echo "loom: aborting — removing the operator record this command wrote: $NEW_STATE" >&2
     state_rm "$NEW_STATE" || true
   fi
   NEW_WT=""; NEW_BR=""; NEW_STATE=""
@@ -1933,11 +1936,11 @@ cmd_new() {
   prof="$FLAG_PROFILE"
   for a in ${FLAG_ARGS[0]+"${FLAG_ARGS[@]}"}; do
     case "$a" in
-      -*) die "aw new: unknown flag '$a' — usage: aw new <task-id> [--fence-profile <name>]" ;;
-      *)  if [ -z "$task" ]; then task="$a"; else die "aw new: unexpected argument '$a'"; fi ;;
+      -*) die "loom new: unknown flag '$a' — usage: loom new <task-id> [--fence-profile <name>]" ;;
+      *)  if [ -z "$task" ]; then task="$a"; else die "loom new: unexpected argument '$a'"; fi ;;
     esac
   done
-  [ -n "$task" ] || die "usage: aw new <task-id> [--fence-profile <name>]"
+  [ -n "$task" ] || die "usage: loom new <task-id> [--fence-profile <name>]"
   local wt br
   # wt_path follows $FLAG_PROFILE, so this is the profiled root when a profile
   # was asserted and the unprofiled one otherwise. Set it before either check.
@@ -1945,15 +1948,15 @@ cmd_new() {
   wt="$(wt_path "$task")"; br="$(branch_of "$task")"
   [ -d "$wt" ] && die "worktree already exists: $wt"
   refuse_cross_root "$task"
-  # An existing branch is a refusal, never something to walk over. `aw drop
+  # An existing branch is a refusal, never something to walk over. `loom drop
   # <task> --keep-branch` leaves exactly this state on purpose, and the old
   # code set $NEW_BR before the add, so the EXIT trap deleted that branch —
   # and its commits — when the add failed. Checked before anything is created
   # or any trap is armed.
   local br_existed=""
   if git show-ref --verify --quiet "refs/heads/$br"; then br_existed=yes; fi
-  [ -z "$br_existed" ] || die "branch $br already exists — aw drop $task first.
-(If you used 'aw drop $task --keep-branch', that branch is holding work: land it
+  [ -z "$br_existed" ] || die "branch $br already exists — loom drop $task first.
+(If you used 'loom drop $task --keep-branch', that branch is holding work: land it
 or delete it deliberately with 'git branch -D $br' before reusing the task id.)"
   [ -f "$AGENTS_DIR/tasks/$task.md" ] || die "no task file: .agents/tasks/$task.md"
   # A key that was meant to be `Fence-profile:` and is not one is worse than no
@@ -1961,27 +1964,27 @@ or delete it deliberately with 'git branch -D $br' before reusing the task id.)"
   local nm
   while IFS= read -r nm; do
     [ -n "$nm" ] || continue
-    echo "aw: WARN: .agents/tasks/$task.md header contains '$(printf '%s' "$nm" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')'" >&2
-    echo "aw: WARN: — that is NOT a fence-profile declaration and was not honoured." >&2
-    echo "aw: WARN: The key is spelled exactly 'Fence-profile:' (no space before the colon)." >&2
+    echo "loom: WARN: .agents/tasks/$task.md header contains '$(printf '%s' "$nm" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')'" >&2
+    echo "loom: WARN: — that is NOT a fence-profile declaration and was not honoured." >&2
+    echo "loom: WARN: The key is spelled exactly 'Fence-profile:' (no space before the colon)." >&2
   done <<< "$(task_profile_nearmiss "$task")"
   # The task file's declaration is intent, the flag is consent. A declaration
   # alone never opts a task in: the file is written by whoever wrote the task.
   decl="$(task_profile "$task")"
   if [ -n "$decl" ] && [ -z "$prof" ]; then
-    die "aw new: .agents/tasks/$task.md declares 'Fence-profile: $decl', which releases
+    die "loom new: .agents/tasks/$task.md declares 'Fence-profile: $decl', which releases
 fenced paths into this worktree. Confirm it on the command line:
-  aw new $task --fence-profile $decl"
+  loom new $task --fence-profile $decl"
   fi
   if [ -n "$prof" ] && [ -n "$decl" ] && [ "$prof" != "$decl" ]; then
-    die "aw new: --fence-profile '$prof' contradicts 'Fence-profile: $decl' in .agents/tasks/$task.md — fix one"
+    die "loom new: --fence-profile '$prof' contradicts 'Fence-profile: $decl' in .agents/tasks/$task.md — fix one"
   fi
   if [ -n "$prof" ]; then
     fence_profile_activate "$prof"                 # dies on an unknown profile
     # Checked BEFORE the worktree exists: a released path must never land on
     # disk for a chain that is not allowed to see it, not even briefly.
     profile_provider_guard implementer reviewer
-    echo "aw: fence profile '$prof' — released into this worktree: $FENCE_RELEASED" >&2
+    echo "loom: fence profile '$prof' — released into this worktree: $FENCE_RELEASED" >&2
   fi
   local wtroot; wtroot="$(root_of_wt "$wt")"
   mkdir -p "$(dirname "$wt")"
@@ -1998,10 +2001,10 @@ fenced paths into this worktree. Confirm it on the command line:
   # would move the branch the operator is standing on — visible in their own
   # working tree, in their prompt, in the next `git status`. `origin/main` is
   # the opposite: a moved `refs/remotes/origin/main` shows NOWHERE, which is why
-  # `aw rebase` refuses to replay onto it without checking what came with it.
+  # `loom rebase` refuses to replay onto it without checking what came with it.
   local newbase; newbase="$(git rev-parse HEAD)" \
     || die "cannot resolve HEAD in $ROOT — there is no branch point to record"
-  # The remote as it is right now, so that a later `aw rebase` / `aw land --pr`
+  # The remote as it is right now, so that a later `loom rebase` / `loom land --pr`
   # can tell that it still is.
   local neworigin; neworigin="$(origin_url)"
   NEW_WT="$wt"
@@ -2032,7 +2035,7 @@ fenced paths into this worktree. Confirm it on the command line:
 
 cmd_run() {
   scan_fence_flag "$@"
-  local task="${FLAG_ARGS[0]:?usage: aw run <task-id> [--fence-profile <name>]}"
+  local task="${FLAG_ARGS[0]:?usage: loom run <task-id> [--fence-profile <name>]}"
   local wt br attempt=1 gate_note="" title fnote pnote
   local -a newargs=()
   # require_fence_flag first: it may activate the profile, and which worktree
@@ -2048,9 +2051,9 @@ cmd_run() {
   # No record, no run. A worktree without one is a worktree nobody can judge
   # later: no base to measure its commits from, no note of the fence it was
   # created under. It used to run a model and commit anyway, and the refusal
-  # only arrived at `aw check`, with the content already on the branch.
+  # only arrived at `loom check`, with the content already on the branch.
   # security_base says this in full but also refuses a branch with nothing past
-  # its branch point — which is the ordinary state of a task `aw run` is about
+  # its branch point — which is the ordinary state of a task `loom run` is about
   # to implement — so the record's existence is checked on its own, here.
   require_record "$task"
   # Re-apply and verify, and refuse outright if what is on disk and what the
@@ -2061,9 +2064,9 @@ cmd_run() {
   title="$(head -1 "$AGENTS_DIR/tasks/$task.md" | sed 's/^#[[:space:]]*//')"
   load_fence; fnote="$(fence_note)"; pnote="$(profile_note)"
 
-  echo "aw: task $task  branch $br  tier $TIER${FENCE_PROFILE:+  fence-profile $FENCE_PROFILE}"
+  echo "loom: task $task  branch $br  tier $TIER${FENCE_PROFILE:+  fence-profile $FENCE_PROFILE}"
   while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
-    echo "aw: attempt $attempt/$MAX_ATTEMPTS"
+    echo "loom: attempt $attempt/$MAX_ATTEMPTS"
     run_role implementer "$wt" "Implement the task in .agents/tasks/$task.md. \
 Read the plan it references first. Touch only the files it lists — check \
 .agents/zones.toml and never edit hand-zone paths. Run ./.agents/gate.sh and \
@@ -2077,20 +2080,20 @@ fix failures until it exits 0. Write brief notes on what you did to \
     # not be the agent's — a gate that rewrites itself to `exit 0`, or that
     # `git update-ref`s the branch on the way past, is one line of shell. The
     # implementer still runs the worktree's copy for its own iteration; this is
-    # the one whose verdict `aw` acts on.
+    # the one whose verdict `loom` acts on.
     if ( cd "$wt" && "$STATE_MAIN_ROOT/.agents/gate.sh" > "$wt/.agents/reviews/$task-gate.log" 2>&1 ); then
-      echo "aw: gate green"
-      # Checked explicitly: from `aw loop` this function runs under `|| rc=$?`,
+      echo "loom: gate green"
+      # Checked explicitly: from `loom loop` this function runs under `|| rc=$?`,
       # which switches set -e off, and a failed add/commit (sparse-checkout
       # refusal, a hook, nothing to commit) would otherwise print "committed"
       # over an unchanged branch.
       ( cd "$wt" && git add -A && git commit -q -m "agent($task): $title" ) \
         || die "commit failed in $wt (nothing to commit, or git refused) — nothing landed on $br"
-      echo "aw: committed on $br — review with: aw check $task && aw diff $task"
+      echo "loom: committed on $br — review with: loom check $task && loom diff $task"
       return 0
     fi
     if [ -f "$wt/.agents/reviews/$task-blocked.md" ]; then
-      echo "aw: implementer reported blocked — see .agents/reviews/$task-blocked.md"
+      echo "loom: implementer reported blocked — see .agents/reviews/$task-blocked.md"
       return 2
     fi
     gate_note=" PREVIOUS ATTEMPT FAILED THE GATE. Failing output (tail):
@@ -2098,14 +2101,14 @@ $(tail -40 "$wt/.agents/reviews/$task-gate.log" 2>/dev/null)"
     attempt=$((attempt + 1))
   done
 
-  echo "aw: gate never went green after $MAX_ATTEMPTS attempts." >&2
-  echo "aw: this usually means the task spec is wrong. Revisit it with the architect." >&2
+  echo "loom: gate never went green after $MAX_ATTEMPTS attempts." >&2
+  echo "loom: this usually means the task spec is wrong. Revisit it with the architect." >&2
   return 1
 }
 
 cmd_check() {
   scan_fence_flag "$@"
-  local task="${FLAG_ARGS[0]:?usage: aw check <task-id> [--fence-profile <name>]}"
+  local task="${FLAG_ARGS[0]:?usage: loom check <task-id> [--fence-profile <name>]}"
   local wt base review log pnote=""
   require_fence_flag "$task" check
   wt="$(require_worktree "$task")"
@@ -2125,7 +2128,7 @@ cmd_check() {
   git -C "$ROOT" diff "$base" "$PINNED_TIP" > "$wt/.agents/reviews/$task.patch" \
     || die "cannot write the review patch for $task"
   review="$wt/.agents/reviews/$task-review.md"
-  log="$(mktemp "${TMPDIR:-/tmp}/aw-review.XXXXXX")"
+  log="$(mktemp "${TMPDIR:-/tmp}/loom-review.XXXXXX")"
   # Without this the scope check reads a released path as an "unauthorized
   # hand/fence change" and REVISEs a diff the profile explicitly authorised.
   if [ -n "$FENCE_PROFILE" ]; then
@@ -2139,13 +2142,13 @@ against the task spec .agents/tasks/$task.md and the plan it references. \
 Print your review to stdout: scope check, correctness concerns, test coverage, \
 and end with a final line 'VERDICT: APPROVE' or 'VERDICT: REVISE — <reason>'.$pnote" "$log"
   cp "$log" "$review"
-  # What was reviewed, recorded: `aw land` refuses a tip that is not this one,
+  # What was reviewed, recorded: `loom land` refuses a tip that is not this one,
   # so a commit added after the reviewer read the patch cannot ride the review
   # into the merge.
   state_put "$task" "$base" "$(state_read "$task" profile)" "$(branch_of "$task")" \
             "$(state_read "$task" created)" "$(state_read "$task" origin)" "$PINNED_TIP"
-  echo "aw: review saved to $(relpath "$review")"
-  echo "aw: reviewed tip $(git rev-parse --short "$PINNED_TIP") — aw land refuses anything else"
+  echo "loom: review saved to $(relpath "$review")"
+  echo "loom: reviewed tip $(git rev-parse --short "$PINNED_TIP") — loom land refuses anything else"
 }
 
 # Bounded implement -> review -> fix -> review. A reviewer that still says
@@ -2155,7 +2158,7 @@ and end with a final line 'VERDICT: APPROVE' or 'VERDICT: REVISE — <reason>'.$
 # the implementer reads, and never your tree.
 cmd_loop() {
   scan_fence_flag "$@"
-  local task="${FLAG_ARGS[0]:?usage: aw loop <task-id> [--fence-profile <name>]}"
+  local task="${FLAG_ARGS[0]:?usage: loom loop <task-id> [--fence-profile <name>]}"
   local rounds="${LOOM_LOOP_ROUNDS:-2}"
   local wt review verdict tfile base i=1
   local -a passthru=()
@@ -2184,8 +2187,8 @@ cmd_loop() {
     cmd_run "$task" ${passthru[0]+"${passthru[@]}"} || rc=$?
     case "$rc" in
       0) return 0 ;;
-      2) die "aw loop: implementer reported blocked — read $(relpath "$wt/.agents/reviews/$task-blocked.md")" ;;
-      *) die "aw loop: implementer never reached a green gate for $task — the spec is probably wrong" ;;
+      2) die "loom loop: implementer reported blocked — read $(relpath "$wt/.agents/reviews/$task-blocked.md")" ;;
+      *) die "loom loop: implementer never reached a green gate for $task — the spec is probably wrong" ;;
     esac
   }
 
@@ -2193,10 +2196,10 @@ cmd_loop() {
   review="$wt/.agents/reviews/$task-review.md"
   tfile="$wt/.agents/tasks/$task.md"
   while [ "$i" -le "$rounds" ]; do
-    echo "aw: [loop] review round $i/$rounds"
+    echo "loom: [loop] review round $i/$rounds"
     # Each round: the implementer has just committed, so re-judge the history
     # before it is turned into a patch and handed to the reviewer. The base is
-    # re-read rather than reused, so that a task re-pointed by `aw rebase` in
+    # re-read rather than reused, so that a task re-pointed by `loom rebase` in
     # between is measured from the base it actually has now.
     pin_branch_tip "$task"
     base="$(security_base "$task")"
@@ -2205,40 +2208,40 @@ cmd_loop() {
     verdict="$(grep '^VERDICT:' "$review" 2>/dev/null | tail -1 || true)"
     # No verdict line at all means a truncated or derailed review, not a
     # rejection — re-implementing on it would act on nothing.
-    [ -n "$verdict" ] || die "no VERDICT line in $(relpath "$review") — review truncated — re-run aw check $task"
+    [ -n "$verdict" ] || die "no VERDICT line in $(relpath "$review") — review truncated — re-run loom check $task"
     case "$verdict" in
-      *APPROVE*) echo "aw: [loop] APPROVE after $i round(s) — next: aw diff $task && aw land $task"
+      *APPROVE*) echo "loom: [loop] APPROVE after $i round(s) — next: loom diff $task && loom land $task"
                  return 0 ;;
     esac
     if [ "$i" -eq "$rounds" ]; then
-      echo "aw: [loop] still REVISE after $rounds round(s) — escalating to the coordinator." >&2
-      echo "aw: [loop] read $(relpath "$review"), then fix the task spec by hand." >&2
+      echo "loom: [loop] still REVISE after $rounds round(s) — escalating to the coordinator." >&2
+      echo "loom: [loop] read $(relpath "$review"), then fix the task spec by hand." >&2
       return 1
     fi
     [ -f "$tfile" ] || die "no task file in the worktree at $tfile — is .agents/tasks/ gitignored? commit it so agent worktrees see it"
     {
-      printf '\n## Auto fix round %s (aw loop — reviewer REVISE)\n\n' "$i"
+      printf '\n## Auto fix round %s (loom loop — reviewer REVISE)\n\n' "$i"
       printf '%s\n' "The reviewer returned REVISE. Address every point below. Keep all existing"
       printf '%s\n' "rulings from earlier rounds; do not weaken or delete tests to satisfy the"
       printf '%s\n\n' "reviewer."
       cat "$review"
     } >> "$tfile"
-    echo "aw: [loop] REVISE — fix round $i appended to $(relpath "$tfile" "$wt") in the worktree"
+    echo "loom: [loop] REVISE — fix round $i appended to $(relpath "$tfile" "$wt") in the worktree"
     implement
     i=$((i + 1))
   done
 }
 
-# `aw diff` writes the same patch file `aw check` hands to a reviewer, so it
+# `loom diff` writes the same patch file `loom check` hands to a reviewer, so it
 # takes --fence-profile on the same terms as every other task command: the
 # history is judged before the patch is written, not after.
 cmd_diff() {
   scan_fence_flag "$@"
-  local task="${FLAG_ARGS[0]:?usage: aw diff <task-id> [--fence-profile <name>]}"
+  local task="${FLAG_ARGS[0]:?usage: loom diff <task-id> [--fence-profile <name>]}"
   local wt base patch
   require_fence_flag "$task" diff
   wt="$(require_worktree "$task")"
-  # Same order as `aw check`, for the same reason: the patch this writes carries
+  # Same order as `loom check`, for the same reason: the patch this writes carries
   # the content of every path in it, so the tree AND the history are judged
   # before a byte of it is written.
   fence_reconcile "$wt" "$FENCE_PROFILE"
@@ -2249,7 +2252,7 @@ cmd_diff() {
   reviews_dir "$wt"
   git -C "$ROOT" diff "$base" "$PINNED_TIP" > "$patch" \
     || die "cannot write the diff for $task"
-  echo "aw: patch at $(relpath "$patch")" >&2
+  echo "loom: patch at $(relpath "$patch")" >&2
   # No editor is assumed. LOOM_DIFF_CMD takes the patch path as its last
   # argument (`delta`, `bat`, `less`, `code --wait`, `vim -R` — whatever you
   # use); otherwise git shows it through its own pager, honouring your
@@ -2276,24 +2279,24 @@ cmd_land() {
       --force)      force=yes ;;
       --pr)         mode="pr" ;;
       --merge)      mode="merge" ;;
-      -*)           die "aw land: unknown flag '$a' — usage: aw land <task-id> [--fence-profile <name>] [--pr|--merge] [--force]" ;;
-      *)            if [ -z "$task" ]; then task="$a"; else die "aw land: unexpected argument '$a'"; fi ;;
+      -*)           die "loom land: unknown flag '$a' — usage: loom land <task-id> [--fence-profile <name>] [--pr|--merge] [--force]" ;;
+      *)            if [ -z "$task" ]; then task="$a"; else die "loom land: unexpected argument '$a'"; fi ;;
     esac
   done
-  [ -n "$task" ] || die "usage: aw land <task-id> [--fence-profile <name>] [--pr|--merge] [--force]"
+  [ -n "$task" ] || die "usage: loom land <task-id> [--fence-profile <name>] [--pr|--merge] [--force]"
   case "$mode" in merge|pr) ;; *) die "LOOM_LAND must be 'merge' or 'pr' (got '$mode')" ;; esac
   require_fence_flag "$task" land
   wt="$(require_worktree "$task")"; br="$(branch_of "$task")"
   fence_reconcile "$wt" "$FENCE_PROFILE"
   # Uncommitted work in the worktree is not the branch's work: the reviewer read
-  # a patch cut from the commits, and what is landing is the commits. `aw rebase`
+  # a patch cut from the commits, and what is landing is the commits. `loom rebase`
   # has always refused a dirty tree; landing is where it matters more.
   local dirty; dirty="$(wt_dirty "$wt")"
   [ -z "$dirty" ] || die "worktree $wt has uncommitted changes:
 $(printf '%s\n' "$dirty" | sed 's/^/  /')
 Landing publishes the branch's COMMITS, so anything still loose here would be
 lost — or, if it is the reason the gate passes, would be landing unreviewed.
-Commit it in the worktree, or discard it, then re-run:  aw check $task"
+Commit it in the worktree, or discard it, then re-run:  loom check $task"
   # Landing is the last gate, and it is the one that PUBLISHES: a merge puts
   # these commits in your tree, --pr puts them on origin. Both legs go through
   # here, and --force does not skip it (it skips the gate, not the boundary).
@@ -2306,20 +2309,20 @@ Commit it in the worktree, or discard it, then re-run:  aw check $task"
   # commit, an `update-ref` from a gate script, a force-push into the ref — is
   # not the thing that was reviewed, and `--force` does not skip this either.
   local reviewed; reviewed="$(state_read "$task" reviewed)"
-  [ -n "$reviewed" ] || die "task $task has never been through 'aw check', so nothing has reviewed the
-commits this would publish. Run it first:  aw check $task${FENCE_PROFILE:+ --fence-profile $FENCE_PROFILE}"
+  [ -n "$reviewed" ] || die "task $task has never been through 'loom check', so nothing has reviewed the
+commits this would publish. Run it first:  loom check $task${FENCE_PROFILE:+ --fence-profile $FENCE_PROFILE}"
   [ "$reviewed" = "$PINNED_TIP" ] || die "the branch moved since it was reviewed:
-  reviewed at aw check: $reviewed
+  reviewed at loom check: $reviewed
   $br is now:           $PINNED_TIP
 Landing would publish commits nobody read. Re-run the review, then land:
-  aw check $task${FENCE_PROFILE:+ --fence-profile $FENCE_PROFILE}"
-  [ -n "$FENCE_PROFILE" ] && echo "aw: fence profile '$FENCE_PROFILE' — this diff may touch $FENCE_RELEASED"
+  loom check $task${FENCE_PROFILE:+ --fence-profile $FENCE_PROFILE}"
+  [ -n "$FENCE_PROFILE" ] && echo "loom: fence profile '$FENCE_PROFILE' — this diff may touch $FENCE_RELEASED"
   if [ -z "$force" ]; then
-    echo "aw: running gate in worktree before landing"
+    echo "loom: running gate in worktree before landing"
     # The OPERATOR's gate, with the worktree as its cwd — never $wt/.agents/gate.sh,
     # which is a file the implementer edits (and, under a profile, may even be
     # allowed to commit).
-    ( cd "$wt" && "$STATE_MAIN_ROOT/.agents/gate.sh" ) || die "gate is red in $br — fix it or land with: aw land $task --force"
+    ( cd "$wt" && "$STATE_MAIN_ROOT/.agents/gate.sh" ) || die "gate is red in $br — fix it or land with: loom land $task --force"
   fi
 
   if [ "$mode" = pr ]; then
@@ -2334,12 +2337,12 @@ Landing would publish commits nobody read. Re-run the review, then land:
     title="$(head -1 "$AGENTS_DIR/tasks/$task.md" 2>/dev/null | sed 's/^#[[:space:]]*//')"
     [ -n "$title" ] || title="$task"
     echo ""
-    echo "aw: pushed $br. NOT merged — next steps are yours:"
+    echo "loom: pushed $br. NOT merged — next steps are yours:"
     echo ""
     echo "    gh pr create --head $br --title \"agent($task): $title\""
     echo ""
-    echo "aw: worktree kept at $wt (drop it once the PR exists: aw drop $task --keep-branch)"
-    echo "aw: tick the plan checkbox for $task by hand when the PR merges."
+    echo "loom: worktree kept at $wt (drop it once the PR exists: loom drop $task --keep-branch)"
+    echo "loom: tick the plan checkbox for $task by hand when the PR merges."
     return 0
   fi
 
@@ -2350,7 +2353,7 @@ Landing would publish commits nobody read. Re-run the review, then land:
   git branch -d "$br"
   plan="$(grep -rl -- "$task" "$AGENTS_DIR/plans" 2>/dev/null | head -1 || true)"
   [ -n "$plan" ] && sedi "s/- \[ \] $task/- [x] $task/" "$plan"
-  echo "aw: landed $task"
+  echo "loom: landed $task"
 }
 
 cmd_rebase() { # rebase agent/<task> onto origin/main and re-point its base
@@ -2373,7 +2376,7 @@ cmd_rebase() { # rebase agent/<task> onto origin/main and re-point its base
   # `refs/remotes/origin/main` is one `git update-ref` away from naming any
   # commit an agent likes, and unlike `refs/heads/main` (which is the branch the
   # operator is standing on, and moves in front of them) a moved `origin/main`
-  # shows NOWHERE. So aw reads what actually came under the base and refuses to
+  # shows NOWHERE. So loom reads what actually came under the base and refuses to
   # bury a fenced or hand-zone path in it without being told to.
   scan_fence_flag "$@"
   local task="" upstream="" accept="" a
@@ -2381,13 +2384,13 @@ cmd_rebase() { # rebase agent/<task> onto origin/main and re-point its base
   for a in ${FLAG_ARGS[0]+"${FLAG_ARGS[@]}"}; do
     case "$a" in
       --accept-upstream) accept=yes ;;
-      -*) die "aw rebase: unknown flag '$a' — usage: aw rebase <task-id> [<upstream>] [--fence-profile <name>] [--accept-upstream]" ;;
+      -*) die "loom rebase: unknown flag '$a' — usage: loom rebase <task-id> [<upstream>] [--fence-profile <name>] [--accept-upstream]" ;;
       *)  if   [ -z "$task" ];     then task="$a"
           elif [ -z "$upstream" ]; then upstream="$a"
-          else die "aw rebase: unexpected argument '$a'"; fi ;;
+          else die "loom rebase: unexpected argument '$a'"; fi ;;
     esac
   done
-  [ -n "$task" ] || die "usage: aw rebase <task-id> [<upstream>] [--fence-profile <name>] [--accept-upstream]"
+  [ -n "$task" ] || die "usage: loom rebase <task-id> [<upstream>] [--fence-profile <name>] [--accept-upstream]"
   upstream="${upstream:-origin/main}"
   require_fence_flag "$task" rebase   # a rebase must not silently change the fence
   wt="$(require_worktree "$task")"; br="$(branch_of "$task")"
@@ -2431,7 +2434,7 @@ Fix the fetch (network, credentials, the remote URL) and re-run."
   fi
   if [ -z "$new_base" ]; then
     new_base="$mb"
-    echo "aw: replayed base not found by patch-id; base set to the merge-base $(git rev-parse --short "$mb") — the reviewer may now see the plan/task commit as a change" >&2
+    echo "loom: replayed base not found by patch-id; base set to the merge-base $(git rev-parse --short "$mb") — the reviewer may now see the plan/task commit as a change" >&2
   fi
   new_base="$(git rev-parse --verify --quiet "$new_base^{commit}")" \
     || die "the new base does not resolve — refusing to record it for $task"
@@ -2456,9 +2459,9 @@ record a base this branch does not descend from. Inspect $wt, do not re-run."
       # instead. A refusal has to leave the task exactly as it found it. The
       # tree was verified clean above, so this discards nothing.
       git -C "$wt" reset --hard "$PINNED_TIP" >/dev/null 2>&1 \
-        || echo "aw: WARNING: could not put $br back at $PINNED_TIP after refusing this
+        || echo "loom: WARNING: could not put $br back at $PINNED_TIP after refusing this
 rebase — the branch is left on $upstream. Inspect $wt." >&2
-      die "the commits this rebase would put UNDER task $task's base touch paths aw will
+      die "the commits this rebase would put UNDER task $task's base touch paths loom will
 not bury silently:
 ${bad_f:+
   fenced:
@@ -2475,20 +2478,20 @@ commit, and unlike your own 'main' a moved 'origin/main' is visible nowhere.
 Nothing changed: the base was not moved and the branch is back at
 $(git rev-parse --short "$PINNED_TIP"). Read those commits, then either accept
 them under the base:
-  aw rebase $task $upstream${FLAG_PROFILE:+ --fence-profile $FLAG_PROFILE} --accept-upstream
-or throw the task away:  aw drop $task"
+  loom rebase $task $upstream${FLAG_PROFILE:+ --fence-profile $FLAG_PROFILE} --accept-upstream
+or throw the task away:  loom drop $task"
     fi
   fi
   if [ -n "$accept" ] && [ "${#HIST_PATHS[@]}" -gt 0 ]; then
-    echo "aw: --accept-upstream: these commits go under task $task's base unreviewed:" >&2
+    echo "loom: --accept-upstream: these commits go under task $task's base unreviewed:" >&2
     git log --oneline "$old_base..$new_base" 2>/dev/null | sed 's/^/  /' >&2
   fi
   # `reviewed` is deliberately cleared: the branch has been rewritten, so the
-  # sha a reviewer read no longer exists on it. `aw land` will ask for a fresh
-  # `aw check`, which is the honest answer.
+  # sha a reviewer read no longer exists on it. `loom land` will ask for a fresh
+  # `loom check`, which is the honest answer.
   state_put "$task" "$new_base" "$(state_read "$task" profile)" "$br" \
             "$(state_read "$task" created)" "$(state_read "$task" origin)" ""
-  echo "aw: $br rebased onto $upstream; base $(git rev-parse --short "$old_base") -> $(git rev-parse --short "$new_base")"
+  echo "loom: $br rebased onto $upstream; base $(git rev-parse --short "$old_base") -> $(git rev-parse --short "$new_base")"
 }
 
 cmd_drop() {
@@ -2497,11 +2500,11 @@ cmd_drop() {
   for a in "$@"; do
     case "$a" in
       --keep-branch) keep=yes ;;
-      -*)            die "aw drop: unknown flag '$a' — usage: aw drop <task-id> [--keep-branch]" ;;
-      *)             if [ -z "$task" ]; then task="$a"; else die "aw drop: unexpected argument '$a'"; fi ;;
+      -*)            die "loom drop: unknown flag '$a' — usage: loom drop <task-id> [--keep-branch]" ;;
+      *)             if [ -z "$task" ]; then task="$a"; else die "loom drop: unexpected argument '$a'"; fi ;;
     esac
   done
-  [ -n "$task" ] || die "usage: aw drop <task-id> [--keep-branch]"
+  [ -n "$task" ] || die "usage: loom drop <task-id> [--keep-branch]"
   # The id, validated BEFORE anything is removed. state_file refuses '.', '..'
   # and anything with a '/' in it — and it used to be called at the END, so a
   # bad id removed a worktree, then died, and the operator saw a refusal after
@@ -2511,8 +2514,8 @@ cmd_drop() {
   git worktree remove "$wt" --force 2>/dev/null || true
   # The operator record goes with the worktree, --keep-branch or not: it names
   # a base and a profile for a task that no longer has a tree, and the next
-  # `aw new <task>` writes a fresh one. A kept branch keeps its commits, not
-  # its record — `aw check` on it says so and points at `aw new`.
+  # `loom new <task>` writes a fresh one. A kept branch keeps its commits, not
+  # its record — `loom check` on it says so and points at `loom new`.
   state_rm "$task"
   if [ -n "$keep" ]; then
     local where
@@ -2525,16 +2528,16 @@ cmd_drop() {
     else
       where="— NOT on origin yet: git push -u origin $br"
     fi
-    echo "aw: dropped worktree for $task and its operator record — branch $br kept $where"
+    echo "loom: dropped worktree for $task and its operator record — branch $br kept $where"
   else
     git branch -D "$br" 2>/dev/null || true
-    echo "aw: dropped $task (worktree, branch and operator record)"
+    echo "loom: dropped $task (worktree, branch and operator record)"
   fi
 }
 
 # Each agent worktree, annotated with the fence profile in its OPERATOR RECORD
 # — a reminder of the flag every command for that task needs, not a claim about
-# what is on disk (`aw run` reconciles the tree; the record only ever refuses).
+# what is on disk (`loom run` reconciles the tree; the record only ever refuses).
 cmd_ls() {
   local line br prof found=""
   while IFS= read -r line; do
@@ -2555,9 +2558,9 @@ cmd_ls() {
 cmd_plan() {
   local headless="" topic
   [ "${1:-}" = "-p" ] && { headless=yes; shift; }
-  topic="${*:?usage: aw plan [-p] \"<topic>\"}"
+  topic="${*:?usage: loom plan [-p] \"<topic>\"}"
   mkdir -p "$AGENTS_DIR/plans" "$AGENTS_DIR/tasks" "$AGENTS_DIR/reviews" "$AGENTS_DIR/decisions"
-  local prompt="Design: $topic. For codebase questions run 'aw scout \"<question>\"' \
+  local prompt="Design: $topic. For codebase questions run 'loom scout \"<question>\"' \
 in the shell instead of reading source files yourself, and treat uncited scout \
 claims as unknown. Write a plan to .agents/plans/ (next number, kebab-slug) \
 following .agents/PLAN_TEMPLATE.md, and one task file per non-HAND task in \
@@ -2567,9 +2570,9 @@ todo!(), a failing test — never the implementation). Do not create or edit any
 file outside .agents/."
   local first; first="$(pick_model architect)"
   if [ "$first" = claude-sub ] && [ -z "$headless" ]; then
-    echo "aw: architect on your Claude subscription (interactive). Ctrl-D to end."
+    echo "loom: architect on your Claude subscription (interactive). Ctrl-D to end."
     claude --append-system-prompt "$(cat "$PROMPTS_DIR/architect.md")" "$prompt" \
-      || { echo "aw: claude exited non-zero — if rate-limited, try: eval \"\$(aw tier lean)\" && aw plan -p \"$topic\"" >&2; return 1; }
+      || { echo "loom: claude exited non-zero — if rate-limited, try: eval \"\$(loom tier lean)\" && loom plan -p \"$topic\"" >&2; return 1; }
   else
     run_role architect "$ROOT" "$prompt"
   fi
@@ -2604,11 +2607,11 @@ scout_root() {
 }
 
 cmd_scout() {
-  local q="${*:?usage: aw scout \"<question>\"}"
+  local q="${*:?usage: loom scout \"<question>\"}"
   # The scout mirror is shared by every task, so no profile ever applies to it:
   # it stays at the FULL fence, and the profile's provider rule therefore never
   # has to cover the (repo-wide, cheap) scout chain.
-  FENCE_PROFILE=""; FENCE_RELEASED=""; unset AW_FENCE_PROFILE
+  FENCE_PROFILE=""; FENCE_RELEASED=""; unset LOOM_FENCE_PROFILE
   local wd; load_fence; wd="$(scout_root)"
   run_role scout "$wd" "$q$(fence_note)"
 }
@@ -2616,10 +2619,10 @@ cmd_scout() {
 cmd_gate() { exec "$AGENTS_DIR/gate.sh"; }
 
 cmd_tier() {
-  local t="${1:?usage: aw tier lean|standard|deep}"
+  local t="${1:?usage: loom tier lean|standard|deep}"
   case "$t" in lean|standard|deep) ;; *) die "unknown tier: $t" ;; esac
   echo "export LOOM_TIER=$t"
-  echo "# apply with: eval \"\$(aw tier $t)\"" >&2
+  echo "# apply with: eval \"\$(loom tier $t)\"" >&2
 }
 
 # -------------------------------------------------------------------- doctor
@@ -2674,7 +2677,7 @@ cmd_doctor() {
     else note "key file $LOOM_ENV mode is $perms — run: chmod 600 $LOOM_ENV"; fi
     grep -q 'PASTE-YOUR' "$LOOM_ENV" && note "key file still has placeholder values"
   else
-    note "no key file at $LOOM_ENV (aw sources it if present)"
+    note "no key file at $LOOM_ENV (loom sources it if present)"
   fi
   [ -n "${ZHIPU_API_KEY:-}" ]    && pass "ZHIPU_API_KEY set (Z.ai)"      || note "ZHIPU_API_KEY not set (ZAI_API_KEY also accepted)"
   [ -n "${MOONSHOT_API_KEY:-}" ] && pass "MOONSHOT_API_KEY set"          || note "MOONSHOT_API_KEY not set"
@@ -2709,11 +2712,11 @@ cmd_doctor() {
             [ -n "$orphan" ] && note "fence pattern matches no tracked file (typo?): $orphan"
           done < <(zones_py fence-orphans 2>/dev/null || true)
           while IFS= read -r odd; do
-            [ -n "$odd" ] && note "fence pattern is not the plain 'subsystem/**' form: $odd — sparse checkout reads it as gitignore, aw zone as fnmatch (ARCHITECTURE.md § 5, caveat 3)"
+            [ -n "$odd" ] && note "fence pattern is not the plain 'subsystem/**' form: $odd — sparse checkout reads it as gitignore, loom zone as fnmatch (ARCHITECTURE.md § 5, caveat 3)"
           done < <(zones_py fence-shape 2>/dev/null || true)
         fi
       else
-        fail "${fpaths#aw: }"
+        fail "${fpaths#loom: }"
       fi
       # Fence profiles: what each one releases, to whom, and whether the
       # default chains could actually run under it.
@@ -2737,7 +2740,7 @@ cmd_doctor() {
         done
       done < <(zones_py profiles 2>/dev/null || true)
     else
-      fail "zones.toml unreadable (agent/* commits are BLOCKED until this is fixed): ${perr#aw: }"
+      fail "zones.toml unreadable (agent/* commits are BLOCKED until this is fixed): ${perr#loom: }"
     fi
   else note "no zones.toml — everything defaults to assist"; fi
   # A hook written before the aw→loom rename calls `aw guard`, and its own
@@ -2746,12 +2749,12 @@ cmd_doctor() {
   local hookf; hookf="$(hook_path)"
   if [ -x "$hookf" ]; then
     if grep -q 'aw guard' "$hookf"; then
-      fail "pre-commit hook still calls the pre-rename 'aw' dispatcher — with aw off PATH the hand-zone guard skips silently. Fix with: aw install-hooks"
+      fail "pre-commit hook still calls the pre-rename 'aw' dispatcher — with aw off PATH the hand-zone guard skips silently. Fix with: loom install-hooks"
     else
       pass "pre-commit hook installed"
     fi
   else
-    note "pre-commit hook not installed (aw install-hooks)"
+    note "pre-commit hook not installed (loom install-hooks)"
   fi
   if [ -x "$hookf.pre-loom" ]; then
     pass "pre-existing pre-commit hook chained (pre-commit.pre-loom)"
@@ -2764,7 +2767,7 @@ cmd_doctor() {
   done
   if [ -n "$stale_list" ]; then note "still say the pre-rename 'aw' command — edit by hand:$stale_list"; fi
   if [ "${LOOM_LAND:-merge}" = pr ]; then
-    have gh && pass "LOOM_LAND=pr — gh on PATH ($(command -v gh)); aw prints the command, never runs it" \
+    have gh && pass "LOOM_LAND=pr — gh on PATH ($(command -v gh)); loom prints the command, never runs it" \
              || note "LOOM_LAND=pr — gh not on PATH; open the PR from the printed branch by hand"
   fi
 
@@ -2803,7 +2806,7 @@ cmd_doctor() {
   done
 
   echo ""
-  echo "aw doctor: $ok ok, $warn warnings, $bad failures"
+  echo "loom doctor: $ok ok, $warn warnings, $bad failures"
   [ "$bad" -eq 0 ]
 }
 
@@ -2814,12 +2817,12 @@ cmd_install_hooks() {
   # Refuse and say what to add by hand. A RELATIVE hooksPath is also
   # per-worktree, so agent worktrees only see a hook that is committed.
   if git ls-files --error-unmatch "$hook" >/dev/null 2>&1; then
-    die "$hook is tracked by git (core.hooksPath) — add this line to it by hand instead: aw guard || exit \$?"
+    die "$hook is tracked by git (core.hooksPath) — add this line to it by hand instead: loom guard || exit \$?"
   fi
   case "$(git config core.hooksPath 2>/dev/null || true)" in
     "") ;;
-    /*) echo "aw: note — core.hooksPath is set; installing the guard at $hook" >&2 ;;
-    *)  echo "aw: note — core.hooksPath is relative, so agent worktrees will only run this hook once it is committed: $hook" >&2 ;;
+    /*) echo "loom: note — core.hooksPath is set; installing the guard at $hook" >&2 ;;
+    *)  echo "loom: note — core.hooksPath is relative, so agent worktrees will only run this hook once it is committed: $hook" >&2 ;;
   esac
   mkdir -p "$(dirname "$hook")"
   # Never silently eat somebody else's hook: move it aside and chain to it.
@@ -2827,25 +2830,25 @@ cmd_install_hooks() {
   if [ -e "$hook" ] && ! grep -q 'Loom hand-zone guard' "$hook"; then
     [ -e "$prev" ] && die "$hook is not Loom's and $prev already exists — merge them by hand, then re-run"
     mv "$hook" "$prev"
-    echo "aw: existing pre-commit hook moved to $prev (it still runs, after the guard)"
-    [ -x "$prev" ] || echo "aw: note — $prev is not executable, so it stays inert (as it was)"
+    echo "loom: existing pre-commit hook moved to $prev (it still runs, after the guard)"
+    [ -x "$prev" ] || echo "loom: note — $prev is not executable, so it stays inert (as it was)"
   fi
   cat > "$hook" << 'HOOK'
 #!/usr/bin/env bash
-# Loom hand-zone guard. Logic lives in `aw guard` so it stays in one place.
+# Loom hand-zone guard. Logic lives in `loom guard` so it stays in one place.
 # Any hook that was here before is preserved as pre-commit.pre-loom and runs
 # after the guard, so installing Loom never disables an existing hook.
-if command -v aw >/dev/null 2>&1; then
-  aw guard || exit $?
+if command -v loom >/dev/null 2>&1; then
+  loom guard || exit $?
 else
-  echo "pre-commit: aw not on PATH — hand-zone guard skipped" >&2
+  echo "pre-commit: loom not on PATH — hand-zone guard skipped" >&2
 fi
 prev="$(dirname "$0")/pre-commit.pre-loom"
 [ -x "$prev" ] && exec "$prev" "$@"
 exit 0
 HOOK
   chmod +x "$hook"
-  echo "aw: installed $hook"
+  echo "loom: installed $hook"
 }
 
 # ------------------------------------------------------------------ dispatch
@@ -2868,5 +2871,5 @@ case "${1:-}" in
   guard)  shift; cmd_guard "$@" ;;
   install-hooks) shift; cmd_install_hooks "$@" ;;
   ""|-h|--help|help) awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0" ;;
-  *) die "unknown command '$1' — try: aw help" ;;
+  *) die "unknown command '$1' — try: loom help" ;;
 esac

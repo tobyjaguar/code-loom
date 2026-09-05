@@ -13,12 +13,12 @@ reaches more than it used to. Round 2 narrowed that grant and split profiled
 worktrees onto their own root; what is left of gap 4 is a confirmation, and it
 is written up that way below.
 
-Every gap carries a `bin/aw:<line>` anchor as of this commit. Line numbers
+Every gap carries a `bin/loom:<line>` anchor as of this commit. Line numbers
 drift; the quoted text is the durable handle, so grep for it.
 
 ---
 
-## 1. `aw guard` read the agent's own copy of `zones.toml` — CLOSED
+## 1. `loom guard` read the agent's own copy of `zones.toml` — CLOSED
 
 **Status: fixed on this branch.** Kept here with its cost, and with the one
 part of the lookup that is still the agent's.
@@ -27,7 +27,7 @@ part of the lookup that is still the agent's.
 was `$ROOT/.agents`, so a command running inside an agent worktree read that
 worktree's copies. `cmd_guard` runs as a pre-commit hook there, so every zone
 lookup read `<worktree>/.agents/zones.toml` — a file the agent can edit. The
-same derivation had a bigger consequence than the guard: `cd <a worktree> && aw
+same derivation had a bigger consequence than the guard: `cd <a worktree> && loom
 new t5` fenced the new task with the agent's `zones.toml` (an emptied one means
 no fence at all) and `.`-sourced the agent's `.agents/loom.env` as shell, in
 your environment.
@@ -39,12 +39,12 @@ main checkout either way — the same derivation the operator record is keyed by
 Everything policy-shaped is read from there: `zones.toml` (zones, fence,
 profiles), `loom.env`, `.opencode/`, and `.agents/gate.sh`.
 
-One thing still comes from the invoking tree, and only one: **`aw guard`'s
+One thing still comes from the invoking tree, and only one: **`loom guard`'s
 subject.** The commit is happening in that worktree, so the branch, the staged
 file list and the tree the reconciler inspects are read from `$INVOKED_ROOT`
-while the zones they are judged by come from `$ROOT`. `aw` says so in one line
+while the zones they are judged by come from `$ROOT`. `loom` says so in one line
 whenever the two differ. `tests/fence-profiles.sh` (av) asserts both halves:
-`aw new` from inside a worktree with an emptied `zones.toml` still applies the
+`loom new` from inside a worktree with an emptied `zones.toml` still applies the
 full fence, and a `loom.env` planted there is never sourced.
 
 **The cost.** A repo whose `zones.toml` legitimately changes *on a branch* is
@@ -57,13 +57,13 @@ an agent from inside its own worktree.
 is the agent's. A process that sets it points the lookup at a record of its
 own. That is not worth plugging: the entire hook is dominated by `git commit
 --no-verify`, which needs no environment at all. The guard is a seatbelt;
-`aw land`'s checks of the commits are the lock.
+`loom land`'s checks of the commits are the lock.
 
 ---
 
-## 2. `aw plan` runs the architect unfenced, in your own tree
+## 2. `loom plan` runs the architect unfenced, in your own tree
 
-**Where.** `bin/aw:2201`, in `cmd_plan` (`bin/aw:2182`):
+**Where.** `bin/loom:2201`, in `cmd_plan` (`bin/loom:2182`):
 `run_role architect "$ROOT" "$prompt"` (and the
 interactive leg, `claude --append-system-prompt … "$prompt"`, likewise in
 `$ROOT`). The architect's chain at every tier ends in cheap third-party
@@ -71,7 +71,7 @@ providers — `zai-coding-plan/glm-5.3`, `moonshotai/kimi-k2.5`,
 `deepseek/deepseek-v4-pro` — and none of the fence machinery is on this path:
 no worktree, no sparse checkout, no `fence_reconcile`.
 
-**Why it is not urgent.** The architect prompt tells it to use `aw scout`
+**Why it is not urgent.** The architect prompt tells it to use `loom scout`
 (which *is* fenced, via the `_scout` mirror) rather than read source, and it is
 told to write only under `.agents/`. That is a prompt, not a boundary.
 
@@ -85,7 +85,7 @@ say so out loud.
 
 ## 3. `.agents/loom.env` is sourced as shell
 
-**Where.** `bin/aw:98`:
+**Where.** `bin/loom:98`:
 
 ```sh
 if [ -f "$ROOT/.agents/loom.env" ]; then set -a; . "$ROOT/.agents/loom.env"; set +a; fi
@@ -115,18 +115,18 @@ merely a risk, it is a bypass:
   after, with a WARN naming any the file tried to set. A caller that exports
   them wins untouched, as before; it is the file that does not.
   `OPENCODE_CONFIG_CONTENT` — a whole config inline in a variable, with no file
-  for `aw` to point at — is additionally stripped from every opencode launch,
+  for `loom` to point at — is additionally stripped from every opencode launch,
   caller included.
 - The file is also a `[hand]` path in the shipped `zones.toml` template now,
-  alongside `.agents/gate.sh` and `.agents/zones.toml`, so `aw land` refuses a
+  alongside `.agents/gate.sh` and `.agents/zones.toml`, so `loom land` refuses a
   branch that changed it. That is a review boundary, not a sandbox: the file
-  still runs as shell when you invoke `aw`.
+  still runs as shell when you invoke `loom`.
 
 There used to be a second, `LOOM_BASE_REF`: the ref the security base was
 measured from, snapshotted before the file was sourced and restored after. That
 variable no longer exists. The base every history check uses is the **operator
 record** (`${XDG_CONFIG_HOME:-$HOME/.config}/loom/repos/<key>/tasks/<task>`),
-written by `aw new`, which no file in the repository takes part in.
+written by `loom new`, which no file in the repository takes part in.
 
 **This gap is the residual the operator record concedes.** That directory is in
 `$HOME`, and the capability this gap describes — an agent that can write files
@@ -152,7 +152,7 @@ that one form or the README changes with it.
 used to read "granted for the whole worktree root". It is not that any more;
 what is left is a confirmation.
 
-**Where.** `bin/aw:503`, in `run_headless` (`bin/aw:416`), the opencode leg:
+**Where.** `bin/loom:503`, in `run_headless` (`bin/loom:416`), the opencode leg:
 
 ```sh
 perm="$(printf '{"external_directory":{"%s/*":"allow","%s/**":"allow"}}' "$wd" "$wd")"
@@ -190,7 +190,7 @@ and whose log says the run was denied an external directory — typically a
 rejected permission for the worktree's parent path, after a command that
 changed directory inside the worktree (`cd <subdir> && …`, `perl -pi`, an
 editor tool given a relative path). The gate then fails for want of any edit,
-and `aw` burns every attempt. If that appears: add the minimum extra entry
+and `loom` burns every attempt. If that appears: add the minimum extra entry
 opencode's parser needs (its *parent*, i.e. the worktree root of THAT task's
 kind) rather than reverting to `$WT_ROOT`, and record here which one it was.
 
@@ -208,8 +208,8 @@ tracked files the agent can rewrite mid-run. That file carries
 `provider.<name>.options.baseURL` — the provider *identity* that a fence
 profile's `providers` list is built on — and the agent definitions that supply
 each role's prompt. An agent could therefore answer as `deepseek` from a host
-of its choosing, or hand itself a different role prompt, and nothing in `aw`
-would see a change: `aw` checks the model TOKEN against the profile, and the
+of its choosing, or hand itself a different role prompt, and nothing in `loom`
+would see a change: `loom` checks the model TOKEN against the profile, and the
 token would still say `deepseek/deepseek-v4-pro`.
 
 **What closes it.** opencode 1.x has two environment knobs, and both are
@@ -222,7 +222,7 @@ OPENCODE_CONFIG=$ROOT/.opencode/opencode.json     # (and OPENCODE_CONFIG_DIR)
 OPENCODE_DISABLE_PROJECT_CONFIG=1
 ```
 
-`run_headless`'s opencode leg (`bin/aw:534`) sets the **disable
+`run_headless`'s opencode leg (`bin/loom:534`) sets the **disable
 unconditionally**, on every opencode invocation — implementer, reviewer, scout
 and architect alike — and names the operator's config only when one exists.
 That is a round-4 correction: the disable used to be conditional on
@@ -248,7 +248,7 @@ global config, and `--agent <role>` falls back to opencode's default agent. A
 repo that wants role definitions must keep them in the operator's copy.
 
 **The residual.** `$ROOT/.opencode/opencode.json` is a file in *your* checkout.
-Nothing an agent runs touches your checkout — except `aw plan`'s architect,
+Nothing an agent runs touches your checkout — except `loom plan`'s architect,
 which is gap 2 above, and anything that gets to `.agents/loom.env`, which is
 gap 3. Closing this one does not close those, and the same file is the reason
 they matter slightly more than they did.

@@ -218,20 +218,20 @@ confused agent asks instead of digging.
    the sparse config is written to the worktree-scoped config, so nothing
    disappears from under your editor. The *definition* of the fence is
    per-repo and comes from ONE place: `.agents/zones.toml` in the MAIN
-   checkout, which `aw` finds as the parent of `git rev-parse
+   checkout, which `loom` finds as the parent of `git rev-parse
    --git-common-dir` whichever tree the command was typed in. A command run
    from inside an agent worktree used to read that worktree's copy — the
    file the agent can edit — and fence the next task with it.
 5. **A worktree can predate the fence.** Sparse rules are applied when a
    worktree is built, so one created before `[fence]` existed — or before it
-   was widened — still holds the paths you have since fenced. `aw scout`
+   was widened — still holds the paths you have since fenced. `loom scout`
    re-applies and *verifies* the fence on every call. Every command that runs a
    role in a task worktree goes through `fence_reconcile` instead (see "Fence
    profiles" below), which is stricter: a worktree holding fenced paths that no
    `--fence-profile` on the command line accounts for is **refused**, not
    quietly re-fenced, because the tree's own diff would carry the content to
    the next model regardless. Either way, after changing `[fence]`, treat
-   existing worktrees in `aw ls` as stale and `aw drop` them.
+   existing worktrees in `loom ls` as stale and `loom drop` them.
 
 Fencing `.agents/**` is refused outright, as is any pattern that would remove
 `zones.toml`, `gate.sh` or the `reviews/` directory. Removing `zones.toml` from
@@ -243,10 +243,10 @@ after a green gate and nothing is committed.
 
 The three control-plane files an agent must be able to READ and must never
 COMMIT — `.agents/zones.toml`, `.agents/gate.sh` and `.agents/loom.env` — are
-`[hand]` paths in the shipped template, which is what makes `aw land` refuse a
+`[hand]` paths in the shipped template, which is what makes `loom land` refuse a
 branch that changed them. They are each an input to the checks that judge the
 agent's own work: the zones and the fence, the script whose exit status means
-"commit it" and "land it", and a file `aw` `.`-sources as shell in your
+"commit it" and "land it", and a file `loom` `.`-sources as shell in your
 environment on every invocation.
 
 ### Fence profiles
@@ -275,14 +275,14 @@ providers = ["claude", "codex"]             # REQUIRED. provider_of() values:
 Semantics:
 
 - **Effective fence** = `[fence].paths` minus the *asserted* profile's
-  `release`. The sparse checkout at `aw new` and the re-apply/verify inside
-  `fence_reconcile` answer with that set. `aw zone` and `aw doctor` are **not**
+  `release`. The sparse checkout at `loom new` and the re-apply/verify inside
+  `fence_reconcile` answer with that set. `loom zone` and `loom doctor` are **not**
   task-scoped and never assert a profile: they always report the full `[fence]`,
   which is the honest answer to "what does this repo fence?" — the release is a
   property of one task's worktree, not of a path.
 - **The opt-in is a fresh operator act, on every command.** `--fence-profile
-  <name>` is REQUIRED by `aw new`, `run`, `check`, `loop`, `diff`, `rebase` and
-  `land` for any task under a profile. `aw new` also writes the profile into
+  <name>` is REQUIRED by `loom new`, `run`, `check`, `loop`, `diff`, `rebase` and
+  `land` for any task under a profile. `loom new` also writes the profile into
   the **operator record** (below) — and is the only thing that ever writes it —
   but that record is a **consistency check, never an authorisation**: three
   rules, all fail-closed, and there is no fourth —
@@ -290,12 +290,12 @@ Semantics:
      "this task was created under fence profile X; pass --fence-profile X";
   2. both exist and differ → die;
   3. the flag is given and no record exists → **die, always**, with the
-     recreate instruction (`aw drop <task> && aw new <task> --fence-profile
-     <name>`). A profile cannot be introduced after `aw new`. This rule had an
+     recreate instruction (`loom drop <task> && loom new <task> --fence-profile
+     <name>`). A profile cannot be introduced after `loom new`. This rule had an
      exception until round 2: a worktree already holding exactly what the
      profile releases was read as corroboration, the record was restored and
      the command ran. That rested on the claim that a materialised tree costs
-     "a checkout nobody but `aw new` performs", which is false — `git
+     "a checkout nobody but `loom new` performs", which is false — `git
      sparse-checkout disable` is one command, and so is `git checkout <ref> --
      core/`. A tree can refuse; it can never vouch.
 
@@ -304,13 +304,13 @@ Semantics:
   running inside the worktree could `git config branch.agent/<task>.fenceprofile
   codex`, because branch config lives in the shared `.git/config`. A design that
   read the profile from there let an agent widen its own fence and have the next
-  `aw run` honour it.
+  `loom run` honour it.
 
   A `Fence-profile: <name>` line in the task file is a third, weakest form: it
-  documents intent — an architect agent may have written it — and `aw new`
+  documents intent — an architect agent may have written it — and `loom new`
   honours it only when the same name is passed on the command line. It is read
   from the task file's **header block** alone, so a line inside a code fence
-  (the shape `aw loop` appends when it pastes a reviewer's text back into the
+  (the shape `loom loop` appends when it pastes a reviewer's text back into the
   task file) is not a declaration.
 - **A profiled task's worktree lives under its own root.**
   `${LOOM_WORKTREES}-profiled`, a sibling of the ordinary root and never a
@@ -318,7 +318,7 @@ Semantics:
   *contains* released paths: not another task's role, not the shared `_scout`
   mirror (which stays under the ordinary root at the full fence), and not
   opencode, whose `external_directory` grant is the role's own worktree rather
-  than the worktree root. `aw ls`, `aw drop`, `aw rebase` and `run_role`'s
+  than the worktree root. `loom ls`, `loom drop`, `loom rebase` and `run_role`'s
   defence-in-depth check all know both roots, and a task that exists under one
   cannot be re-created under the other.
 
@@ -378,8 +378,8 @@ Semantics:
   branch's **commits** touch — `git diff --no-renames --name-only <base>
   $PINNED_TIP`, a rename counted on both sides — against the full `[fence]`
   minus the asserted release, wherever history is handed to a role or to the
-  operator: `aw check` before the patch is written, each round of `aw loop`,
-  `aw diff`, `aw rebase`, and `aw land`. The endpoint is `$PINNED_TIP`, the
+  operator: `loom check` before the patch is written, each round of `loom loop`,
+  `loom diff`, `loom rebase`, and `loom land`. The endpoint is `$PINNED_TIP`, the
   **sha** this command resolved `refs/heads/agent/<task>` to, once, before any
   of it — never the ref name re-read per use, and never the worktree's `HEAD`.
   With nothing asserted, nothing is released, so any fenced path in the history
@@ -389,13 +389,13 @@ Semantics:
   coverage. A fenced path **added and deleted again on the same branch** is not
   in `git diff <base> <tip>` even though both commits are in the history and
   `git log -p` carries the content: the tree reconciler catches it while it is
-  on disk, and the first `aw` command after the add sees it in the range, but a
+  on disk, and the first `loom` command after the add sees it in the range, but a
   branch that does both between two commands is invisible to this check. And a
   diff says nothing about what was *read* — that is caveat 1's exfiltration
   class, and no check of this shape reaches it.
 - **One base, and it is the operator's — kept outside the repo.** `<base>`
   above is `security_base <task>`: the commit `$ROOT` was checked out at when
-  `aw new` created the task, read from the **operator record**
+  `loom new` created the task, read from the **operator record**
 
   ```
   ${XDG_CONFIG_HOME:-$HOME/.config}/loom/repos/<sha256 of the main checkout's
@@ -404,12 +404,12 @@ Semantics:
                                          branch=agent/<task> created=<iso>
   ```
 
-  written 0700/0600, by `aw new` alone; re-pointed by `aw rebase` (an operator
-  command, and the only thing that moves a base); deleted by `aw drop`, with or
+  written 0700/0600, by `loom new` alone; re-pointed by `loom rebase` (an operator
+  command, and the only thing that moves a base); deleted by `loom drop`, with or
   without `--keep-branch`; read by every security check, by `cmd_guard` (which
   runs as the same OS user, and finds the same directory from a linked worktree
   because the key is the **main** checkout's path via `git rev-parse
-  --git-common-dir`) and by `aw ls`.
+  --git-common-dir`) and by `loom ls`.
 
   The location is the point. Everything under `.git/` is writable from any
   linked worktree — config *and* refs — so none of it can carry a security
@@ -423,39 +423,39 @@ Semantics:
   base, a base that is not an ancestor of the branch, a branch with nothing past
   its branch point ("nothing to review/land"), unresolvable rev, failed diff.
 
-  There is no second base. The review patch `aw check` and `aw diff` write is
+  There is no second base. The review patch `loom check` and `loom diff` write is
   cut from the same range the history check just cleared, so there is nothing
   left to clamp — and nothing for an agent to shrink.
 - **The endpoint is the branch ref, never the worktree's HEAD — and it is
   resolved to a SHA exactly once per command.**
   `fence_reconcile_history` and the review-patch cut both read
-  `refs/heads/agent/<task>` in `$ROOT` — the ref `aw land` merges and `aw land
+  `refs/heads/agent/<task>` in `$ROOT` — the ref `loom land` merges and `loom land
   --pr` pushes. Measuring from the worktree's `HEAD` meant `git checkout
   --detach HEAD~1` after a fenced commit left every check looking at a clean
   history while the branch still carried the commit onward. A worktree whose
   `HEAD` is not `refs/heads/agent/<task>` (`git symbolic-ref -q HEAD`) is
-  refused outright as well: it is not a state `aw` produces.
+  refused outright as well: it is not a state `loom` produces.
 
   Naming the ref was not enough either, because a name is resolved at the
   moment it is used and `refs/heads/*` is in the shared `.git`. A command that
   said `agent/<task>` four times — the history check, the patch, the merge, the
   push — resolved it four times, and one `git update-ref` between any two of
-  them (the gate script `aw land` used to run out of the worktree is one line
+  them (the gate script `loom land` used to run out of the worktree is one line
   of shell) landed something other than what was checked. `pin_branch_tip
   <task>` resolves it once into `$PINNED_TIP`, and every one of the four uses
   that sha: `git merge --no-ff <sha>`, `git push origin
   <sha>:refs/heads/agent/<task>`.
 - **What was reviewed is recorded, and landing refuses anything else.**
-  `aw check` writes `reviewed=<sha>` into the operator record after the review
-  is saved; `aw land` refuses when `$PINNED_TIP` is not that sha, naming both
-  and asking for a fresh `aw check`. `--force` skips the gate, not this. A
+  `loom check` writes `reviewed=<sha>` into the operator record after the review
+  is saved; `loom land` refuses when `$PINNED_TIP` is not that sha, naming both
+  and asking for a fresh `loom check`. `--force` skips the gate, not this. A
   rebase clears the stamp, because the sha a reviewer read does not exist on a
   rebased branch. Landing also refuses a worktree with uncommitted changes —
   what the reviewer read and what a merge would carry have come apart —
-  excluding `.agents/reviews/`, which is where `aw check` and `aw diff` write
+  excluding `.agents/reviews/`, which is where `loom check` and `loom diff` write
   the review patch themselves (consumers should gitignore that directory).
-- **The gate `aw` acts on is the operator's.** `aw run` (green -> commit) and
-  `aw land` (green -> merge/push) execute `<main checkout>/.agents/gate.sh`
+- **The gate `loom` acts on is the operator's.** `loom run` (green -> commit) and
+  `loom land` (green -> merge/push) execute `<main checkout>/.agents/gate.sh`
   with the worktree as its cwd, never `<worktree>/.agents/gate.sh`. The
   worktree's copy is a file the implementer edits — the `claude` leg allowlists
   running it by name, and under a fence profile that releases it the guard
@@ -464,7 +464,7 @@ Semantics:
   implementer still runs the worktree's copy for its own iteration; that is its
   business. `.agents/gate.sh`, `.agents/zones.toml` and `.agents/loom.env`
   belong in `[hand]` for the same reason, and the shipped template lists them.
-- **A rebase does not bury upstream commits under the base.** `aw rebase` is the
+- **A rebase does not bury upstream commits under the base.** `loom rebase` is the
   one command that moves a recorded base, and everything in
   `old_base..new_base` stops being the branch's work: it is upstream now, below
   the base, where no fence check, no hand check and no review patch looks
@@ -480,17 +480,17 @@ Semantics:
   "I have read those commits and I accept them under the base", and prints them
   as well. `git fetch` losing its `|| true` belongs to the same rule: replaying
   onto a stale upstream succeeds quietly. And `remote.origin.url` is recorded at
-  `aw new`, with `aw rebase` (before the fetch) and `aw land --pr` (before the
+  `loom new`, with `loom rebase` (before the fetch) and `loom land --pr` (before the
   push) refusing when it has changed.
 - **Landing inspects what it is about to publish.** Before it merges and before
-  it pushes, `aw land` maps every path in `<security base>..agent/<task>` through
+  it pushes, `loom land` maps every path in `<security base>..agent/<task>` through
   `zone_of` and the asserted profile's release list: a fenced path the profile
   does not release, or ANY `[hand]` path it does not release, refuses the
   landing by name. The guard is supposed to have stopped these, but the guard
   runs in the agent's own context where `--no-verify` exists, so landing is
   where it is actually caught. `--force` skips the gate, not this.
 - **Provider rule.** Before a worktree is created, and again before each role
-  runs, `aw` walks the *entire* model chain of every role that will run there
+  runs, `loom` walks the *entire* model chain of every role that will run there
   (implementer, reviewer, and the auto-fix rounds through the implementer) and
   dies unless `provider_of(model)` is in `providers` for all of them. Chains,
   not first entries: a fallback fires on a rate limit without asking. The scout
@@ -498,7 +498,7 @@ Semantics:
   every task and always carries the full fence.
 - **The guard follows, as a seatbelt.** Fenced paths are conventionally
   duplicated into `[hand]` so that a *commit* to them is blocked even where the
-  fence is not applied. Under a profile, `aw guard` accepts exactly the released
+  fence is not applied. Under a profile, `loom guard` accepts exactly the released
   patterns and keeps blocking the rest of `[hand]`. But be clear about what it
   is: the guard is a pre-commit hook that runs **in the agent's own context**,
   where `git commit --no-verify` exists. It is a seatbelt, not a lock.
@@ -513,7 +513,7 @@ Semantics:
   process that can set that variable can point the lookup at a record of its
   own. That is not a hole to plug so much as the shape of the thing — the whole
   hook is dominated by `--no-verify`, which needs no environment at all.
-  `aw land`'s checks are the lock; this is the seatbelt. It is
+  `loom land`'s checks are the lock; this is the seatbelt. It is
   therefore allowed to read the operator record for the released set — it runs
   as the same OS user, and resolves the same state directory from inside the
   worktree — and it checks that record against the tree before trusting it: a
@@ -525,8 +525,8 @@ Semantics:
   unsandboxed agent can write `$HOME` (KNOWN-GAPS 3), so the state directory is
   **operator integrity, not tamper-proofing**. It catches a stale worktree and
   an honest mistake. What actually decides whether released content reaches a
-  provider is the operator's flag on `aw new`, re-checked on every later
-  command, and `aw land`'s inspection of the commits. The reviewer prompt is
+  provider is the operator's flag on `loom new`, re-checked on every later
+  command, and `loom land`'s inspection of the commits. The reviewer prompt is
   told the same fact, so a released path is not reported as an unauthorized
   change.
 - **Fail-closed parsing.** Unknown profile name, unknown key in the table, a

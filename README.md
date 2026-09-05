@@ -170,7 +170,7 @@ Codex can also be the *implementer*: a writable sandbox, granted per role, not
 per model, on any run — see "Codex (or Claude) as an implementer" below. It is
 not in a default chain, so it takes an explicit `LOOM_MODELS_implementer`.
 
-Any role's chain can be replaced from the environment, without editing `aw`:
+Any role's chain can be replaced from the environment, without editing `loom`:
 
 ```sh
 export LOOM_MODELS_reviewer="codex-sub deepseek/deepseek-v4-pro"
@@ -233,7 +233,7 @@ paths = ["crates/audat-nda/**", "docs/audits/**"]
 
 Read the honest limits in `ARCHITECTURE.md` § 5 before relying on it — in
 particular, a fenced path the build needs will break the build in the worktree.
-`aw zone <path>` reports fencing, and `aw doctor` warns about fence patterns
+`loom zone <path>` reports fencing, and `loom doctor` warns about fence patterns
 that match no tracked file. Both are repo-wide, not task-scoped: they always
 report the whole `[fence]`, never one task's relaxation of it.
 
@@ -268,7 +268,7 @@ part of the branch that still changes your runs:
 
 - **The base is an operator record, outside every repo.** Every check of what a
   branch's *commits* touch is measured from the commit your checkout was on
-  when `aw new` created the task, stored in
+  when `loom new` created the task, stored in
   `${XDG_CONFIG_HOME:-~/.config}/loom/repos/<sha256 of the repo path>/tasks/<task>`
   (mode 0700/0600, with a `repo` file beside it naming the checkout). Nothing
   inside the repository takes part: a linked worktree shares `.git` with your
@@ -278,8 +278,8 @@ part of the branch that still changes your runs:
   them could collapse the range a fence check looked at to nothing. That also
   fixes a false refusal in the other direction: your own unpushed commits on
   `main` used to count as the branch's.
-  `aw new` writes the record, `aw rebase` re-points it (the one command that
-  moves a base, and it is yours), `aw drop` deletes it, and every check reads
+  `loom new` writes the record, `loom rebase` re-points it (the one command that
+  moves a base, and it is yours), `loom drop` deletes it, and every check reads
   it. A missing record, a base that does not resolve, a base that is not an
   ancestor of the branch, and a branch with nothing past its branch point are
   each a refusal with their own message — never an empty answer.
@@ -288,7 +288,7 @@ part of the branch that still changes your runs:
   your checkout, and never the worktree's `HEAD`: `git checkout --detach
   HEAD~1` after a fenced commit left the tree looking clean while the branch
   still carried the commit into the merge. A worktree whose `HEAD` is not its
-  own branch is refused outright — it is not a state `aw` produces.
+  own branch is refused outright — it is not a state `loom` produces.
 - **The worktree roots are verified.** Both are normalised (a trailing `/` or
   `/.` in `$LOOM_WORKTREES` is stripped before `-profiled` is appended),
   resolved with `pwd -P` and refused if the resolved path is not where the name
@@ -302,10 +302,10 @@ part of the branch that still changes your runs:
   core/copy.rs` never touches the index — is a dead stop instead of an
   invisible one. (Content copied to a path the fence does *not* name is still
   the exfiltration class; see "What a profile is not".)
-- **An existing branch is refused**, never walked over: `aw new` used to arm
+- **An existing branch is refused**, never walked over: `loom new` used to arm
   its cleanup trap before `git worktree add -b`, so an add that failed because
   `agent/<task>` already existed deleted that branch and its commits. A branch
-  the failing `aw new` *itself* created **is** removed, and it says so — `git
+  the failing `loom new` *itself* created **is** removed, and it says so — `git
   worktree add -b` creates the branch and can then fail on the path, and an
   orphan there made the task id unusable forever.
 - **A fence that was widened under an existing worktree is refused**, not
@@ -330,11 +330,11 @@ part of the branch that still changes your runs:
   to move into the role prompt.
 - **Policy comes from the MAIN checkout, whichever tree you typed the command
   in.** `$ROOT` used to be `git rev-parse --show-toplevel`, so `cd
-  <a worktree> && aw new t5` read *that worktree's* `.agents/zones.toml` (the
+  <a worktree> && loom new t5` read *that worktree's* `.agents/zones.toml` (the
   fence it was about to apply — an agent that emptied it got an unfenced task)
   and sourced *that worktree's* `.agents/loom.env` as shell in your
   environment. It is now the parent of `git rev-parse --git-common-dir`. One
-  thing still comes from the invoking tree, and only one: `aw guard`'s subject —
+  thing still comes from the invoking tree, and only one: `loom guard`'s subject —
   the staged files and the tree it is judging are the ones the commit is
   happening in, while the zones it judges them by are the main checkout's.
   (That also closes `docs/KNOWN-GAPS.md` gap 1.)
@@ -344,23 +344,23 @@ part of the branch that still changes your runs:
   one `git update-ref` from something else. The checks, the patch, `git merge
   --no-ff <sha>` and `git push origin <sha>:refs/heads/agent/<task>` are now all
   the same sha.
-- **`aw check` records the tip it reviewed; `aw land` refuses any other**,
-  naming both shas and asking for a fresh `aw check`. A commit added after the
+- **`loom check` records the tip it reviewed; `loom land` refuses any other**,
+  naming both shas and asking for a fresh `loom check`. A commit added after the
   reviewer read the patch does not ride the review into the merge. `--force`
-  skips the gate, not this. `aw rebase` clears the stamp, because the sha a
+  skips the gate, not this. `loom rebase` clears the stamp, because the sha a
   reviewer read no longer exists on a rebased branch.
-- **`aw run` and `aw land` run the OPERATOR's `.agents/gate.sh`** (with the
+- **`loom run` and `loom land` run the OPERATOR's `.agents/gate.sh`** (with the
   worktree as its cwd), never `<worktree>/.agents/gate.sh`. The worktree's copy
   is a file the implementer edits — the `claude` leg even allowlists running it
   — and it was deciding "green, commit it" and "green, land it". The
   implementer still runs the worktree's copy for its own iteration; the verdict
-  `aw` acts on is yours.
+  `loom` acts on is yours.
 - **Landing refuses a dirty worktree.** Uncommitted work is not the branch's
   work: what the reviewer read and what the merge would carry have come apart.
-  `.agents/reviews/` is excluded, because that is where `aw check` and `aw diff`
+  `.agents/reviews/` is excluded, because that is where `loom check` and `loom diff`
   write the review patch themselves — **gitignore that directory** in a
   consuming repo.
-- **`aw rebase` will not bury upstream commits under your base.** A rebase is
+- **`loom rebase` will not bury upstream commits under your base.** A rebase is
   the one command that moves a recorded base, and everything between the old
   base and the new one stops being the branch's work — it slides *under* the
   base, where no fence check, no hand check and no review patch looks again.
@@ -375,11 +375,11 @@ part of the branch that still changes your runs:
   commits and I accept them under the base"; it prints them too. A failed `git
   fetch` is a refusal for the same reason: replaying onto a stale upstream
   succeeds quietly.
-- **`remote.origin.url` is pinned to the task.** Recorded at `aw new`;
-  `aw rebase` (before it fetches) and `aw land --pr` (before it pushes) refuse
+- **`remote.origin.url` is pinned to the task.** Recorded at `loom new`;
+  `loom rebase` (before it fetches) and `loom land --pr` (before it pushes) refuse
   when it differs. Remote config is in the shared `.git/config`.
-- **`aw run` with no operator record refuses before the model runs.** It used to
-  run one and commit, with the refusal arriving at `aw check` and the content
+- **`loom run` with no operator record refuses before the model runs.** It used to
+  run one and commit, with the refusal arriving at `loom check` and the content
   already on the branch.
 - **opencode's config variables never come out of the tree.** `OPENCODE_CONFIG`,
   `OPENCODE_CONFIG_DIR`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_PERMISSION` and
@@ -392,22 +392,22 @@ part of the branch that still changes your runs:
   stripped from every launch outright, caller included.
 - Independent of all of it: implementer-class roles on `claude-sub` and
   `codex-sub` get a write-capable sandbox (see "Codex as an implementer"
-  below), and `aw doctor` prints the parse error when `zones.toml` is
+  below), and `loom doctor` prints the parse error when `zones.toml` is
   unreadable instead of a generic line.
 
-**The rule is fail-closed.** Before the worktree is created, `aw` checks every
+**The rule is fail-closed.** Before the worktree is created, `loom` checks every
 model in every chain that will run against it — implementer, reviewer, and the
-auto-fix rounds of `aw loop`, fallbacks included, because a fallback fires on a
+auto-fix rounds of `loom loop`, fallbacks included, because a fallback fires on a
 rate limit without asking anyone. One model outside `providers` and it dies,
 naming the role and the override that fixes it:
 
 ```
-$ aw new 0007-c --fence-profile codex
-aw: fence profile 'codex' releases fenced paths into this worktree,
+$ loom new 0007-c --fence-profile codex
+loom: fence profile 'codex' releases fenced paths into this worktree,
 but the implementer chain would run 'zai-coding-plan/glm-5.3' (provider 'zai-coding-plan').
 The profile allows only: claude codex
 Restrict the chain for this task, e.g.:
-  LOOM_MODELS_implementer="claude-sub codex-sub" aw ...
+  LOOM_MODELS_implementer="claude-sub codex-sub" loom ...
 ```
 
 An unknown profile name, a `release` pattern that is not in `[fence].paths`, a
@@ -418,16 +418,16 @@ never covered by a profile: its mirror is shared by every task, so it always
 runs at the full fence.
 
 **You pass the flag every time.** `--fence-profile <name>` is required by
-`aw new`, `run`, `check`, `loop`, `diff`, `rebase` and `land` for a task under
+`loom new`, `run`, `check`, `loop`, `diff`, `rebase` and `land` for a task under
 a profile:
 
 ```sh
-aw new    0007-c --fence-profile codex
-aw run    0007-c --fence-profile codex
-aw check  0007-c --fence-profile codex
-aw diff   0007-c --fence-profile codex
-aw rebase 0007-c --fence-profile codex
-aw land   0007-c --fence-profile codex
+loom new    0007-c --fence-profile codex
+loom run    0007-c --fence-profile codex
+loom check  0007-c --fence-profile codex
+loom diff   0007-c --fence-profile codex
+loom rebase 0007-c --fence-profile codex
+loom land   0007-c --fence-profile codex
 ```
 
 **A profiled task's worktree lives under its own root.** `$LOOM_WORKTREES` with
@@ -436,13 +436,13 @@ Nothing that runs unprofiled is ever pointed at a directory that contains
 released paths, and that includes the shared `_scout` mirror (which stays under
 the ordinary root and always carries the full fence) and opencode's
 `external_directory` grant, which is now the role's own worktree rather than
-the whole root. `aw ls` and `aw drop` know both roots. A task that already
+the whole root. `loom ls` and `loom drop` know both roots. A task that already
 exists under one root cannot be re-created under the other: a profile is not
 something you add to, or remove from, a task that exists.
 
-`aw new` also records it — in the operator record, the same file that holds the
-task's base — and `aw ls` shows it. That record is a **consistency check, not
-an authorisation**. `aw new` is the only thing that ever writes it. It can
+`loom new` also records it — in the operator record, the same file that holds the
+task's base — and `loom ls` shows it. That record is a **consistency check, not
+an authorisation**. `loom new` is the only thing that ever writes it. It can
 refuse a command in three ways, it grants nothing, and these three rules are
 the whole of it — there is no fourth case and no exception:
 
@@ -452,10 +452,10 @@ the whole of it — there is no fourth case and no exception:
 | absent | `codex` | **dies**: this task was created under `codex`, so pass `--fence-profile codex` |
 | `audit` | `codex` | **dies**: the flag contradicts the record |
 | `codex` | `codex` | the profile is active for this command |
-| `codex` | absent | **dies**: a profile cannot be introduced after `aw new` — `aw drop <task> && aw new <task> --fence-profile codex` |
+| `codex` | absent | **dies**: a profile cannot be introduced after `loom new` — `loom drop <task> && loom new <task> --fence-profile codex` |
 
 That last row used to have an escape: if the worktree already held exactly what
-the profile releases, `aw` called that corroboration, restored the record and
+the profile releases, `loom` called that corroboration, restored the record and
 ran. It is gone. A worktree is a directory the agent can write — `git
 sparse-checkout disable` materialises the released paths in one command — so a
 tree that "looks like" a profile is not evidence that anyone asked for it.
@@ -465,7 +465,7 @@ Re-creating the task is now an operator act, with the same weight as the flag.
 the reason is worth stating plainly: **branch config is agent-writable state.**
 It lives in the shared `.git/config`, so anything running in the worktree could
 `git config branch.agent/<task>.fenceprofile codex` and, under a design that
-read the profile back from there, widen its own fence for the next `aw run`.
+read the profile back from there, widen its own fence for the next `loom run`.
 The record moved to a file outside every repository. That is
 **operator integrity, not tamper-proofing** — an unsandboxed agent can write
 `$HOME`, which `docs/KNOWN-GAPS.md` § 3 already concedes — but it does remove
@@ -474,20 +474,20 @@ security check". Your flag is the consent; the record only checks it.
 
 A `Fence-profile: <name>` line in the task file is a third form, and the
 weakest — it *documents* the intent of a task (an architect agent may have
-written it), so `aw new` honours it only when you also pass the same name:
+written it), so `loom new` honours it only when you also pass the same name:
 
 ```markdown
 Zone: assist
-Fence-profile: codex        # aw new 0007-c --fence-profile codex, or it dies
+Fence-profile: codex        # loom new 0007-c --fence-profile codex, or it dies
 ```
 
 Only the task file's header block is read, so a `Fence-profile:` line inside a
-code block — the shape `aw loop` appends when it pastes a reviewer's text back
+code block — the shape `loom loop` appends when it pastes a reviewer's text back
 into the task file — is not a declaration.
 
 **Enforcement comes off the disk and out of the commits, not off the record.**
 Before any role runs — and before *every* fallback attempt, because attempt 1
-can widen the tree and then hit a rate limit — `aw` asks the worktree which
+can widen the tree and then hit a rate limit — `loom` asks the worktree which
 fenced paths are actually in it (against the whole `[fence]`, never the
 released subset) and refuses anything that does not line up: released paths
 present that your flag does not account for, or a flag whose released paths are
@@ -500,9 +500,9 @@ fact: materialise `core/**`, commit it, put the sparse rules back, and the
 worktree looks clean while the *history* still carries it into every diff,
 patch file and merge. So the branch's commits are judged too — every path in
 `git diff <security base> refs/heads/agent/<task>`, mapped through the full
-`[fence]` — wherever history is handed onward: `aw check` (before the patch is
-written), each round of `aw loop`, `aw diff`, `aw rebase`, and `aw land` before
-it merges or pushes. `aw land` additionally refuses any `[hand]` path in those
+`[fence]` — wherever history is handed onward: `loom check` (before the patch is
+written), each round of `loom loop`, `loom diff`, `loom rebase`, and `loom land` before
+it merges or pushes. `loom land` additionally refuses any `[hand]` path in those
 commits that the profile does not release; `--force` skips the gate, not this.
 
 Two honest limits of a diff between two endpoints. It answers "what do these
@@ -510,7 +510,7 @@ commits, taken together, touch" — so a fenced path **added and then deleted
 again on the same branch** is not in it, even though both commits are in the
 history and `git log -p` shows the content. (The reconciler catches it while it
 is on disk, and the *first* command to run after the add sees it in the range;
-what is not covered is a branch that adds and removes it between two `aw`
+what is not covered is a branch that adds and removes it between two `loom`
 commands.) And it says nothing about what the model read: content copied to a
 path the fence does not name is the exfiltration class, below.
 
@@ -524,7 +524,7 @@ pointed at the branch's own tip, or an `origin/main` moved there with `git
 update-ref`, makes every one of those diffs empty; a detached worktree hides
 the last commit from every check measured off `HEAD`). There is no second,
 "nicer to read" base any more: the review patch is cut from the same range the
-history check just cleared, `base..refs/heads/agent/<task>`. `aw rebase` is the
+history check just cleared, `base..refs/heads/agent/<task>`. `loom rebase` is the
 only command that moves a recorded base, and it is one of yours.
 
 **The commit guard follows the profile — as a seatbelt.** Fenced paths are
@@ -544,7 +544,7 @@ agree costs one `git sparse-checkout disable`, and an unsandboxed agent can
 write `$HOME`. It catches a stale worktree and an honest mistake, and that is
 all it claims. The
 thing that actually decides whether released content reaches a provider is your
-`--fence-profile` flag, re-checked on every command, plus `aw land`'s
+`--fence-profile` flag, re-checked on every command, plus `loom land`'s
 inspection of the commits. The reviewer is told the same thing, so a released
 path does not come back as an "unauthorized hand/fence change" REVISE.
 
@@ -553,7 +553,7 @@ declined security-remediation prompts; the profile allows both providers
 precisely so that is a one-line retry, not a dead end:
 
 ```sh
-LOOM_MODELS_implementer=claude-sub aw run 0007-c --fence-profile codex
+LOOM_MODELS_implementer=claude-sub loom run 0007-c --fence-profile codex
 ```
 
 **What a profile is not.** It scopes *exposure*, it does not prevent
@@ -568,7 +568,7 @@ a profile does **not** close are written down in
 One of them (opencode's directory grant) is *widened* by profiles, and is the
 reason a profiled worktree gets its own root.
 
-`aw doctor` lists every profile, what it releases, to whom, and warns when a
+`loom doctor` lists every profile, what it releases, to whom, and warns when a
 role's default chain reaches a provider the profile does not allow.
 
 #### Codex (or Claude) as an implementer
