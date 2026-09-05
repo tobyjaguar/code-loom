@@ -369,18 +369,35 @@ part of the branch that still changes your runs:
   a moved `origin/main` is visible nowhere. So the range `old_base..new_base` is
   mapped through the **full** `[fence]` and `[hand]` — a profile releases paths
   for the *task's* commits, and nobody released anything for what arrives from
-  upstream — and a hit refuses the rebase, printing the paths and `git log
-  --oneline old_base..new_base`, leaving the base where it was and the branch
-  where it was. `--accept-upstream` is the operator saying "I have read those
-  commits and I accept them under the base"; it prints them too. In an active
+  upstream — and a hit refuses the rebase, leaving the base where it was and
+  the branch where it was. `--accept-upstream` is the operator saying "I have
+  read those commits and I accept them under the base". Either way the range is
+  printed whenever the base moves — `git log --oneline old_base..new_base` and
+  the fenced/hand path lists, empty or not — because consent to bury commits is
+  only consent if you were shown them. In an active
   repo it will fire on your *own* hand-zone commits merged upstream while the
   task ran — that is the intended shape, not a bug: the flag is a one-word
   confirmation, not an override. A failed `git
   fetch` is a refusal for the same reason: replaying onto a stale upstream
   succeeds quietly.
-- **`remote.origin.url` is pinned to the task.** Recorded at `loom new`;
+- **The remote is pinned to the task — the URL *and* the refspec.**
+  `remote.origin.url` and `remote.origin.fetch` are both recorded at `loom new`;
   `loom rebase` (before it fetches) and `loom land --pr` (before it pushes) refuse
-  when it differs. Remote config is in the shared `.git/config`.
+  when either differs. Remote config is in the shared `.git/config`, and the
+  refspec is the quieter of the two: pointed at `refs/remotes/decoy/*` it makes
+  `git fetch origin` succeed while updating nothing under
+  `refs/remotes/origin/`, so a forged `origin/main` survives the fetch and the
+  rebase replays onto it. `loom rebase` therefore writes the refspec out itself
+  — `git fetch origin +refs/heads/<b>:refs/remotes/origin/<b>` — instead of
+  trusting the config to say what a fetch is for.
+- **The operator record is one field per line, and `loom` wrote every one of
+  them.** `origin` and `fetch` arrive from `.git/config`, where a value may
+  contain a newline — so a URL of `https://…` + newline + `reviewed=<sha>` used
+  to append a second field to the record. `state_put` refuses a control
+  character in any value and a key outside the fixed list
+  (`base profile branch created origin fetch reviewed`); `state_read` refuses a
+  file with a duplicated field, an unknown key or a line that is not
+  `<key>=<value>`, instead of taking the first match and carrying on.
 - **`loom run` with no operator record refuses before the model runs.** It used to
   run one and commit, with the refusal arriving at `loom check` and the content
   already on the branch.

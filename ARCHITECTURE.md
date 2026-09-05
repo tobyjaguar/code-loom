@@ -400,8 +400,13 @@ Semantics:
   ```
   ${XDG_CONFIG_HOME:-$HOME/.config}/loom/repos/<sha256 of the main checkout's
       real path>/repo                 <- that path, for humans
-      .../tasks/<task>                <- base=<commit> profile=<name>
-                                         branch=agent/<task> created=<iso>
+      .../tasks/<task>                <- base=<commit>
+                                         profile=<name>
+                                         branch=agent/<task>
+                                         created=<iso>
+                                         reviewed=<tip loom check last read>
+                                         origin=<remote.origin.url at loom new>
+                                         fetch=<remote.origin.fetch at loom new>
   ```
 
   written 0700/0600, by `loom new` alone; re-pointed by `loom rebase` (an operator
@@ -410,6 +415,17 @@ Semantics:
   runs as the same OS user, and finds the same directory from a linked worktree
   because the key is the **main** checkout's path via `git rev-parse
   --git-common-dir`) and by `loom ls`.
+
+  Those are all seven fields, and they are the whole file: one field per line,
+  each field once, every key in that fixed list. `state_put` refuses anything
+  else on the way in and `state_read` refuses it on the way out, because two of
+  the values arrive from `.git/config` — `origin` via `git remote get-url`,
+  `fetch` via `git config` — where a worktree can put a NEWLINE inside a value
+  and forge a second field. `reviewed` is written above those two on purpose,
+  so that even a reader taking the first match for a duplicated key takes the
+  honest one. `reviewed` is what `loom check` stamps and `loom land` refuses to
+  publish anything else against; `origin`/`fetch` are what `loom rebase` and
+  `loom land --pr` check before they contact a remote at all.
 
   The location is the point. Everything under `.git/` is writable from any
   linked worktree — config *and* refs — so none of it can carry a security
@@ -464,8 +480,8 @@ Semantics:
   implementer still runs the worktree's copy for its own iteration; that is its
   business. `.agents/gate.sh`, `.agents/zones.toml` and `.agents/loom.env`
   belong in `[hand]` for the same reason, and the shipped template lists them.
-- **A rebase does not bury upstream commits under the base.** `loom rebase` is the
-  one command that moves a recorded base, and everything in
+- **A rebase does not bury upstream commits under the base.** `loom rebase` is
+  the one command that moves a recorded base, and everything in
   `old_base..new_base` stops being the branch's work: it is upstream now, below
   the base, where no fence check, no hand check and no review patch looks
   again. `refs/remotes/origin/main` is one `git update-ref` from any commit —
@@ -473,18 +489,35 @@ Semantics:
   and moves in front of them, a moved `origin/main` is visible nowhere. So the
   range is mapped through the **full** `[fence]` and the **full** `[hand]` (a
   profile releases paths for the *task's* commits; nobody released anything for
-  what arrives from upstream), and a hit refuses the rebase — printing the
-  paths and `git log --oneline old_base..new_base`, leaving the recorded base
-  untouched and resetting the branch back to `$PINNED_TIP`, so the refusal
-  leaves the task exactly as it found it. `--accept-upstream` is the operator's
-  "I have read those commits and I accept them under the base", and prints them
-  as well. It will fire on ordinary work too — your own `[hand]` commits, merged
-  upstream while the task ran, are a hit — and that is the intended shape: the
-  flag is a confirmation, not an override, and the alternative is a base that
-  moves over unread commits. `git fetch` losing its `|| true` belongs to the same rule: replaying
-  onto a stale upstream succeeds quietly. And `remote.origin.url` is recorded at
-  `loom new`, with `loom rebase` (before the fetch) and `loom land --pr` (before the
-  push) refusing when it has changed.
+  what arrives from upstream), and a hit refuses the rebase, leaving the
+  recorded base untouched and resetting the branch back to `$PINNED_TIP`, so
+  the refusal leaves the task exactly as it found it. `--accept-upstream` is
+  the operator's "I have read those commits and I accept them under the base".
+
+  The range itself — `git log --oneline old_base..new_base` **and** the
+  fenced/hand path lists — is printed **whenever the base moves**: on the
+  refusal and under `--accept-upstream` alike, and whether or not anything is
+  in those lists. Consent to bury commits is only consent if the operator was
+  shown what they are; the accept leg used to print subjects with no lists at
+  all, because it never computed them, and both legs were gated on the range
+  touching a path, so a range of merge commits slid under in silence. It will
+  fire on ordinary work too — your own `[hand]` commits, merged upstream while
+  the task ran, are a hit — and that is the intended shape: the flag is a
+  confirmation, not an override, and the alternative is a base that moves over
+  unread commits.
+
+  `git fetch` losing its `|| true` belongs to the same rule: replaying onto a
+  stale upstream succeeds quietly. So does the SHAPE of the fetch. For an
+  `origin/<branch>` upstream `loom` writes the refspec out itself —
+  `git fetch origin +refs/heads/<b>:refs/remotes/origin/<b>` — rather than
+  letting `remote.origin.fetch` decide what a fetch is for. That setting lives
+  in the shared `.git/config`: pointed at `refs/remotes/decoy/*` it makes the
+  fetch succeed while updating nothing under `refs/remotes/origin/`, so a
+  forged `origin/main` survives it intact, and forged at the branch's own tip
+  that re-points the base onto the branch's own work. Both halves of the remote
+  — `remote.origin.url` and `remote.origin.fetch` — are also recorded at
+  `loom new`, with `loom rebase` (before the fetch) and `loom land --pr`
+  (before the push) refusing when either has changed.
 - **Landing inspects what it is about to publish.** Before it merges and before
   it pushes, `loom land` maps every path in `<security base>..agent/<task>` through
   `zone_of` and the asserted profile's release list: a fenced path the profile

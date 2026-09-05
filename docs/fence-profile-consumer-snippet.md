@@ -219,9 +219,13 @@ loom check <some-task> --fence-profile codex      # must STILL die, telling you 
                                                 # loom drop && loom new the task
 ```
 
-The record is a file you own, not a git object: `loom new` writes it, `loom rebase`
-re-points its `base`, `loom drop` deletes it (with or without `--keep-branch`),
-and `loom ls` shows the profile it names. A task created by an older `loom` has no
+The record is a file you own, not a git object: `loom new` writes it, `loom check`
+stamps its `reviewed`, `loom rebase` re-points its `base`, `loom drop` deletes it
+(with or without `--keep-branch`), and `loom ls` shows the profile it names. It is
+one field per line, each field once, every key from a fixed list and no control
+character in any value — `loom` refuses a record of any other shape rather than
+reading the first line that matches, because `origin` and `fetch` come out of
+`.git/config`, where a value may contain a newline. A task created by an older `loom` has no
 record, so `loom check|diff|loop|rebase|land` on it refuses with "no operator
 record for task X" — `loom drop X && loom new X` is the fix, and there is no
 migration to run beyond that.
@@ -249,8 +253,17 @@ or up to date. Two consequences worth knowing before you rely on it:
 * **`loom rebase` will not bury upstream commits under your base.** Moving the
   base makes everything between the old one and the new one upstream, i.e.
   invisible to every later check. If those commits touch a fenced or `[hand]`
-  path, `loom rebase` refuses and prints them; `--accept-upstream` is the
-  operator's "I have read those and I accept them under the base".
+  path, `loom rebase` refuses; `--accept-upstream` is the operator's "I have
+  read those and I accept them under the base". Either way the range is printed
+  whenever the base moves — the `git log --oneline` and the fenced/hand path
+  lists — so the consent is an informed one.
+* **The remote is pinned to the task: the URL *and* `remote.origin.fetch`.**
+  Both are recorded at `loom new` and refused when changed. The refspec matters
+  because it decides which local ref a fetch updates at all — pointed at
+  `refs/remotes/decoy/*` it leaves a forged `refs/remotes/origin/main` standing
+  through a fetch that looks like it worked. `loom rebase` also names the
+  refspec itself (`+refs/heads/<b>:refs/remotes/origin/<b>`) rather than
+  trusting the config.
 * **`loom check` stamps the tip it reviewed, and `loom land` refuses any other.**
   A commit added after the reviewer read the patch does not ride the review
   into the merge — re-run `loom check`. Landing also refuses a worktree with

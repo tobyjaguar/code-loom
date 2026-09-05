@@ -32,9 +32,9 @@ new t5` fenced the new task with the agent's `zones.toml` (an emptied one means
 no fence at all) and `.`-sourced the agent's `.agents/loom.env` as shell, in
 your environment.
 
-**What closes it.** `bin/loom:117` (`ROOT="$(cd "$(dirname "$_common")" …)"`,
-from `git rev-parse --git-common-dir` at `bin/loom:113`) and `bin/loom:133`
-(`AGENTS_DIR="$ROOT/.agents"`); the guard's own reads are `bin/loom:1536`
+**What closes it.** `bin/loom:118` (`ROOT="$(cd "$(dirname "$_common")" …)"`,
+from `git rev-parse --git-common-dir` at `bin/loom:114`) and `bin/loom:134`
+(`AGENTS_DIR="$ROOT/.agents"`); the guard's own reads are `bin/loom:1720`
 onward. `$ROOT` is now the **main checkout** for every command:
 `git rev-parse --git-common-dir` answers `.git` from the main checkout and the
 absolute path of the main `.git` from a linked worktree, so its parent is the
@@ -45,7 +45,7 @@ profiles), `loom.env`, `.opencode/`, and `.agents/gate.sh`.
 One thing still comes from the invoking tree, and only one: **`loom guard`'s
 subject.** The commit is happening in that worktree, so the branch, the staged
 file list and the tree the reconciler inspects are read from `$INVOKED_ROOT`
-(`bin/loom:109`)
+(`bin/loom:110`)
 while the zones they are judged by come from `$ROOT`. `loom` says so in one line
 whenever the two differ. `tests/fence-profiles.sh` (av) asserts both halves:
 `loom new` from inside a worktree with an emptied `zones.toml` still applies the
@@ -67,7 +67,7 @@ own. That is not worth plugging: the entire hook is dominated by `git commit
 
 ## 2. `loom plan` runs the architect unfenced, in your own tree
 
-**Where.** `bin/loom:2593`, in `cmd_plan` (`bin/loom:2574`):
+**Where.** `bin/loom:2839`, in `cmd_plan` (`bin/loom:2820`):
 `run_role architect "$ROOT" "$prompt"` (and the
 interactive leg, `claude --append-system-prompt … "$prompt"`, likewise in
 `$ROOT`). The architect's chain at every tier ends in cheap third-party
@@ -89,7 +89,7 @@ say so out loud.
 
 ## 3. `.agents/loom.env` is sourced as shell
 
-**Where.** `bin/loom:168`:
+**Where.** `bin/loom:169`:
 
 ```sh
 if [ -f "$ROOT/.agents/loom.env" ]; then set -a; . "$ROOT/.agents/loom.env"; set +a; fi
@@ -132,13 +132,36 @@ variable no longer exists. The base every history check uses is the **operator
 record** (`${XDG_CONFIG_HOME:-$HOME/.config}/loom/repos/<key>/tasks/<task>`),
 written by `loom new`, which no file in the repository takes part in.
 
-**This gap is the residual the operator record concedes.** That directory is in
-`$HOME`, and the capability this gap describes — an agent that can write files
-in your checkout, and a file in your checkout that runs as shell in your
-environment — reaches `$HOME` too. The state directory is therefore **operator
-integrity, not tamper-proofing**: it removes the class of "one `git config` or
-`git update-ref` inside the worktree rewrites the input to its own security
-check", which was a much cheaper attack than this one. It does not claim more.
+**A third set is cleared rather than restored**: git's own environment —
+`GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`,
+`GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_NAMESPACE`,
+`GIT_CEILING_DIRECTORIES` — unset once both env files have been sourced. This
+file is `.`-sourced under `set -a`, so one `GIT_DIR=` line in a landed
+`loom.env` re-aimed every git subprocess `loom` runs: measured, the recorded
+base became a decoy repository's `HEAD` and the worktree was cut from the
+decoy. No caller wins this one either; `loom` has already `cd`'d to `$ROOT`.
+
+**What the record now carries, and what that is worth.** It is not just the
+base any more. `base` is the commit every fence and hand history check is
+measured from; `reviewed` is the tip `loom check` last handed to a reviewer,
+and `loom land` refuses to publish any other; `origin` and `fetch` are the
+remote URL and refspec the task was created against, and `loom rebase` /
+`loom land --pr` refuse a changed one before they contact a remote at all. The
+file is validated on both sides — one field per line, each field once, every
+key in a fixed list, no control character in any value — because `origin` and
+`fetch` arrive from `.git/config`, where a newline inside a value would append
+a second field to it.
+
+**This gap is the residual all of that concedes.** The directory is in `$HOME`,
+and the capability this gap describes — an agent that can write files in your
+checkout, and a file in your checkout that runs as shell in your environment —
+reaches `$HOME` too. The record is therefore **operator integrity, not
+tamper-proofing**: it removes the class of "one `git config` or `git
+update-ref` inside the worktree rewrites the input to its own security check",
+which was a much cheaper attack than this one, and it now removes "a git config
+VALUE writes a field of that record" as well. It does not claim more. An agent
+that reaches `$HOME` can write the record, and then `reviewed` says whatever it
+likes.
 
 The carve-out does not fix the gap either. Anything else in that file still
 runs as shell, in your environment.
@@ -156,7 +179,7 @@ that one form or the README changes with it.
 used to read "granted for the whole worktree root". It is not that any more;
 what is left is a confirmation.
 
-**Where.** `bin/loom:615`, in `run_headless` (`bin/loom:528`), the opencode leg:
+**Where.** `bin/loom:792`, in `run_headless` (`bin/loom:705`), the opencode leg:
 
 ```sh
 perm="$(printf '{"external_directory":{"%s/*":"allow","%s/**":"allow"}}' "$wd" "$wd")"
@@ -226,7 +249,7 @@ OPENCODE_CONFIG=$ROOT/.opencode/opencode.json     # (and OPENCODE_CONFIG_DIR)
 OPENCODE_DISABLE_PROJECT_CONFIG=1
 ```
 
-`run_headless`'s opencode leg (`bin/loom:646`) sets the **disable
+`run_headless`'s opencode leg (`bin/loom:823`) sets the **disable
 unconditionally**, on every opencode invocation — implementer, reviewer, scout
 and architect alike — and names the operator's config only when one exists.
 That is a round-4 correction: the disable used to be conditional on

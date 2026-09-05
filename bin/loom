@@ -1317,8 +1317,9 @@ zones_py_full() { ( unset LOOM_FENCE_PROFILE; zones_py "$@" ); }
 # Two rules keep it honest, and they are the whole design:
 #
 #   1. The opt-in is a FRESH OPERATOR ACT on every command. `--fence-profile
-#      <name>` must be passed to `loom new`, `run`, `check`, `loop`, `rebase` and
-#      `land` alike. The operator record (the state file outside every repo)
+#      <name>` must be passed to `loom new`, `run`, `check`, `loop`, `diff`,
+#      `rebase` and `land` alike — `diff` included, because it writes the same
+#      review patch `check` does. The operator record (the state file outside every repo)
 #      keeps the name `loom new` was given, but ONLY as a consistency record: it
 #      may refuse a command, never authorise one. A `Fence-profile:` line in
 #      the task file is documentation of intent; the flag is the consent.
@@ -1967,8 +1968,8 @@ or start clean:  loom drop $task"
 
 # --- where a task's fence profile comes from -------------------------------
 # From the operator, on the command line, every single time. `--fence-profile
-# <name>` is required by `loom new`, `run`, `check`, `loop`, `rebase` and `land`
-# alike. The `profile` field of the operator record is written at `loom new` and
+# <name>` is required by `loom new`, `run`, `check`, `loop`, `diff`, `rebase` and
+# `land` alike (`diff` writes the same review patch `check` does). The `profile` field of the operator record is written at `loom new` and
 # is a CONSISTENCY RECORD, not an authorisation: it can refuse a command (the
 # flag is missing, or names a different profile) but it can never supply one.
 # `branch.agent/<task>.fenceprofile` is neither read nor written any more — it
