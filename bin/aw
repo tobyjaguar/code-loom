@@ -66,9 +66,7 @@ AGENTS_DIR="$ROOT/.agents"
 PROMPTS_DIR="$ROOT/.opencode/prompts"
 # The two worktree roots are derived and VERIFIED further down, after
 # .agents/loom.env has been sourced (it may set LOOM_WORKTREES) and after die()
-# exists. Anything preset in the environment for WT_ROOT_PROFILED is captured
-# here, before a single path is derived from it.
-WT_ROOT_PRESET="${WT_ROOT_PROFILED:-}"
+# exists.
 TIER="${LOOM_TIER:-standard}"
 MAX_ATTEMPTS="${LOOM_MAX_ATTEMPTS:-3}"
 SKIP="${LOOM_SKIP:-}"
@@ -146,6 +144,10 @@ not re-run."
   printf '%s\n' "$real"
 }
 
+# Captured AFTER both env files have been sourced, because .agents/loom.env is
+# exactly the place a preset would come from: it is a file in the tree an agent
+# writes, and it is `.`-sourced (KNOWN-GAPS 3).
+WT_ROOT_PRESET="${WT_ROOT_PROFILED:-}"
 WT_ROOT="${LOOM_WORKTREES:-$(dirname "$ROOT")/.loom-worktrees/$(basename "$ROOT")}"
 case "$WT_ROOT" in /*) ;; *) die "LOOM_WORKTREES must be an absolute path (got '$WT_ROOT')" ;; esac
 while :; do

@@ -63,8 +63,15 @@ STUB
 cat > "$TMP/stubs/opencode" << 'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$@" >> "${AW_TEST_TMP:?}/called-opencode.log"
-# The directory grant is the thing under test: record it verbatim.
+# The directory grant and the CONFIG are the things under test: record both
+# verbatim. opencode resolves its project config from the cwd, which is a
+# worktree the agent can write, so which config it was handed is a security
+# fact, not a detail.
 printf 'OPENCODE_PERMISSION=%s\n' "${OPENCODE_PERMISSION:-(unset)}" \
+  >> "${AW_TEST_TMP:?}/called-opencode.log"
+printf 'OPENCODE_CONFIG=%s\n' "${OPENCODE_CONFIG:-(unset)}" \
+  >> "${AW_TEST_TMP:?}/called-opencode.log"
+printf 'OPENCODE_DISABLE_PROJECT_CONFIG=%s\n' "${OPENCODE_DISABLE_PROJECT_CONFIG:-(unset)}" \
   >> "${AW_TEST_TMP:?}/called-opencode.log"
 echo "stub opencode done"
 STUB
@@ -118,6 +125,22 @@ echo "open finding: none"  > docs/audits/a.md
 printf '#!/usr/bin/env bash\nexit 0\n' > .agents/gate.sh
 chmod +x .agents/gate.sh
 for p in implementer reviewer scout architect; do echo "stub $p prompt" > ".opencode/prompts/$p.md"; done
+# The operator's opencode config. Its existence is load-bearing: `aw` points
+# every opencode run at THIS file and turns the project's own config off, so
+# that a worktree copy an agent rewrote cannot repoint a provider's baseURL or
+# swap a role prompt. No `model`/`provider` keys — `aw doctor` reads model IDs
+# out of this file and there is nothing here to verify.
+cat > .opencode/opencode.json << 'JSON'
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "implementer": {"description": "stub", "prompt": "{file:./prompts/implementer.md}"},
+    "reviewer":    {"description": "stub", "prompt": "{file:./prompts/reviewer.md}"},
+    "scout":       {"description": "stub", "prompt": "{file:./prompts/scout.md}"},
+    "architect":   {"description": "stub", "prompt": "{file:./prompts/architect.md}"}
+  }
+}
+JSON
 
 cat > .agents/zones.toml << 'TOML'
 [fence]
@@ -148,7 +171,8 @@ mk_task() { # mk_task <id> [<profile-line>]
     [ -n "${2:-}" ] && echo "Fence-profile: $2"; } > ".agents/tasks/$1.md"
 }
 for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p \
-         0014-u 0016-v 0017-w 0018-x 0019-y 0020-y2 0023-ae; do mk_task "$t"; done
+         0014-u 0016-v 0017-w 0018-x 0019-y 0020-y2 0023-ae \
+         0024-ad 0025-ae2 0026-af 0027-ag 0028-ah 0029-ai 0030-aj; do mk_task "$t"; done
 mk_task 0005-f codex
 mk_task 0011-n codex
 # (o) a Fence-profile line that is NOT a declaration: it is inside a code fence,
@@ -558,6 +582,16 @@ oc="$(cat "$TMP/called-opencode.log" 2>/dev/null || true)"
 want_in     "(w) the grant is the role's OWN worktree"    "$oc" "$WTU/0017-w/**"
 want_not_in "(w) ... not the whole worktree root"         "$oc" "\"$WTU/*\":\"allow\""
 want_not_in "(w) ... and never the profiled root"         "$oc" "$WTP"
+# (ak) opencode resolves its project config from the cwd — <worktree>/.opencode/
+# opencode.json, which the agent in that worktree can rewrite, and which carries
+# provider.<name>.options.baseURL (the provider identity a profile is built on)
+# and the role prompts. It must be handed the OPERATOR's copy, and told not to
+# read the project's own: OPENCODE_CONFIG alone is merged BEFORE the project
+# files, so the worktree's copy would still win key by key.
+want_in "(ak) opencode is pointed at the operator's config" \
+        "$oc" "OPENCODE_CONFIG=$REPO/.opencode/opencode.json"
+want_in "(ak) ... and the worktree's own config is off"    \
+        "$oc" "OPENCODE_DISABLE_PROJECT_CONFIG=1"
 # A trailing slash in $LOOM_WORKTREES must not turn the profiled root into a
 # CHILD of the unprofiled one ("/x/wt/" + "-profiled" = "/x/wt/-profiled").
 out="$(LOOM_WORKTREES="$TMP/wt3/" LOOM_MODELS_implementer="claude-sub" \
@@ -695,6 +729,157 @@ want_eq "(ac) a near-miss key does not opt a task in"     "$rc" "0"
 want_in "(ac) ... but aw new says it was not honoured"    "$out" "not honoured"
 want_in "(ac) ... quoting the line it found"              "$out" "Fence-profile : codex"
 want_absent "(ac) ... and it released nothing"            "$WTU/0022-ad/core/lib.rs"
+
+
+# ==========================================================================
+# ROUND-3 fixes. Every case below FAILS against the pre-fix bin/aw (69a297a).
+# ==========================================================================
+
+# --- (ad) the diff base is not the agent's to choose ----------------------
+# branch.<br>.loombase lives in the SHARED .git/config, so anything running in
+# the worktree can rewrite it. Set to the branch's own HEAD it made `git diff
+# <base> HEAD` empty, and every history check then answered "this branch
+# touches nothing" — `aw land` merged a fenced commit, `aw check` handed the
+# patch to a reviewer. The base is now merge-base($LOOM_BASE_REF, <branch>),
+# computed in YOUR checkout from refs you control.
+taint() { # taint <task> <worktree>   materialise a fenced path, commit, re-fence
+  git -C "$2" sparse-checkout disable
+  echo "// smuggled by $1" >> "$2/core/lib.rs"
+  git -C "$2" add core/lib.rs
+  git -C "$2" commit -qm "touch a fenced path"
+  git -C "$2" sparse-checkout init --no-cone
+  git -C "$2" sparse-checkout set '/*' '!core/**' '!ios/**' '!docs/audits/**'
+}
+out="$("$AW" new 0024-ad 2>&1)"; rc=$?
+want_eq "(ad) setup: an unprofiled worktree"              "$rc" "0"
+ADW="$WTU/0024-ad"
+taint 0024-ad "$ADW"
+git config "branch.agent/0024-ad.loombase" "$(git -C "$ADW" rev-parse HEAD)"   # the agent
+rm -f "$ADW/.agents/reviews/0024-ad.patch"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0024-ad 2>&1)"; rc=$?
+want_eq "(ad) a loombase at HEAD does not empty the check" "$rc" "1"
+want_in "(ad) ... the fenced path is still named"         "$out" "core/lib.rs"
+want_absent "(ad) ... and NO patch was written"           "$ADW/.agents/reviews/0024-ad.patch"
+want_not_in "(ad) ... and no reviewer was launched"       "$out" "running on"
+out="$(EDITOR=true "$AW" diff 0024-ad 2>&1)"; rc=$?
+want_eq "(ad) aw diff dies on it too"                     "$rc" "1"
+want_in "(ad) ... for the same reason"                    "$out" "commits touch fenced paths"
+head_before="$(git rev-parse HEAD)"
+out="$("$AW" land 0024-ad 2>&1)"; rc=$?
+want_eq "(ad) aw land refuses the branch"                 "$rc" "1"
+want_in "(ad) ... naming the fenced path"                 "$out" "core/lib.rs"
+want_eq "(ad) ... and nothing was merged"                 "$(git rev-parse HEAD)" "$head_before"
+
+# --- (ae2) a loombase that does not resolve is a refusal, not an empty diff -
+# It used to be the cheapest attack in the file: `git config
+# branch.<br>.loombase 0000…` and history_paths returned 0 with no paths at
+# all, which reads downstream as "nothing fenced in this history".
+out="$("$AW" new 0025-ae2 2>&1)"; rc=$?
+want_eq "(ae) setup: an unprofiled worktree"              "$rc" "0"
+AEW="$WTU/0025-ae2"
+taint 0025-ae2 "$AEW"
+git config "branch.agent/0025-ae2.loombase" "0000000000000000000000000000000000000000"
+rm -f "$AEW/.agents/reviews/0025-ae2.patch"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0025-ae2 2>&1)"; rc=$?
+want_eq "(ae) an unresolvable loombase still dies"        "$rc" "1"
+want_in "(ae) ... naming the fenced path, not a git error" "$out" "core/lib.rs"
+want_absent "(ae) ... and NO patch was written"           "$AEW/.agents/reviews/0025-ae2.patch"
+want_not_in "(ae) ... and no reviewer was launched"       "$out" "running on"
+
+# --- (af) a loombase moved FORWARD shrinks the review diff ----------------
+# The security base decides what the fence check sees; the loombase is kept
+# only because it is the nicer diff to READ. So it is clamped: ahead of the
+# security base it would hide commits from the reviewer, and the review diff
+# falls back to the security base, loudly.
+out="$("$AW" new 0026-af 2>&1)"; rc=$?
+want_eq "(af) setup: an unprofiled worktree"              "$rc" "0"
+AFW="$WTU/0026-af"
+echo "hidden" > "$AFW/backend/af-hidden.txt"
+git -C "$AFW" add backend/af-hidden.txt
+git -C "$AFW" commit -qm "a commit the agent would rather the reviewer did not see"
+af_hide="$(git -C "$AFW" rev-parse HEAD)"
+echo "visible" > "$AFW/backend/af-visible.txt"
+git -C "$AFW" add backend/af-visible.txt
+git -C "$AFW" commit -qm "the commit it wants reviewed"
+git config "branch.agent/0026-af.loombase" "$af_hide"          # the agent
+out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0026-af 2>&1)"; rc=$?
+want_eq "(af) the check still succeeds"                   "$rc" "0"
+want_in "(af) ... but warns that the loombase is ahead"   "$out" "ahead of the"
+patch_af="$(cat "$AFW/.agents/reviews/0026-af.patch" 2>/dev/null || true)"
+want_in "(af) the review diff shows the hidden commit"    "$patch_af" "af-hidden.txt"
+want_in "(af) ... and the one it wanted reviewed"         "$patch_af" "af-visible.txt"
+
+# --- (ag) a symlink standing where the profiled root should be ------------
+# "$WT_ROOT-profiled" is a sibling of the unprofiled root BY NAME. An agent
+# that plants a symlink there points every released path back INSIDE the
+# directory unprofiled runs are given.
+mkdir -p "$TMP/wt-ag/T5"
+ln -s "$TMP/wt-ag/T5" "$TMP/wt-ag-profiled"
+out="$(LOOM_WORKTREES="$TMP/wt-ag" LOOM_MODELS_implementer="claude-sub" \
+       LOOM_MODELS_reviewer="codex-sub" "$AW" new 0027-ag --fence-profile codex 2>&1)"; rc=$?
+want_eq "(ag) a symlinked worktree root is refused"       "$rc" "1"
+want_in "(ag) ... naming what it really resolves to"      "$out" "$TMP/wt-ag/T5"
+want_absent "(ag) ... and nothing was created under it"   "$TMP/wt-ag/T5/0027-ag"
+want_eq "(ag) ... and no branch was created"              "$(sha_of agent/0027-ag)" "GONE"
+rm -f "$TMP/wt-ag-profiled"
+
+# --- (ah) LOOM_WORKTREES=/x/wt/. must not produce /x/wt/.-profiled --------
+out="$(LOOM_WORKTREES="$TMP/wt5/." LOOM_MODELS_implementer="claude-sub" \
+       LOOM_MODELS_reviewer="codex-sub" "$AW" new 0028-ah --fence-profile codex 2>&1)"; rc=$?
+want_eq   "(ah) a trailing '/.' is normalised away"       "$rc" "0"
+want_file "(ah) ... so the profiled root is a sibling"    "$TMP/wt5-profiled/0028-ah/core/lib.rs"
+want_absent "(ah) ... never a child of the unprofiled root" "$TMP/wt5/.-profiled"
+want_absent "(ah) ... under any spelling of it"           "$TMP/wt5/-profiled"
+out="$(LOOM_WORKTREES="$TMP/wt5/." "$AW" drop 0028-ah 2>&1)"; rc=$?
+want_eq   "(ah) ... and aw drop finds it there"           "$rc" "0"
+
+# --- (ai) .agents/loom.env is in the tree the agent writes ----------------
+# It is sourced as shell (KNOWN-GAPS 3), so it cannot be trusted with either
+# of the two things that decide what a check looks at: where released content
+# lands, and which commit a history is measured from.
+printf 'WT_ROOT_PROFILED=%s\n' "$TMP/wt6/nested" > .agents/loom.env
+out="$(LOOM_WORKTREES="$TMP/wt6" LOOM_MODELS_implementer="claude-sub" \
+       LOOM_MODELS_reviewer="codex-sub" "$AW" new 0029-ai --fence-profile codex 2>&1)"; rc=$?
+rm -f .agents/loom.env
+want_eq "(ai) loom.env cannot redirect the profiled root" "$rc" "1"
+want_in "(ai) ... because that root is DERIVED"           "$out" "DERIVED"
+want_absent "(ai) ... and nothing landed under the unprofiled root" "$TMP/wt6/nested"
+want_eq "(ai) ... and no branch was created"              "$(sha_of agent/0029-ai)" "GONE"
+# ... and the same for the base every history check is measured from: pointed
+# at the tainted branch's own tip, the merge-base would be that tip.
+printf 'LOOM_BASE_REF=%s\n' "$(git -C "$WTU/0016-v" rev-parse HEAD)" > .agents/loom.env
+out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0016-v 2>&1)"; rc=$?
+rm -f .agents/loom.env
+want_eq "(ai) loom.env cannot move the security base"     "$rc" "1"
+want_in "(ai) ... it says the setting was ignored"        "$out" "LOOM_BASE_REF"
+want_in "(ai) ... and the fenced path is still caught"    "$out" "core/lib.rs"
+# An operator-side base ref that does not resolve is a refusal, never an empty
+# answer: not knowing the base is not the same as knowing there is nothing.
+out="$(LOOM_BASE_REF="refs/heads/no-such-trunk" LOOM_MODELS_reviewer="codex-sub" \
+       "$AW" check 0003-c --fence-profile codex 2>&1)"; rc=$?
+want_eq "(ai) an unresolvable base ref dies"              "$rc" "1"
+want_in "(ai) ... naming it"                              "$out" "no-such-trunk"
+
+# --- (aj) an UNTRACKED file under a fenced path --------------------------
+# `git ls-files` answers the index, and `git show HEAD:core/lib.rs >
+# core/copy.rs` never touches it. The reconciler asks the disk now.
+out="$("$AW" new 0030-aj 2>&1)"; rc=$?
+want_eq "(aj) setup: an unprofiled worktree"              "$rc" "0"
+AJW="$WTU/0030-aj"
+want_absent "(aj) setup: core/ is fenced out of it"       "$AJW/core"
+mkdir -p "$AJW/core"
+git -C "$AJW" show HEAD:core/lib.rs > "$AJW/core/copy.rs"   # untracked, fenced path
+claude_before="$(wc -l < "$TMP/called-claude.log" 2>/dev/null || echo 0)"
+out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 "$AW" run 0030-aj 2>&1)"; rc=$?
+want_eq "(aj) an untracked file under a fenced path stops the run" "$rc" "1"
+# Asserted as the RECONCILE's refusal, not just as the path appearing: without
+# the walk the run got as far as `git add -A`, which fails on a path outside
+# the sparse-checkout definition and prints the same name for another reason.
+want_in "(aj) ... as a fenced path that is present"       "$out" "fenced paths are present in"
+want_in "(aj) ... naming it"                              "$out" "core/copy.rs"
+want_eq "(aj) ... before the model was launched"          \
+        "$(wc -l < "$TMP/called-claude.log" 2>/dev/null || echo 0)" "$claude_before"
+rm -rf "$AJW/core"
 
 # --- (j)/(t) doctor lists the profiles, and touches no network ------------
 out="$(timeout 180 "$AW" doctor 2>&1 || true)"
