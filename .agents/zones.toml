@@ -17,10 +17,28 @@
 # structural code, not numerical correctness. Edit honestly for your repo.
 
 [hand]
-reason = "Rust learning surface + DSP numerical correctness. Type system does not cover these."
+reason = "Rust learning surface + DSP numerical correctness. Type system does not cover these. Plus the control plane, which is what judges everything else."
 paths = [
   "crates/audat-dsp/src/**",
   "crates/audat-core/src/restore/**",
+
+  # The control plane. An agent may PROPOSE a change to any of these — that is
+  # what the hand zone means — and may never commit one, because each of them
+  # is an input to the checks that judge the agent's own work:
+  #
+  #   gate.sh    decides "green, commit it" and "green, land it". `aw` runs the
+  #              MAIN checkout's copy for both, but a worktree copy that landed
+  #              would become that copy on the next task.
+  #   zones.toml is this file: the zones, the fence, and the profiles. An agent
+  #              that could commit it could widen its own zone.
+  #   loom.env   is `.`-sourced as shell, in your environment, on every `aw`
+  #              invocation (docs/KNOWN-GAPS.md § 3).
+  #
+  # Keep them here even if you fence nothing: the fence is optional, the guard
+  # is not.
+  ".agents/gate.sh",
+  ".agents/zones.toml",
+  ".agents/loom.env",
 ]
 
 [assist]

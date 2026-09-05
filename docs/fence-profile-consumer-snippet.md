@@ -86,6 +86,35 @@ providers = ["claude", "codex"]
 scope v1 and cannot be gated locally at all, and `spike/**` is unreviewed
 exploratory code including live-key harnesses.
 
+## 1b. `.agents/zones.toml` — three paths that belong in `[hand]`
+
+Check that `[hand].paths` in the consuming repo lists the control plane itself,
+and add what is missing:
+
+```toml
+  ".agents/gate.sh",
+  ".agents/zones.toml",
+  ".agents/loom.env",
+```
+
+An agent may **propose** a change to any of the three — that is what the hand
+zone means — and may never commit one, because each is an input to the checks
+that judge the agent's own work:
+
+* `.agents/gate.sh` decides "green, commit it" (`aw run`) and "green, land it"
+  (`aw land`). `aw` runs the **main checkout's** copy for both, with the
+  worktree as its cwd, precisely because the worktree's copy is a file the
+  implementer edits — but a worktree copy that *landed* would become the main
+  checkout's copy for the next task.
+* `.agents/zones.toml` is the zones, the fence and the profiles. An agent able
+  to commit it could widen its own zone, and the pre-commit guard is a seatbelt
+  (`--no-verify`), not a lock.
+* `.agents/loom.env` is `.`-sourced as shell, in your environment, on every
+  `aw` invocation (`docs/KNOWN-GAPS.md` § 3).
+
+`aw land` checks the branch's commits against `[hand]` regardless of what the
+guard did, so this is the entry that actually holds.
+
 ## 2. The chains for a profiled task — per command, not in `loom.env`
 
 The default implementer chain is GLM/DeepSeek/Kimi and the default reviewer
@@ -203,13 +232,25 @@ or up to date. Two consequences worth knowing before you rely on it:
   are both writable from inside a linked worktree (`git config
   branch.<br>.loombase <tip>`, `git update-ref refs/remotes/origin/main <tip>`),
   and either one emptied every check. So is the worktree's `HEAD`: the history
-  endpoint is `refs/heads/agent/<task>`, read in your checkout, and a worktree
-  that is not on its own branch is refused.
+  endpoint is the branch ref `refs/heads/agent/<task>`, resolved to a SHA once
+  per command and used as that sha for the checks, the review patch, the merge
+  and the push; a worktree that is not on its own branch is refused.
+* **`aw rebase` will not bury upstream commits under your base.** Moving the
+  base makes everything between the old one and the new one upstream, i.e.
+  invisible to every later check. If those commits touch a fenced or `[hand]`
+  path, `aw rebase` refuses and prints them; `--accept-upstream` is the
+  operator's "I have read those and I accept them under the base".
+* **`aw check` stamps the tip it reviewed, and `aw land` refuses any other.**
+  A commit added after the reviewer read the patch does not ride the review
+  into the merge — re-run `aw check`. Landing also refuses a worktree with
+  uncommitted changes (`.agents/reviews/` excepted, which is where `aw` writes
+  the patch itself — gitignore that directory).
 
 ```sh
 # the record for a task, if you ever want to read one:
 cat "${XDG_CONFIG_HOME:-$HOME/.config}/loom/repos/"*"/tasks/<some-task>"
 #   base=<commit>  profile=<name>  branch=agent/<task>  created=<iso>
+#   origin=<remote.origin.url at aw new>  reviewed=<tip aw check last reviewed>
 ```
 
 Then read [`docs/KNOWN-GAPS.md`](KNOWN-GAPS.md) in the harness repo, in full:
