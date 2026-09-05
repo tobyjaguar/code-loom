@@ -63,6 +63,19 @@ cd "$ROOT"
 AGENTS_DIR="$ROOT/.agents"
 PROMPTS_DIR="$ROOT/.opencode/prompts"
 WT_ROOT="${LOOM_WORKTREES:-$(dirname "$ROOT")/.loom-worktrees/$(basename "$ROOT")}"
+# Trailing slashes are stripped before anything is derived from this. With
+# LOOM_WORKTREES=/x/wt/ the profiled root below would otherwise be
+# "/x/wt/-profiled" — a CHILD of the unprofiled root, which is the one thing it
+# must never be.
+while :; do
+  case "$WT_ROOT" in
+    /|"") break ;;
+    */)   WT_ROOT="${WT_ROOT%/}" ;;
+    *)    break ;;
+  esac
+done
+# (die() is defined further down; this runs before it exists.)
+[ -n "$WT_ROOT" ] || { echo "aw: LOOM_WORKTREES is empty" >&2; exit 1; }
 # A task under a fence profile holds paths the fence normally removes, so its
 # worktree lives under a SEPARATE root. Nothing that runs unprofiled — no
 # unprofiled role, and not the shared `_scout` mirror, which stays under

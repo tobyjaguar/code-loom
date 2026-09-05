@@ -144,7 +144,7 @@ mk_task() { # mk_task <id> [<profile-line>]
     [ -n "${2:-}" ] && echo "Fence-profile: $2"; } > ".agents/tasks/$1.md"
 }
 for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p \
-         0014-u 0016-v 0017-w 0018-x 0019-y 0020-y2; do mk_task "$t"; done
+         0014-u 0016-v 0017-w 0018-x 0019-y 0020-y2 0023-ae; do mk_task "$t"; done
 mk_task 0005-f codex
 mk_task 0011-n codex
 # (o) a Fence-profile line that is NOT a declaration: it is inside a code fence,
@@ -554,6 +554,17 @@ oc="$(cat "$TMP/called-opencode.log" 2>/dev/null || true)"
 want_in     "(w) the grant is the role's OWN worktree"    "$oc" "$WTU/0017-w/**"
 want_not_in "(w) ... not the whole worktree root"         "$oc" "\"$WTU/*\":\"allow\""
 want_not_in "(w) ... and never the profiled root"         "$oc" "$WTP"
+# A trailing slash in $LOOM_WORKTREES must not turn the profiled root into a
+# CHILD of the unprofiled one ("/x/wt/" + "-profiled" = "/x/wt/-profiled").
+out="$(LOOM_WORKTREES="$TMP/wt3/" LOOM_MODELS_implementer="claude-sub" \
+       LOOM_MODELS_reviewer="codex-sub" "$AW" new 0023-ae --fence-profile codex 2>&1)"; rc=$?
+want_eq   "(w) a trailing slash in LOOM_WORKTREES is stripped"  "$rc" "0"
+want_file "(w) ... so the profiled root is a sibling"           "$TMP/wt3-profiled/0023-ae/core/lib.rs"
+want_absent "(w) ... and never a child of the unprofiled root"  "$TMP/wt3/-profiled"
+out="$(LOOM_WORKTREES="$TMP/wt3/" "$AW" drop 0023-ae 2>&1)"; rc=$?
+want_eq   "(w) ... and aw drop finds it there"                  "$rc" "0"
+want_absent "(w) ... and removed it"                            "$TMP/wt3-profiled/0023-ae"
+
 rm -f "$TMP/called-opencode.log"
 out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
        "$AW" scout "where is main" 2>&1)"; rc=$?
