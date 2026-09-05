@@ -341,11 +341,13 @@ zones_py() { # zones_py <mode> [arg]
   #   parse | zone <path> | fenced <path> | fence-paths
   #   fence-orphans | fence-shape | fence-present <worktree>
   #   fence-present-full <worktree>
+  #   history-fence <path>... | history-hand <path>...
   #   profiles | profile-release | profile-providers | profile-released <path>
   #   profile-tracked <worktree>
   # The fence modes answer with the EFFECTIVE fence: [fence] minus the
   # release list of $AW_FENCE_PROFILE, when one is set. `fence-present-full`
   # is the exception, and the one the reconciler uses: the FULL fence, always.
+  # `history-*` take a list of paths (a branch's diff) instead of a worktree.
   python3 - "$AGENTS_DIR/zones.toml" "$@" << 'PY'
 import sys, os, re, fnmatch, subprocess
 
@@ -531,6 +533,26 @@ elif mode == "fence-present-full":
     wt = args[0]
     for p in tracked_in(wt):
         if any(hit(p, g) for g in fence) and os.path.exists(os.path.join(wt, p)):
+            print(p)
+elif mode in ("history-fence", "history-hand"):
+    # The paths a BRANCH's commits touch, judged without looking at the tree.
+    # A worktree can be re-fenced after the fact — `git sparse-checkout set`
+    # costs one command — but the commits stay, and every `git diff`, patch
+    # file and merge carries their content onward. Both answers are computed
+    # against the FULL [fence] / the real [hand], minus what the ASSERTED
+    # profile releases; with no profile asserted nothing is released.
+    fence_sanity()
+    _seen = set()
+    for p in args:
+        if p in _seen:
+            continue
+        _seen.add(p)
+        if any(hit(p, g) for g in released):
+            continue
+        if mode == "history-fence":
+            if any(hit(p, g) for g in fence):
+                print(p)
+        elif zone_of(p) == "hand":
             print(p)
 elif mode == "profiles":       # doctor listing: name \t providers \t release
     for name in sorted(profiles):
@@ -838,6 +860,80 @@ created under), or start clean:  aw drop <task-id>"
     echo "aw: WARNING: running at it. Pass --fence-profile $rprof if that was not what you meant." >&2
   fi
   fence_enforce "$wt"
+}
+
+# ------------------------------------------------- reconcile, over HISTORY
+# fence_reconcile answers "what is in this worktree NOW". That is not the whole
+# question, because a worktree can be re-fenced after the fact: an agent (or an
+# `aw` run) can materialise core/**, commit it, and put the sparse rules back,
+# and the tree then looks clean while every `git diff`, every
+# .agents/reviews/<task>.patch and every merge still carries the content. So
+# the branch's COMMITS are judged too, wherever history is handed to a role or
+# to the operator: aw check (before the patch is written), aw loop (each
+# round), aw diff, aw land (before merge and before push) and aw rebase.
+#
+# Base is the branch's loombase, the same commit the reviewer's diff uses.
+HIST_PATHS=()
+history_paths() { # history_paths <dir> <base> <rev>  -> fills $HIST_PATHS
+  local d="$1" base="$2" rev="${3:-HEAD}" p
+  HIST_PATHS=()
+  [ -n "$base" ] || return 0
+  git -C "$d" rev-parse --verify --quiet "$base^{commit}" >/dev/null 2>&1 || return 0
+  git -C "$d" rev-parse --verify --quiet "$rev^{commit}"  >/dev/null 2>&1 || return 0
+  # -z: a path with a space or a quote in it must not turn into two paths.
+  # --no-renames: a rename must be judged on BOTH sides, and with rename
+  # detection off git reports it as a delete plus an add, which is exactly
+  # that. The --diff-filter=A pass adds nothing new after --no-renames; it is
+  # there so the answer does not depend on that equivalence holding.
+  while IFS= read -r -d '' p; do
+    [ -n "$p" ] && HIST_PATHS+=("$p")
+  done < <( { git -C "$d" diff -z --no-renames --name-only "$base" "$rev"
+              git -C "$d" diff -z --no-renames --name-only --diff-filter=A "$base" "$rev"
+            } 2>/dev/null )
+  return 0
+}
+
+# Fenced paths in the branch's commits that the asserted profile does not
+# release. With nothing asserted, "released" is empty: any fenced path in the
+# history is a violation.
+fence_reconcile_history() { # fence_reconcile_history <wt> <base> <asserted>
+  local wt="$1" base="$2" asserted="${3:-}" bad
+  [ -d "$wt" ] || return 0
+  if [ -n "$asserted" ] && [ "$FENCE_PROFILE" != "$asserted" ]; then
+    fence_profile_activate "$asserted"
+  fi
+  history_paths "$wt" "$base" HEAD
+  [ "${#HIST_PATHS[@]}" -gt 0 ] || return 0
+  bad="$(zones_py history-fence "${HIST_PATHS[@]}")" \
+    || die "cannot tell which paths this branch's commits touch — refusing to guess"
+  [ -n "$bad" ] || return 0
+  die "this branch's commits touch fenced paths:
+$(printf '%s\n' "$bad" | sed 's/^/  /')
+The worktree may no longer show them, but the history does, and the diff, the
+review patch and any merge carry their content onward.
+If this task was created under a fence profile that releases these paths, name
+it: --fence-profile <name>. Otherwise the branch is tainted — throw it away:
+  aw drop <task-id>"
+}
+
+# [hand] paths in the branch's commits that the asserted profile does not
+# release. The pre-commit guard is supposed to stop these, but it runs in the
+# agent's own context where `git commit --no-verify` exists, so `aw land`
+# checks the commits it is about to publish rather than trusting that it did.
+hand_reconcile_history() { # hand_reconcile_history <dir> <base> <rev>
+  local d="$1" base="$2" rev="$3" bad note=""
+  history_paths "$d" "$base" "$rev"
+  [ "${#HIST_PATHS[@]}" -gt 0 ] || return 0
+  bad="$(zones_py history-hand "${HIST_PATHS[@]}")" \
+    || die "cannot tell which zones this branch's commits touch — refusing to guess"
+  [ -n "$bad" ] || return 0
+  [ -n "$FENCE_PROFILE" ] && note="Fence profile '$FENCE_PROFILE' releases only: $FENCE_RELEASED
+"
+  die "this branch's commits touch hand-zone paths:
+$(printf '%s\n' "$bad" | sed 's/^/  /')
+${note}These are yours to write. The pre-commit guard is a seatbelt and 'git commit
+--no-verify' skips it, so landing is where this is caught. Re-do the change by
+hand, or reclassify the zone deliberately in .agents/zones.toml."
 }
 
 # One sentence for the implementer prompt when a profile is in force, so the
@@ -1178,8 +1274,10 @@ cmd_run() {
   local task="${FLAG_ARGS[0]:?usage: aw run <task-id> [--fence-profile <name>]}"
   local wt br attempt=1 gate_note="" title fnote pnote
   local -a newargs=()
-  wt="$(wt_path "$task")"; br="$(branch_of "$task")"
+  # require_fence_flag first: it may activate the profile, and which worktree
+  # ROOT this task lives under follows the profile (wt_path).
   require_fence_flag "$task" run
+  wt="$(wt_path "$task")"; br="$(branch_of "$task")"
   profile_provider_guard implementer      # no-op without a profile
   if [ ! -d "$wt" ]; then
     [ -n "$FLAG_PROFILE" ] && newargs=(--fence-profile "$FLAG_PROFILE")
@@ -1226,15 +1324,16 @@ cmd_check() {
   scan_fence_flag "$@"
   local task="${FLAG_ARGS[0]:?usage: aw check <task-id> [--fence-profile <name>]}"
   local wt base review log pnote=""
-  wt="$(wt_path "$task")"
-  [ -d "$wt" ] || die "no worktree for $task"
   require_fence_flag "$task" check
+  wt="$(require_worktree "$task")"
   profile_provider_guard reviewer         # no-op without a profile
   # BEFORE the patch is written: the patch carries the content of every path in
   # the diff, so a tree the operator has not vouched for must stop the command
-  # here, not one line later.
+  # here, not one line later — and so must a HISTORY the operator has not
+  # vouched for, which a re-fenced worktree no longer shows.
   fence_reconcile "$wt" "$FENCE_PROFILE"
   base="$(base_of "$task")"
+  fence_reconcile_history "$wt" "$base" "$FENCE_PROFILE"
   ( cd "$wt" && git diff "$base" HEAD > ".agents/reviews/$task.patch" )
   review="$wt/.agents/reviews/$task-review.md"
   log="$(mktemp "${TMPDIR:-/tmp}/aw-review.XXXXXX")"
@@ -1263,7 +1362,7 @@ cmd_loop() {
   scan_fence_flag "$@"
   local task="${FLAG_ARGS[0]:?usage: aw loop <task-id> [--fence-profile <name>]}"
   local rounds="${LOOM_LOOP_ROUNDS:-2}"
-  local wt review verdict tfile i=1
+  local wt review verdict tfile base i=1
   local -a passthru=()
   [ -n "$FLAG_PROFILE" ] && passthru=(--fence-profile "$FLAG_PROFILE")
   wt="$(wt_path "$task")"
@@ -1277,8 +1376,11 @@ cmd_loop() {
   # chains are checked once here — before anything is created or called.
   require_fence_flag "$task" loop
   profile_provider_guard implementer reviewer
+  refuse_cross_root "$task"
   [ -d "$wt" ] || cmd_new "$task" ${passthru[0]+"${passthru[@]}"} > /dev/null
   fence_reconcile "$wt" "$FENCE_PROFILE"
+  base="$(base_of "$task")"
+  fence_reconcile_history "$wt" "$base" "$FENCE_PROFILE"
 
   implement() { # one implementer pass, with cmd_run's exit codes named
     local rc=0
@@ -1295,6 +1397,9 @@ cmd_loop() {
   tfile="$wt/.agents/tasks/$task.md"
   while [ "$i" -le "$rounds" ]; do
     echo "aw: [loop] review round $i/$rounds"
+    # Each round: the implementer has just committed, so re-judge the history
+    # before it is turned into a patch and handed to the reviewer.
+    fence_reconcile_history "$wt" "$base" "$FENCE_PROFILE"
     cmd_check "$task" ${passthru[0]+"${passthru[@]}"}
     verdict="$(grep '^VERDICT:' "$review" 2>/dev/null | tail -1 || true)"
     # No verdict line at all means a truncated or derailed review, not a
@@ -1323,12 +1428,17 @@ cmd_loop() {
   done
 }
 
+# `aw diff` writes the same patch file `aw check` hands to a reviewer, so it
+# takes --fence-profile on the same terms as every other task command: the
+# history is judged before the patch is written, not after.
 cmd_diff() {
-  local task="${1:?usage: aw diff <task-id>}"
+  scan_fence_flag "$@"
+  local task="${FLAG_ARGS[0]:?usage: aw diff <task-id> [--fence-profile <name>]}"
   local wt base patch
-  wt="$(wt_path "$task")"
-  [ -d "$wt" ] || die "no worktree for $task"
+  require_fence_flag "$task" diff
+  wt="$(require_worktree "$task")"
   base="$(base_of "$task")"
+  fence_reconcile_history "$wt" "$base" "$FENCE_PROFILE"
   patch="$wt/.agents/reviews/$task.patch"
   ( cd "$wt" && git diff "$base" HEAD > "$patch" )
   ${EDITOR:-vim} -R -c 'set filetype=diff' "$patch"
@@ -1349,10 +1459,16 @@ cmd_land() {
   done
   [ -n "$task" ] || die "usage: aw land <task-id> [--fence-profile <name>] [--pr|--merge] [--force]"
   case "$mode" in merge|pr) ;; *) die "LOOM_LAND must be 'merge' or 'pr' (got '$mode')" ;; esac
-  wt="$(wt_path "$task")"; br="$(branch_of "$task")"
-  [ -d "$wt" ] || die "no worktree for $task"
   require_fence_flag "$task" land
+  wt="$(require_worktree "$task")"; br="$(branch_of "$task")"
   fence_reconcile "$wt" "$FENCE_PROFILE"
+  # Landing is the last gate, and it is the one that PUBLISHES: a merge puts
+  # these commits in your tree, --pr puts them on origin. Both legs go through
+  # here, and --force does not skip it (it skips the gate, not the boundary).
+  # What is on disk is not the question — what the commits carry is.
+  base="$(base_of "$task")"
+  fence_reconcile_history "$wt" "$base" "$FENCE_PROFILE"
+  hand_reconcile_history "$ROOT" "$base" "$br"
   [ -n "$FENCE_PROFILE" ] && echo "aw: fence profile '$FENCE_PROFILE' — this diff may touch $FENCE_RELEASED"
   if [ -z "$force" ]; then
     echo "aw: running gate in worktree before landing"
@@ -1394,10 +1510,13 @@ cmd_rebase() { # rebase agent/<task> onto origin/main and re-point loombase
   local task="${FLAG_ARGS[0]:?usage: aw rebase <task-id> [<upstream>] [--fence-profile <name>]}"
   local upstream="${FLAG_ARGS[1]:-origin/main}"
   local wt br old_base old_pid new_base mb c
-  wt="$(wt_path "$task")"; br="$(branch_of "$task")"
-  [ -d "$wt" ] || die "no worktree for $task (aw new first)"
   require_fence_flag "$task" rebase   # a rebase must not silently change the fence
+  wt="$(require_worktree "$task")"; br="$(branch_of "$task")"
   fence_reconcile "$wt" "$FENCE_PROFILE"
+  # A rebase rewrites these commits onto a new base and re-points the diff
+  # base, which is exactly when a fenced path buried in the history would stop
+  # being visible. Judge it before, not after.
+  fence_reconcile_history "$wt" "$(base_of "$task")" "$FENCE_PROFILE"
   [ -z "$(git -C "$wt" status --porcelain)" ] || die "worktree $wt is dirty — commit or stash first"
   old_base="$(git config "branch.$br.loombase" 2>/dev/null)" || die "no loombase recorded for $br"
   old_pid="$(git show "$old_base" | git patch-id --stable | cut -d' ' -f1)"
