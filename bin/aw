@@ -16,6 +16,8 @@
 #   aw land  0007-c --pr             gate, push agent/0007-c, print PR next steps
 #   aw drop  0007-c [--keep-branch]  discard worktree (and branch, unless kept)
 #   aw rebase 0007-c                 rebase the branch onto origin/main; re-point its diff base
+#   aw rebase 0007-c --accept-upstream   ... even when what arrives under the
+#                                    base touches a fenced or hand-zone path
 #   aw ls                            list active agent worktrees
 #   aw gate                          run the gate here
 #   aw zone  <path>                  which zone a path belongs to
@@ -57,10 +59,11 @@
 #   ${XDG_CONFIG_HOME:-~/.config}/loom/repos/<sha256 of the repo's real path>/
 #       repo                       the repo path, so the directory is readable
 #       tasks/<task>               base=<commit> profile=<name> branch=<br>
-#                                  created=<iso>
+#                                  created=<iso> origin=<url> reviewed=<sha>
 #
-# `aw new` writes it, `aw rebase` re-points its base, `aw drop` deletes it, and
-# every security check (and `aw ls`) reads it. Mode 0700/0600.
+# `aw new` writes it, `aw rebase` re-points its base, `aw check` stamps the tip
+# it had reviewed, `aw drop` deletes it, and every security check (and `aw ls`)
+# reads it. Mode 0700/0600.
 #
 # Anthropic policy: subscription only, on purpose. The architect runs through
 # the `claude` CLI (your Claude Code login). There is no ANTHROPIC_API_KEY
@@ -198,7 +201,18 @@ state_read() { # state_read <task> <key>
 
 # The only writer. `aw new` calls it with a fresh timestamp; `aw rebase` calls
 # it with the recorded one, because a re-point is not a new task.
-state_put() { # state_put <task> <base> <profile> <branch> <created>
+#
+# Two fields beyond the base and the profile, and both exist to pin something
+# an agent could otherwise move under the operator:
+#
+#   origin=<url>    `remote.origin.url` as it was at `aw new`. `aw rebase` and
+#                   `aw land --pr` refuse when the current URL differs: the
+#                   remote config is in the shared .git, so one `git remote
+#                   set-url` inside a worktree re-aims the fetch a rebase
+#                   replays onto, and the push a --pr landing performs.
+#   reviewed=<sha>  the branch tip `aw check` last handed to a reviewer.
+#                   `aw land` refuses a tip that is not this one.
+state_put() { # state_put <task> <base> <profile> <branch> <created> <origin> <reviewed>
   local task="$1" f tmp
   f="$(state_file "$task")"
   ( umask 077; mkdir -p "$STATE_DIR/tasks" ) \
@@ -207,13 +221,36 @@ state_put() { # state_put <task> <base> <profile> <branch> <created>
   ( umask 077; printf '%s\n' "$STATE_MAIN_ROOT" > "$STATE_DIR/repo" ) || true
   tmp="$f.tmp.$$"
   ( umask 077
-    { printf 'base=%s\n'    "$2"
-      printf 'profile=%s\n' "$3"
-      printf 'branch=%s\n'  "$4"
-      printf 'created=%s\n' "$5"
+    { printf 'base=%s\n'     "$2"
+      printf 'profile=%s\n'  "$3"
+      printf 'branch=%s\n'   "$4"
+      printf 'created=%s\n'  "$5"
+      printf 'origin=%s\n'   "${6:-}"
+      printf 'reviewed=%s\n' "${7:-}"
     } > "$tmp" ) || die "cannot write the operator record $f"
   chmod 600 "$tmp" 2>/dev/null || true
   mv "$tmp" "$f" || die "cannot write the operator record $f"
+}
+
+# `remote.origin.url` as git answers it NOW, or "" when there is no origin.
+# Never a failure: a repo without a remote is ordinary, and the comparison
+# against the recorded value is what refuses.
+origin_url() { git remote get-url origin 2>/dev/null || true; }
+
+# The origin a task was created against must still be the origin it lands
+# against. Called by `aw rebase` (before the fetch it would replay onto) and by
+# `aw land --pr` (before the push).
+require_recorded_origin() { # require_recorded_origin <task> <command-name>
+  local task="$1" cmd="$2" rec now
+  rec="$(state_read "$task" origin)"
+  now="$(origin_url)"
+  [ "$rec" = "$now" ] && return 0
+  die "the 'origin' remote is not the one task $task was created against:
+  recorded at aw new: ${rec:-(none)}
+  configured now:     ${now:-(none)}
+'remote.origin.url' lives in the shared .git/config, which every linked worktree
+can write, so aw will not $cmd against a remote it cannot vouch for. Put the URL
+back, or start clean:  aw drop $task && aw new $task"
 }
 
 state_rm() { rm -f "$(state_file "$1")"; }
@@ -1023,6 +1060,13 @@ zone_of() { # zone_of <repo-relative-path>   (fails loudly: callers gate commits
   zones_py zone "$1"
 }
 
+# zones_py with NO profile active, whatever this command asserted. The subshell
+# is the point: `AW_FENCE_PROFILE` is exported, and a caller must not have its
+# own answer changed by asking this question. Used where a release list has no
+# standing — `aw rebase`'s judgement of what arrives from upstream, which nobody
+# released anything for.
+zones_py_full() { ( unset AW_FENCE_PROFILE; zones_py "$@" ); }
+
 # ------------------------------------------------------------ fence profiles
 # A fence profile is a NAMED, per-provider relaxation of the read fence: the
 # worktree of a task that opts into it is fenced by [fence] MINUS the profile's
@@ -1365,12 +1409,16 @@ an empty diff."
 # Fenced paths in the branch's commits that the asserted profile does not
 # release. With nothing asserted, "released" is empty: any fenced path in the
 # history is a violation.
+#
+# The endpoint is $PINNED_TIP — the sha this command resolved the branch ref to,
+# once, before any of this — not the ref name and not the worktree's HEAD.
 fence_reconcile_history() { # fence_reconcile_history <task> <base> <asserted>
   local task="$1" base="$2" asserted="${3:-}" bad
   if [ -n "$asserted" ] && [ "$FENCE_PROFILE" != "$asserted" ]; then
     fence_profile_activate "$asserted"
   fi
-  history_paths "$ROOT" "$base" "$(branch_ref "$task")"
+  require_pinned_tip
+  history_paths "$ROOT" "$base" "$PINNED_TIP"
   [ "${#HIST_PATHS[@]}" -gt 0 ] || return 0
   bad="$(zones_py history-fence "${HIST_PATHS[@]}")" \
     || die "cannot tell which paths this branch's commits touch — refusing to guess"
@@ -1548,6 +1596,22 @@ require_worktree() { # require_worktree <task>
 branch_of()  { echo "agent/$1"; }
 branch_ref() { echo "refs/heads/agent/$1"; }
 
+# Uncommitted work in a task worktree, EXCEPT the dispatcher's own review
+# scratch: `aw check` and `aw diff` write .agents/reviews/<task>.patch and
+# -review.md into the worktree themselves, so counting those would make `aw`
+# refuse to land after its own review step. Consumers should gitignore
+# .agents/reviews/ (README); this exclusion is what keeps the check honest in
+# the repos that have not.
+#
+# Everything else counts, untracked files included. A tree with uncommitted
+# changes is a tree whose diff is not the branch's diff: what the reviewer read
+# and what a merge would carry have come apart, and the gate about to run is
+# measuring files nobody reviewed.
+wt_dirty() { # wt_dirty <worktree>   -> the offending `git status --porcelain` lines
+  git -C "$1" status --porcelain -- . ':(exclude).agents/reviews' 2>/dev/null \
+    || die "cannot read the state of the worktree $1 — refusing to guess whether it is clean"
+}
+
 # --- ONE base, and it is the operator's ------------------------------------
 # There used to be two: a "security base" derived from refs, and a "review
 # base" read from `branch.agent/<task>.loombase`. Both are gone, and for the
@@ -1567,22 +1631,52 @@ branch_ref() { echo "refs/heads/agent/$1"; }
 # (an operator command), and read from a file outside every repo. It is the
 # base of BOTH the security checks and the review patch — there is nothing left
 # to clamp, because there is no second, cheaper base to clamp against.
-security_base() { # security_base <task>  -> the recorded base commit, or dies
-  local task="$1" base br ref
-  br="$(branch_of "$task")"; ref="$(branch_ref "$task")"
-  base="$(state_read "$task" base)"
-  [ -n "$base" ] || die "no operator record for task $task — created before this version, or
+# --- ONE endpoint too, and it is a SHA ------------------------------------
+# `refs/heads/agent/<task>` is the right endpoint, and it is also a moving
+# target: the ref lives in the shared `.git`, so anything running in the
+# worktree — the implementer, a hook, `.agents/gate.sh` — can `git update-ref`
+# it between the check and the merge. A command that named the branch four
+# times resolved it four times, and only the first three were the reviewed one.
+#
+# So every command resolves it EXACTLY ONCE, into $PINNED_TIP, and then uses
+# that sha for all of it: the history checks, the review patch, the merge and
+# the push. Whatever a worktree does to the ref afterwards, the command is
+# already talking about a commit.
+PINNED_TIP=""
+pin_branch_tip() { # pin_branch_tip <task>   -> sets $PINNED_TIP for this command
+  local task="$1" ref; ref="$(branch_ref "$task")"
+  PINNED_TIP="$(git rev-parse --verify --quiet "$ref^{commit}" 2>/dev/null)" \
+    || die "branch '$(branch_of "$task")' does not resolve in $ROOT — refusing to guess what it touches"
+  [ -n "$PINNED_TIP" ] \
+    || die "branch '$(branch_of "$task")' does not resolve in $ROOT — refusing to guess what it touches"
+}
+
+require_pinned_tip() {
+  [ -n "$PINNED_TIP" ] || die "internal error: the branch tip was not pinned for this command"
+}
+
+# The operator record's existence, said in security_base's words. `aw run` needs
+# the refusal without the rest of security_base, because a task that has just
+# been created legitimately has nothing past its branch point.
+require_record() { # require_record <task>
+  [ -n "$(state_read "$1" base)" ] || die "no operator record for task $1 — created before this version, or
 removed. There is no base to judge this branch's commits against, and aw will
 not derive one from anything a worktree can write. Start clean:
-  aw drop $task && aw new $task"
+  aw drop $1 && aw new $1"
+}
+
+security_base() { # security_base <task>  -> the recorded base commit, or dies
+  local task="$1" base br
+  br="$(branch_of "$task")"
+  require_pinned_tip                     # the endpoint, resolved once, upstream
+  require_record "$task"
+  base="$(state_read "$task" base)"
   base="$(git rev-parse --verify --quiet "$base^{commit}" 2>/dev/null)" \
     || die "the base recorded for task $task does not resolve in $ROOT.
 That commit is what every fence and hand history check is measured from, so
 without it aw cannot tell what this branch's commits touch — and will not guess.
 If the history was rewritten under it:  aw drop $task && aw new $task"
-  git rev-parse --verify --quiet "$ref^{commit}" >/dev/null 2>&1 \
-    || die "branch '$br' does not resolve in $ROOT — refusing to guess what it touches"
-  git merge-base --is-ancestor "$base" "$ref" 2>/dev/null \
+  git merge-base --is-ancestor "$base" "$PINNED_TIP" 2>/dev/null \
     || die "the base recorded for task $task ($(git rev-parse --short "$base")) is not an
 ancestor of $br. This branch is not the one that record was written for — it was
 rebased or reset outside 'aw rebase', or the record belongs to another task.
@@ -1590,7 +1684,7 @@ Inspect it, do not land it:  git log --oneline $(git rev-parse --short "$base").
   # Equal, or behind: there is nothing between the branch point and the branch.
   # An empty review is not something to hand a reviewer, and an empty history
   # check is not evidence of anything.
-  ! git merge-base --is-ancestor "$ref" "$base" 2>/dev/null \
+  ! git merge-base --is-ancestor "$PINNED_TIP" "$base" 2>/dev/null \
     || die "nothing to review/land — the branch has no commits past its branch point
 ($(git rev-parse --short "$base")). Run the implementer first:  aw run $task"
   printf '%s\n' "$base"
@@ -1836,8 +1930,19 @@ fenced paths into this worktree. Confirm it on the command line:
   # The branch point, resolved ONCE and used for both the checkout and the
   # record, so that "the commit this branch was cut from" is the same fact in
   # both places rather than two lookups that could disagree.
+  #
+  # This one `git rev-parse HEAD` is the one ref read that IS a security input,
+  # and it is acceptable for a reason worth writing down: it is $ROOT's HEAD,
+  # i.e. `refs/heads/<your branch>` in YOUR checkout. An agent that moved it
+  # would move the branch the operator is standing on — visible in their own
+  # working tree, in their prompt, in the next `git status`. `origin/main` is
+  # the opposite: a moved `refs/remotes/origin/main` shows NOWHERE, which is why
+  # `aw rebase` refuses to replay onto it without checking what came with it.
   local newbase; newbase="$(git rev-parse HEAD)" \
     || die "cannot resolve HEAD in $ROOT — there is no branch point to record"
+  # The remote as it is right now, so that a later `aw rebase` / `aw land --pr`
+  # can tell that it still is.
+  local neworigin; neworigin="$(origin_url)"
   NEW_WT="$wt"
   # $NEW_BR before the add, on purpose: the add CREATES the branch and can then
   # fail on the path, and the check above observed that this branch did not
@@ -1850,7 +1955,8 @@ fenced paths into this worktree. Confirm it on the command line:
   git worktree add --no-checkout -b "$br" "$wt" "$newbase" >&2
   assert_wt_under "$wt" "$wtroot"
   NEW_STATE="$task"
-  state_put "$task" "$newbase" "$prof" "$br" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  state_put "$task" "$newbase" "$prof" "$br" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "$neworigin" ""
   if has_fence; then
     fence_apply "$wt"
     git -C "$wt" checkout >&2
@@ -1895,7 +2001,14 @@ fix failures until it exits 0. Write brief notes on what you did to \
 .agents/reviews/$task-done.md. If you cannot proceed, write why to \
 .agents/reviews/$task-blocked.md and stop.$fnote$pnote$gate_note" || true
 
-    if ( cd "$wt" && ./.agents/gate.sh > "$wt/.agents/reviews/$task-gate.log" 2>&1 ); then
+    # The OPERATOR's gate script, with the worktree as its cwd. `.agents/gate.sh`
+    # inside the worktree is a file the implementer edits (the claude leg even
+    # allowlists running it), so the copy that decides "green, commit it" must
+    # not be the agent's — a gate that rewrites itself to `exit 0`, or that
+    # `git update-ref`s the branch on the way past, is one line of shell. The
+    # implementer still runs the worktree's copy for its own iteration; this is
+    # the one whose verdict `aw` acts on.
+    if ( cd "$wt" && "$STATE_MAIN_ROOT/.agents/gate.sh" > "$wt/.agents/reviews/$task-gate.log" 2>&1 ); then
       echo "aw: gate green"
       ( cd "$wt" && git add -A && git commit -q -m "agent($task): $title" )
       echo "aw: committed on $br — review with: aw check $task && aw diff $task"
@@ -1927,12 +2040,14 @@ cmd_check() {
   # here, not one line later — and so must a HISTORY the operator has not
   # vouched for, which a re-fenced worktree no longer shows.
   fence_reconcile "$wt" "$FENCE_PROFILE"
+  pin_branch_tip "$task"
   base="$(security_base "$task")"
   fence_reconcile_history "$task" "$base" "$FENCE_PROFILE"
   # One base, one endpoint, and neither is read from the worktree: the patch
-  # handed to the reviewer is exactly the range the history check just cleared.
+  # handed to the reviewer is exactly the range the history check just cleared,
+  # cut against the SHA that range was cleared for.
   mkdir -p "$wt/.agents/reviews"
-  git -C "$ROOT" diff "$base" "$(branch_ref "$task")" > "$wt/.agents/reviews/$task.patch" \
+  git -C "$ROOT" diff "$base" "$PINNED_TIP" > "$wt/.agents/reviews/$task.patch" \
     || die "cannot write the review patch for $task"
   review="$wt/.agents/reviews/$task-review.md"
   log="$(mktemp "${TMPDIR:-/tmp}/aw-review.XXXXXX")"
@@ -1949,7 +2064,13 @@ against the task spec .agents/tasks/$task.md and the plan it references. \
 Print your review to stdout: scope check, correctness concerns, test coverage, \
 and end with a final line 'VERDICT: APPROVE' or 'VERDICT: REVISE — <reason>'.$pnote" "$log"
   cp "$log" "$review"
+  # What was reviewed, recorded: `aw land` refuses a tip that is not this one,
+  # so a commit added after the reviewer read the patch cannot ride the review
+  # into the merge.
+  state_put "$task" "$base" "$(state_read "$task" profile)" "$(branch_of "$task")" \
+            "$(state_read "$task" created)" "$(state_read "$task" origin)" "$PINNED_TIP"
   echo "aw: review saved to $(relpath "$review")"
+  echo "aw: reviewed tip $(git rev-parse --short "$PINNED_TIP") — aw land refuses anything else"
 }
 
 # Bounded implement -> review -> fix -> review. A reviewer that still says
@@ -1979,6 +2100,7 @@ cmd_loop() {
   [ -d "$wt" ] || cmd_new "$task" ${passthru[0]+"${passthru[@]}"} > /dev/null
   require_wt_on_branch "$task" "$wt"
   fence_reconcile "$wt" "$FENCE_PROFILE"
+  pin_branch_tip "$task"
   base="$(security_base "$task")"
   fence_reconcile_history "$task" "$base" "$FENCE_PROFILE"
 
@@ -2001,6 +2123,7 @@ cmd_loop() {
     # before it is turned into a patch and handed to the reviewer. The base is
     # re-read rather than reused, so that a task re-pointed by `aw rebase` in
     # between is measured from the base it actually has now.
+    pin_branch_tip "$task"
     base="$(security_base "$task")"
     fence_reconcile_history "$task" "$base" "$FENCE_PROFILE"
     cmd_check "$task" ${passthru[0]+"${passthru[@]}"}
@@ -2044,11 +2167,12 @@ cmd_diff() {
   # the content of every path in it, so the tree AND the history are judged
   # before a byte of it is written.
   fence_reconcile "$wt" "$FENCE_PROFILE"
+  pin_branch_tip "$task"
   base="$(security_base "$task")"
   fence_reconcile_history "$task" "$base" "$FENCE_PROFILE"
   patch="$wt/.agents/reviews/$task.patch"
   mkdir -p "$wt/.agents/reviews"
-  git -C "$ROOT" diff "$base" "$(branch_ref "$task")" > "$patch" \
+  git -C "$ROOT" diff "$base" "$PINNED_TIP" > "$patch" \
     || die "cannot write the diff for $task"
   ${EDITOR:-vim} -R -c 'set filetype=diff' "$patch"
 }
@@ -2071,22 +2195,52 @@ cmd_land() {
   require_fence_flag "$task" land
   wt="$(require_worktree "$task")"; br="$(branch_of "$task")"
   fence_reconcile "$wt" "$FENCE_PROFILE"
+  # Uncommitted work in the worktree is not the branch's work: the reviewer read
+  # a patch cut from the commits, and what is landing is the commits. `aw rebase`
+  # has always refused a dirty tree; landing is where it matters more.
+  local dirty; dirty="$(wt_dirty "$wt")"
+  [ -z "$dirty" ] || die "worktree $wt has uncommitted changes:
+$(printf '%s\n' "$dirty" | sed 's/^/  /')
+Landing publishes the branch's COMMITS, so anything still loose here would be
+lost — or, if it is the reason the gate passes, would be landing unreviewed.
+Commit it in the worktree, or discard it, then re-run:  aw check $task"
   # Landing is the last gate, and it is the one that PUBLISHES: a merge puts
   # these commits in your tree, --pr puts them on origin. Both legs go through
   # here, and --force does not skip it (it skips the gate, not the boundary).
   # What is on disk is not the question — what the commits carry is.
+  pin_branch_tip "$task"
   base="$(security_base "$task")"
   fence_reconcile_history "$task" "$base" "$FENCE_PROFILE"
-  hand_reconcile_history "$ROOT" "$base" "$(branch_ref "$task")"
+  hand_reconcile_history "$ROOT" "$base" "$PINNED_TIP"
+  # The tip a reviewer actually read. A branch that moved since — an extra
+  # commit, an `update-ref` from a gate script, a force-push into the ref — is
+  # not the thing that was reviewed, and `--force` does not skip this either.
+  local reviewed; reviewed="$(state_read "$task" reviewed)"
+  [ -n "$reviewed" ] || die "task $task has never been through 'aw check', so nothing has reviewed the
+commits this would publish. Run it first:  aw check $task${FENCE_PROFILE:+ --fence-profile $FENCE_PROFILE}"
+  [ "$reviewed" = "$PINNED_TIP" ] || die "the branch moved since it was reviewed:
+  reviewed at aw check: $reviewed
+  $br is now:           $PINNED_TIP
+Landing would publish commits nobody read. Re-run the review, then land:
+  aw check $task${FENCE_PROFILE:+ --fence-profile $FENCE_PROFILE}"
   [ -n "$FENCE_PROFILE" ] && echo "aw: fence profile '$FENCE_PROFILE' — this diff may touch $FENCE_RELEASED"
   if [ -z "$force" ]; then
     echo "aw: running gate in worktree before landing"
-    ( cd "$wt" && ./.agents/gate.sh ) || die "gate is red in $br — fix it or land with: aw land $task --force"
+    # The OPERATOR's gate, with the worktree as its cwd — never $wt/.agents/gate.sh,
+    # which is a file the implementer edits (and, under a profile, may even be
+    # allowed to commit).
+    ( cd "$wt" && "$STATE_MAIN_ROOT/.agents/gate.sh" ) || die "gate is red in $br — fix it or land with: aw land $task --force"
   fi
 
   if [ "$mode" = pr ]; then
     git remote get-url origin >/dev/null 2>&1 || die "no 'origin' remote — PR-mode landing needs one"
-    git push -u origin "$br"
+    require_recorded_origin "$task" "push"
+    # The SHA, pushed INTO the branch's ref name. Pushing the name would publish
+    # whatever the ref says at push time, which is not necessarily what the gate
+    # ran on and the reviewer read.
+    git push origin "$PINNED_TIP:refs/heads/$br" \
+      || die "push of $PINNED_TIP to origin/$br failed — nothing was published"
+    git branch --set-upstream-to="origin/$br" "$br" >/dev/null 2>&1 || true
     title="$(head -1 "$AGENTS_DIR/tasks/$task.md" 2>/dev/null | sed 's/^#[[:space:]]*//')"
     [ -n "$title" ] || title="$task"
     echo ""
@@ -2099,7 +2253,9 @@ cmd_land() {
     return 0
   fi
 
-  git merge --no-ff "$br" -m "land($task)"
+  # The pinned SHA, not the branch name: between the checks above and this line
+  # the ref is one `git update-ref` from saying something else.
+  git merge --no-ff "$PINNED_TIP" -m "land($task)"
   git worktree remove "$wt" --force
   git branch -d "$br"
   plan="$(grep -rl -- "$task" "$AGENTS_DIR/plans" 2>/dev/null | head -1 || true)"
@@ -2119,21 +2275,56 @@ cmd_rebase() { # rebase agent/<task> onto origin/main and re-point its base
   # command: it replays the branch and re-points the record at the commit it
   # replayed onto — the replayed base commit matched by patch-id, or the new
   # merge-base. Nothing an agent runs re-points anything.
+  #
+  # And moving the base is not a neutral act, which is the whole of the
+  # `--accept-upstream` machinery below. Everything between the old base and the
+  # new one STOPS being the branch's work: it slides under the base, where no
+  # fence check, no hand check and no review patch will ever look at it again.
+  # `refs/remotes/origin/main` is one `git update-ref` away from naming any
+  # commit an agent likes, and unlike `refs/heads/main` (which is the branch the
+  # operator is standing on, and moves in front of them) a moved `origin/main`
+  # shows NOWHERE. So aw reads what actually came under the base and refuses to
+  # bury a fenced or hand-zone path in it without being told to.
   scan_fence_flag "$@"
-  local task="${FLAG_ARGS[0]:?usage: aw rebase <task-id> [<upstream>] [--fence-profile <name>]}"
-  local upstream="${FLAG_ARGS[1]:-origin/main}"
-  local wt br old_base old_pid new_base mb c
+  local task="" upstream="" accept="" a
+  local wt br old_base old_pid new_base mb c dirty bad_f bad_h
+  for a in ${FLAG_ARGS[0]+"${FLAG_ARGS[@]}"}; do
+    case "$a" in
+      --accept-upstream) accept=yes ;;
+      -*) die "aw rebase: unknown flag '$a' — usage: aw rebase <task-id> [<upstream>] [--fence-profile <name>] [--accept-upstream]" ;;
+      *)  if   [ -z "$task" ];     then task="$a"
+          elif [ -z "$upstream" ]; then upstream="$a"
+          else die "aw rebase: unexpected argument '$a'"; fi ;;
+    esac
+  done
+  [ -n "$task" ] || die "usage: aw rebase <task-id> [<upstream>] [--fence-profile <name>] [--accept-upstream]"
+  upstream="${upstream:-origin/main}"
   require_fence_flag "$task" rebase   # a rebase must not silently change the fence
   wt="$(require_worktree "$task")"; br="$(branch_of "$task")"
   fence_reconcile "$wt" "$FENCE_PROFILE"
   # A rebase rewrites these commits onto a new base and re-points the recorded
   # one, which is exactly when a fenced path buried in the history would stop
   # being visible. Judge it before, not after.
+  pin_branch_tip "$task"
   old_base="$(security_base "$task")"
   fence_reconcile_history "$task" "$old_base" "$FENCE_PROFILE"
-  [ -z "$(git -C "$wt" status --porcelain)" ] || die "worktree $wt is dirty — commit or stash first"
+  dirty="$(wt_dirty "$wt")"
+  [ -z "$dirty" ] || die "worktree $wt is dirty — commit or stash first:
+$(printf '%s\n' "$dirty" | sed 's/^/  /')"
+  # The remote a rebase replays onto must be the remote this task was created
+  # against. Checked BEFORE the fetch, so a re-aimed URL is never contacted.
+  require_recorded_origin "$task" "rebase"
   old_pid="$(git show "$old_base" | git patch-id --stable | cut -d' ' -f1)"
-  git fetch -q origin >&2 || true
+  # A failed fetch used to be swallowed. It must not be: the whole point of the
+  # fetch is that `$upstream` is current, and replaying onto a stale ref moves
+  # this task's base onto commits the operator has not seen — silently, because
+  # a rebase onto an old tip succeeds perfectly well.
+  if git remote get-url origin >/dev/null 2>&1; then
+    git fetch -q origin >&2 \
+      || die "git fetch origin failed, so '$upstream' may be stale — and a rebase onto a
+stale upstream moves this task's base onto commits you have not fetched.
+Fix the fetch (network, credentials, the remote URL) and re-run."
+  fi
   git -C "$wt" rebase "$upstream" >&2 || die "rebase onto $upstream failed — resolve in $wt, then re-run"
   mb="$(git merge-base "$br" "$upstream")" \
     || die "$br and $upstream have no common ancestor after the rebase — inspect $wt"
@@ -2157,7 +2348,46 @@ cmd_rebase() { # rebase agent/<task> onto origin/main and re-point its base
   git merge-base --is-ancestor "$new_base" "$br" \
     || die "the new base $(git rev-parse --short "$new_base") is not an ancestor of $br — refusing to
 record a base this branch does not descend from. Inspect $wt, do not re-run."
-  state_put "$task" "$new_base" "$(state_read "$task" profile)" "$br" "$(state_read "$task" created)"
+  # WHAT CAME UNDER THE BASE. Everything in old_base..new_base is about to stop
+  # being reviewable: it is upstream now. Judged through the FULL [fence] and
+  # the FULL [hand] — a fence profile releases paths for the TASK's own commits,
+  # and nobody consented to a release for whatever arrived from upstream.
+  history_paths "$ROOT" "$old_base" "$new_base"
+  if [ "${#HIST_PATHS[@]}" -gt 0 ] && [ -z "$accept" ]; then
+    bad_f="$(zones_py_full history-fence "${HIST_PATHS[@]}")" \
+      || die "cannot tell what the commits under the new base touch — refusing to guess"
+    bad_h="$(zones_py_full history-hand "${HIST_PATHS[@]}")" \
+      || die "cannot tell which zones the commits under the new base touch — refusing to guess"
+    if [ -n "$bad_f$bad_h" ]; then
+      die "the commits this rebase would put UNDER task $task's base touch paths aw will
+not bury silently:
+${bad_f:+
+  fenced:
+$(printf '%s\n' "$bad_f" | sed 's/^/    /')}${bad_h:+
+  hand zone:
+$(printf '%s\n' "$bad_h" | sed 's/^/    /')}
+
+  $(git rev-parse --short "$old_base")..$(git rev-parse --short "$new_base") ($upstream):
+$(git log --oneline "$old_base..$new_base" 2>/dev/null | sed 's/^/    /')
+
+Below the base nothing looks at them again — not the fence check, not the hand
+check, not the review patch. 'origin/main' is one 'git update-ref' away from any
+commit, and unlike your own 'main' a moved 'origin/main' is visible nowhere.
+The base was NOT moved; the branch has been replayed, so read those commits and
+then either accept them under the base:
+  aw rebase $task $upstream${FLAG_PROFILE:+ --fence-profile $FLAG_PROFILE} --accept-upstream
+or throw the task away:  aw drop $task"
+    fi
+  fi
+  if [ -n "$accept" ] && [ "${#HIST_PATHS[@]}" -gt 0 ]; then
+    echo "aw: --accept-upstream: these commits go under task $task's base unreviewed:" >&2
+    git log --oneline "$old_base..$new_base" 2>/dev/null | sed 's/^/  /' >&2
+  fi
+  # `reviewed` is deliberately cleared: the branch has been rewritten, so the
+  # sha a reviewer read no longer exists on it. `aw land` will ask for a fresh
+  # `aw check`, which is the honest answer.
+  state_put "$task" "$new_base" "$(state_read "$task" profile)" "$br" \
+            "$(state_read "$task" created)" "$(state_read "$task" origin)" ""
   echo "aw: $br rebased onto $upstream; base $(git rev-parse --short "$old_base") -> $(git rev-parse --short "$new_base")"
 }
 
