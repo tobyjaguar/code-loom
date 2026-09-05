@@ -260,11 +260,56 @@ providers = ["claude", "codex"]             # provider_of(), not model IDs
 A task that opts into `codex` gets a worktree fenced by `[fence]` **minus**
 `release` — `core/**` and `docs/audits/**` are there, `ios/**` and `spike/**`
 are still gone. A task with no profile is fenced by the whole `[fence]`, as
-before. (Two things *did* change for unprofiled runs, and neither is about
-profiles: implementer-class roles on `claude-sub` and `codex-sub` now get a
-write-capable sandbox — see "Codex as an implementer" below — and `aw doctor`
-prints the parse error when `zones.toml` is unreadable instead of a generic
-line.)
+before.
+
+**Unprofiled runs did get stricter, though**, and none of it is about profiles
+— the fence-profile work was where the adversarial reviews happened, so the
+fixes landed here. If you never write a `[fence_profiles]` table, this is the
+part of the branch that still changes your runs:
+
+- **The security base.** Every check of what a branch's *commits* touch is
+  measured from `merge-base($LOOM_BASE_REF, agent/<task>)`, computed in your
+  checkout — not from `branch.agent/<task>.loombase`, which lives in the shared
+  `.git/config` and which anything running in the worktree can rewrite.
+  `$LOOM_BASE_REF` is `origin/main` if it exists, else `main`; set it yourself
+  for a differently-named trunk. It is operator-side: `.agents/loom.env` may
+  not set it (that file is in the tree an agent writes), and a value there is
+  ignored with a warning. The loombase survives only as the *review* diff, and
+  only when it is an ancestor of the branch and of the security base —
+  otherwise the review diff falls back to the security base, loudly, because an
+  agent must not be able to shrink what the reviewer sees. A base that does not
+  resolve, or a branch with no common ancestor, is a refusal and never an empty
+  answer.
+- **The worktree roots are verified.** Both are normalised (a trailing `/` or
+  `/.` in `$LOOM_WORKTREES` is stripped before `-profiled` is appended),
+  resolved with `pwd -P` and refused if the resolved path is not where the name
+  says — a symlink at `$WT_ROOT-profiled` would otherwise put released content
+  inside the directory unprofiled runs are pointed at. `WT_ROOT_PROFILED` is
+  derived, never taken from the environment or `loom.env`. Every `git worktree
+  add` re-resolves its parent immediately before, and the created worktree
+  immediately after.
+- **"Which fenced paths are present" is asked of the disk**, not just of `git
+  ls-files`, so an untracked `core/copy.rs` — `git show HEAD:core/lib.rs >
+  core/copy.rs` never touches the index — is a dead stop instead of an
+  invisible one. (Content copied to a path the fence does *not* name is still
+  the exfiltration class; see "What a profile is not".)
+- **An existing branch is refused**, never walked over: `aw new` used to arm
+  its cleanup trap before `git worktree add -b`, so an add that failed because
+  `agent/<task>` already existed deleted that branch and its commits.
+- **A fence that was widened under an existing worktree is refused**, not
+  quietly re-applied — the worktree's own diff carries the content regardless.
+  There is no "the branch record says this would have been fine" arm any more.
+- **The history is refused in `check`, `diff`, `loop`, `rebase` and `land`**
+  when the branch's commits touch a fenced path, and `land` refuses a `[hand]`
+  path in those commits too. `--force` skips the gate, not this.
+- **opencode's grant narrowed** from the whole worktree root to the role's own
+  worktree, and opencode now reads *your* `.opencode/opencode.json` with the
+  project's own config disabled — the worktree copy is a file the agent can
+  rewrite, and it carries provider endpoints and role prompts.
+- Independent of all of it: implementer-class roles on `claude-sub` and
+  `codex-sub` get a write-capable sandbox (see "Codex as an implementer"
+  below), and `aw doctor` prints the parse error when `zones.toml` is
+  unreadable instead of a generic line.
 
 **The rule is fail-closed.** Before the worktree is created, `aw` checks every
 model in every chain that will run against it — implementer, reviewer, and the
@@ -366,11 +411,23 @@ The tree is only half the question, because a tree can be re-fenced after the
 fact: materialise `core/**`, commit it, put the sparse rules back, and the
 worktree looks clean while the *history* still carries it into every diff,
 patch file and merge. So the branch's commits are judged too — every path in
-`git diff <loombase> HEAD`, mapped through the full `[fence]` — wherever
+`git diff <security base> HEAD`, mapped through the full `[fence]` — wherever
 history is handed onward: `aw check` (before the patch is written), each round
 of `aw loop`, `aw diff`, `aw rebase`, and `aw land` before it merges or pushes.
 `aw land` additionally refuses any `[hand]` path in those commits that the
 profile does not release; `--force` skips the gate, not this.
+
+The *security base* is `merge-base($LOOM_BASE_REF, agent/<task>)`, computed in
+your checkout, and it is deliberately not the branch's `loombase`: branch
+config is agent-writable state (that is the same sentence as three paragraphs
+up, and it cost a whole class of bypass — a loombase pointed at the branch's
+own tip makes every one of those diffs empty). The loombase is still what the
+*review* patch is cut from, because it hides the plan/task commit the branch
+rides on, but only while it stays an ancestor of the branch and of the security
+base. Past either, the review patch is cut from the security base instead, with
+a warning. `aw rebase` trips that clamp by design when it re-points at a
+replayed base: the plan commit is back in the review diff, and there is no way
+for `aw` to tell that re-point apart from an agent hiding a commit.
 
 **The commit guard follows the profile — as a seatbelt.** Fenced paths are
 conventionally listed under `[hand]` too (that is what blocks a *commit* to
@@ -427,7 +484,10 @@ The edit permission is granted per ROLE, never per model:
 
 Note the third column: the opencode leg has **no OS sandbox in either row** — an
 opencode reviewer is held by its role prompt, the fence, and the profile's
-provider rule, not by the process. Note also that neither `codex-sub` nor
+provider rule, not by the process. Those last two now come from *your*
+`.opencode/opencode.json` (`OPENCODE_CONFIG` plus
+`OPENCODE_DISABLE_PROJECT_CONFIG=1`), not from the worktree's copy, which the
+agent can rewrite — provider endpoints and role prompts both live in that file. Note also that neither `codex-sub` nor
 `claude-sub` appears in a default implementer chain (those are GLM, DeepSeek and
 Kimi), so reaching this path at all takes an explicit `LOOM_MODELS_implementer`.
 

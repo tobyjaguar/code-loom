@@ -56,7 +56,7 @@ paths = [
 # Optional, and only meaningful with a [fence] above it: a NAMED, per-provider
 # relaxation of the fence. A task opts in with `aw new <task> --fence-profile
 # <name>`, and EVERY later command for that task repeats the flag (run, check,
-# loop, rebase, land). Its worktree is fenced by [fence] MINUS `release`, and
+# loop, diff, rebase, land). Its worktree is fenced by [fence] MINUS `release`, and
 # `aw` refuses to run any role there whose model chain (fallbacks included)
 # reaches a provider outside `providers`. A `Fence-profile: <name>` line in the
 # task file documents the intent but never opts in on its own.

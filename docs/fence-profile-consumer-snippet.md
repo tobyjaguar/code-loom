@@ -178,6 +178,25 @@ aw check <some-task> --fence-profile codex      # must STILL die, and tell you
 git config branch.agent/<some-task>.fenceprofile codex   # your act, not aw's
 ```
 
+## 5. One thing to check that is not about profiles
+
+Every check of what a branch's **commits** touch is measured from
+`merge-base($LOOM_BASE_REF, agent/<task>)`, and `$LOOM_BASE_REF` defaults to
+`origin/main` if that ref exists, else `main`. `graduated-wallet` is on `main`
+with an `origin`, so the default is right and there is nothing to set. A repo
+whose trunk is called something else gets a hard refusal on `aw
+check|diff|loop|rebase|land` until it sets `LOOM_BASE_REF` — in the
+environment or in `~/.config/loom/env`, **never** in `.agents/loom.env`, which
+is a file in the tree an agent writes and which `aw` ignores for this one
+variable (loudly). It is measured this way, and not from the branch's recorded
+diff base, because that base lives in the shared `.git/config`: anything
+running in the worktree could point it at the branch's own tip and empty every
+one of those checks.
+
+```sh
+git rev-parse --verify origin/main   # must resolve, or set LOOM_BASE_REF
+```
+
 Then read [`docs/KNOWN-GAPS.md`](KNOWN-GAPS.md) in the harness repo, in full:
 it is the list of what a profile does **not** close, and it is kept current
 there rather than summarised here. None of it is fixed by this snippet.

@@ -303,6 +303,34 @@ Semantics:
   than the worktree root. `aw ls`, `aw drop`, `aw rebase` and `run_role`'s
   defence-in-depth check all know both roots, and a task that exists under one
   cannot be re-created under the other.
+
+  "Sibling" is a claim about a path, so both paths are checked rather than
+  assumed. `$LOOM_WORKTREES` must be absolute and is normalised first (trailing
+  `/` **and** `/.` stripped repeatedly — `/x/wt/.` would otherwise derive
+  `/x/wt/.-profiled`, a child); the profiled root is then derived from that and
+  from nothing else, and a `WT_ROOT_PROFILED` preset in the environment or in
+  `.agents/loom.env` that differs is a refusal, not a redirection. Both roots
+  are resolved with `pwd -P` (through the parent chain, so a repo under a
+  symlinked `/tmp` stays ordinary) and refused when the final component is not
+  the real directory its name claims — an agent that plants
+  `$WT_ROOT-profiled -> $WT_ROOT/T5` would otherwise have every released path
+  checked out inside the directory unprofiled runs are pointed at. Neither root
+  may contain the other or sit inside `$ROOT`. And because a verified directory
+  is not a promise, every `git worktree add` re-resolves the parent of the path
+  it is about to create against this command's root, and re-resolves the
+  worktree afterwards.
+- **opencode reads the operator's config.** opencode resolves its project
+  config from the cwd, which is the agent's worktree:
+  `<worktree>/.opencode/opencode.json` is a tracked file the agent can rewrite,
+  and it carries `provider.<name>.options.baseURL` — the provider identity the
+  whole `providers` rule is built on — as well as the agent definitions that
+  supply the role prompt. Every opencode invocation therefore runs with
+  `OPENCODE_CONFIG=$ROOT/.opencode/opencode.json` **and**
+  `OPENCODE_DISABLE_PROJECT_CONFIG=1`: the first alone is merged *before* the
+  project files, so the worktree copy would still win key by key. The cost is
+  that opencode no longer reads the worktree's `AGENTS.md`/`CLAUDE.md` or a
+  project-local plugin; the role prompt now comes from `$ROOT/.opencode`, which
+  is the copy the `claude` and `codex` legs already used.
 - **Enforcement is a consistency check against the tree AND the commits.**
   `fence_reconcile <wt> <asserted>` runs before any role in
   `run`/`check`/`loop`/`rebase`/`land`, and again inside `run_role` for any
@@ -321,15 +349,37 @@ Semantics:
 
   The tree alone is not enough, because a tree can be re-fenced after the fact.
   `fence_reconcile_history <wt> <base> <asserted>` therefore judges what the
-  branch's **commits** touch — `git diff --no-renames --name-only <loombase>
-  HEAD`, a rename counted on both sides — against the full `[fence]` minus the
+  branch's **commits** touch — `git diff --no-renames --name-only <base> HEAD`,
+  a rename counted on both sides — against the full `[fence]` minus the
   asserted release, wherever history is handed to a role or to the operator:
   `aw check` before the patch is written, each round of `aw loop`, `aw diff`,
   `aw rebase`, and `aw land`. With nothing asserted, nothing is released, so
   any fenced path in the history is a dead stop; with no fenced path touched it
   is a no-op.
+- **Two bases, and only one of them is trusted.** `<base>` above is the
+  **security base**: `security_base <br>` = `merge-base($LOOM_BASE_REF, <br>)`,
+  computed in `$ROOT` from refs the operator controls. `$LOOM_BASE_REF` is one
+  name, resolved once (`origin/main` if it exists, else `main`), and it is
+  operator-side by construction — `.agents/loom.env` may not set it, because
+  that file lives in the tree an agent writes and is `.`-sourced; a value there
+  is restored to the operator's and warned about. This replaced
+  `branch.agent/<task>.loombase`, which is branch config in the shared
+  `.git/config`: one `git config` set it to the branch's own tip and every
+  history diff above went empty, and one unresolvable sha made `history_paths`
+  answer "no paths" — a fail-open on exactly the input an agent controls. Not
+  knowing a base is now a refusal in every direction: unresolvable base,
+  unresolvable rev, failed diff, no common ancestor.
+
+  The loombase survives as the **review base** only — the patch `aw check` and
+  `aw diff` write, where hiding the plan/task commit is a courtesy to the
+  reader — and it is clamped: it must be an ancestor of the branch, and equal
+  to or an ancestor of the security base. Otherwise the review patch is cut
+  from the security base too, loudly, because an agent must not be able to
+  shrink what the reviewer sees. `aw rebase`'s re-point onto a replayed base
+  sits ahead of the merge-base and therefore trips the clamp by design; `aw`
+  cannot distinguish it from a commit being hidden, and says so.
 - **Landing inspects what it is about to publish.** Before it merges and before
-  it pushes, `aw land` maps every path in `<loombase>..agent/<task>` through
+  it pushes, `aw land` maps every path in `<security base>..agent/<task>` through
   `zone_of` and the asserted profile's release list: a fenced path the profile
   does not release, or ANY `[hand]` path it does not release, refuses the
   landing by name. The guard is supposed to have stopped these, but the guard

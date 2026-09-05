@@ -11,6 +11,10 @@ is a confirmation, and it is written up that way below.
 They are written down here so that the fence-profile work is not mistaken for
 closing them, and so they are not re-discovered from scratch.
 
+Gap 5 is different in kind: it is **closed**, and it is written down because
+the closure has a cost you should know about and a residual that is worth
+naming.
+
 Every gap carries a `bin/aw:<line>` anchor as of this commit. Line numbers
 drift; the quoted text is the durable handle, so grep for it.
 
@@ -77,6 +81,21 @@ present in every agent worktree.
 it is a tracked file (so the change shows up in the diff you review), and an
 agent that can write files in your checkout has other options.
 
+**Two variables are already carved out of it**, because for those the file is
+not merely a risk, it is a bypass:
+
+- `LOOM_BASE_REF` — the ref every security base is measured from. Snapshotted
+  before the file is sourced and restored after, with a warning naming the
+  value that was ignored. A `loom.env` that set it to the branch's own tip
+  would make every history check answer "this branch touches nothing".
+- `WT_ROOT_PROFILED` — where a profiled worktree's released paths land. It is
+  derived from the normalised `$LOOM_WORKTREES` and a preset that differs is a
+  refusal; `loom.env` may still set `LOOM_WORKTREES` itself, which moves both
+  roots together and keeps them siblings.
+
+Neither carve-out fixes the gap. Anything else in that file still runs as
+shell, in your environment.
+
 **Suggested fix.** Parse it instead of sourcing it: read `KEY=VALUE` lines,
 reject anything else, and `export` the pairs. Losing shell syntax there costs
 the `${VAR:-default}` idiom the README documents, so either the parser handles
@@ -131,3 +150,49 @@ editor tool given a relative path). The gate then fails for want of any edit,
 and `aw` burns every attempt. If that appears: add the minimum extra entry
 opencode's parser needs (its *parent*, i.e. the worktree root of THAT task's
 kind) rather than reverting to `$WT_ROOT`, and record here which one it was.
+
+---
+
+## 5. opencode's project config — CLOSED, with a cost and a residual
+
+**Status: fixed on this branch.** Recorded here because the fix changes what
+opencode reads, and because the residual is not zero.
+
+**What it was.** opencode resolves its project config from the current working
+directory, which for every opencode role is the agent's own worktree:
+`<worktree>/opencode.json` and `<worktree>/.opencode/opencode.json`, both
+tracked files the agent can rewrite mid-run. That file carries
+`provider.<name>.options.baseURL` — the provider *identity* that a fence
+profile's `providers` list is built on — and the agent definitions that supply
+each role's prompt. An agent could therefore answer as `deepseek` from a host
+of its choosing, or hand itself a different role prompt, and nothing in `aw`
+would see a change: `aw` checks the model TOKEN against the profile, and the
+token would still say `deepseek/deepseek-v4-pro`.
+
+**What closes it.** opencode 1.x has two environment knobs, and both are
+needed (verified against the installed 1.18 binary, whose config loader merges
+`OPENCODE_CONFIG` *before* the project files — so that variable alone leaves
+the worktree's copy winning key by key):
+
+```sh
+OPENCODE_CONFIG=$ROOT/.opencode/opencode.json
+OPENCODE_DISABLE_PROJECT_CONFIG=1
+```
+
+`run_headless`'s opencode leg sets both when the operator's copy exists. A
+caller that sets `OPENCODE_CONFIG` itself wins untouched, the same rule
+`OPENCODE_PERMISSION` already had.
+
+**The cost.** With the project config off, opencode no longer reads the
+worktree's `AGENTS.md`/`CLAUDE.md`, the worktree's `.opencode/` directory, or a
+project-local plugin. Role prompts now come from `$ROOT/.opencode/prompts/`
+(via `{file:./prompts/…}` in the operator's config) — which is the copy the
+`claude` and `codex` legs already used, so this makes the three legs agree
+rather than diverge. If a repo's opencode roles depended on `AGENTS.md`
+reaching the model, that content has to move into the role prompt.
+
+**The residual.** `$ROOT/.opencode/opencode.json` is a file in *your* checkout.
+Nothing an agent runs touches your checkout — except `aw plan`'s architect,
+which is gap 2 above, and anything that gets to `.agents/loom.env`, which is
+gap 3. Closing this one does not close those, and the same file is the reason
+they matter slightly more than they did.
