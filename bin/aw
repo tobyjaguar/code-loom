@@ -1069,13 +1069,25 @@ paths '$flag' releases — a profile cannot be introduced after 'aw new'. Start 
 # reason about later — released paths on disk with no record of why. `aw new`
 # therefore records first and checks out second, and unwinds the whole thing if
 # anything in between fails or the operator interrupts it.
+#
+# $NEW_BR is set ONLY once `git worktree add -b` has actually created the
+# branch. It used to be set before the add, so an add that failed because
+# agent/<task> already existed ran this trap and deleted the PRE-EXISTING
+# branch — the work of an `aw drop --keep-branch`, gone, with the deletion
+# silenced by >/dev/null. `aw new` now refuses an existing branch up front, and
+# what this trap deletes it says out loud.
 NEW_WT=""; NEW_BR=""
 new_abort() {
-  [ -n "$NEW_WT" ] || return 0
-  echo "aw: aborting — removing the half-built worktree $NEW_WT" >&2
-  git worktree remove --force "$NEW_WT" >/dev/null 2>&1 || true
-  git worktree prune >/dev/null 2>&1 || true
-  [ -n "$NEW_BR" ] && git branch -D "$NEW_BR" >/dev/null 2>&1 || true
+  [ -n "$NEW_WT$NEW_BR" ] || return 0
+  [ -n "$NEW_WT" ] && {
+    echo "aw: aborting — removing the half-built worktree $NEW_WT" >&2
+    git worktree remove --force "$NEW_WT" >/dev/null 2>&1 || true
+    git worktree prune >/dev/null 2>&1 || true
+  }
+  if [ -n "$NEW_BR" ]; then
+    echo "aw: aborting — deleting the branch this command created: $NEW_BR" >&2
+    git branch -D "$NEW_BR" >&2 || true
+  fi
   NEW_WT=""; NEW_BR=""
 }
 
@@ -1091,8 +1103,21 @@ cmd_new() {
   done
   [ -n "$task" ] || die "usage: aw new <task-id> [--fence-profile <name>]"
   local wt br
+  # wt_path follows $FLAG_PROFILE, so this is the profiled root when a profile
+  # was asserted and the unprofiled one otherwise. Set it before either check.
+  FLAG_PROFILE="$prof"
   wt="$(wt_path "$task")"; br="$(branch_of "$task")"
   [ -d "$wt" ] && die "worktree already exists: $wt"
+  refuse_cross_root "$task"
+  # An existing branch is a refusal, never something to walk over. `aw drop
+  # <task> --keep-branch` leaves exactly this state on purpose, and the old
+  # code set $NEW_BR before the add, so the EXIT trap deleted that branch —
+  # and its commits — when the add failed. Checked before anything is created
+  # or any trap is armed.
+  git show-ref --verify --quiet "refs/heads/$br" && die "branch $br already exists — \
+aw drop $task first.
+(If you used 'aw drop $task --keep-branch', that branch is holding work: land it
+or delete it deliberately with 'git branch -D $br' before reusing the task id.)"
   [ -f "$AGENTS_DIR/tasks/$task.md" ] || die "no task file: .agents/tasks/$task.md"
   # The task file's declaration is intent, the flag is consent. A declaration
   # alone never opts a task in: the file is written by whoever wrote the task.
@@ -1113,12 +1138,15 @@ fenced paths into this worktree. Confirm it on the command line:
     echo "aw: fence profile '$prof' — released into this worktree: $FENCE_RELEASED" >&2
   fi
   mkdir -p "$(dirname "$wt")"
-  NEW_WT="$wt"; NEW_BR="$br"
+  NEW_WT="$wt"
   trap 'new_abort' EXIT
   trap 'new_abort; exit 130' INT TERM
   # --no-checkout first: the branch config is written while the tree is still
   # empty, so an interrupt can never leave released content without a record.
   git worktree add --no-checkout -b "$br" "$wt" HEAD >&2
+  # Only NOW does this command own the branch, and only now may the trap delete
+  # it. Anything above this line failed without creating a branch.
+  NEW_BR="$br"
   git config "branch.$br.loombase" "$(git rev-parse HEAD)"
   [ -n "$prof" ] && git config "branch.$br.fenceprofile" "$prof"
   if has_fence; then
