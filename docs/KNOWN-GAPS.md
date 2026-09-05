@@ -23,8 +23,8 @@ drift; the quoted text is the durable handle, so grep for it.
 ## 1. `aw guard` reads the agent's own copy of `zones.toml`
 
 **Where.** `bin/aw:59` (`ROOT="$(git rev-parse --show-toplevel …)"`) and
-`bin/aw:63` (`AGENTS_DIR="$ROOT/.agents"`); the reader is `cmd_guard`,
-`bin/aw:1020`. `cmd_guard` runs as a pre-commit hook inside
+`bin/aw:65` (`AGENTS_DIR="$ROOT/.agents"`); the reader is `cmd_guard`,
+`bin/aw:1303`. `cmd_guard` runs as a pre-commit hook inside
 the agent's worktree, so `$ROOT` is that worktree and every zone lookup reads
 `<worktree>/.agents/zones.toml` — a file the agent can edit.
 
@@ -44,7 +44,7 @@ branch would be judged by main's copy, which is arguably the point.
 
 ## 2. `aw plan` runs the architect unfenced, in your own tree
 
-**Where.** `bin/aw:1709`, in `cmd_plan` (`bin/aw:1690`):
+**Where.** `bin/aw:2085`, in `cmd_plan` (`bin/aw:2066`):
 `run_role architect "$ROOT" "$prompt"` (and the
 interactive leg, `claude --append-system-prompt … "$prompt"`, likewise in
 `$ROOT`). The architect's chain at every tier ends in cheap third-party
@@ -66,7 +66,7 @@ say so out loud.
 
 ## 3. `.agents/loom.env` is sourced as shell
 
-**Where.** `bin/aw:84`:
+**Where.** `bin/aw:88`:
 
 ```sh
 if [ -f "$ROOT/.agents/loom.env" ]; then set -a; . "$ROOT/.agents/loom.env"; set +a; fi
@@ -109,7 +109,7 @@ that one form or the README changes with it.
 used to read "granted for the whole worktree root". It is not that any more;
 what is left is a confirmation.
 
-**Where.** `bin/aw:288`, in `run_headless` (`bin/aw:201`), the opencode leg:
+**Where.** `bin/aw:438`, in `run_headless` (`bin/aw:351`), the opencode leg:
 
 ```sh
 perm="$(printf '{"external_directory":{"%s/*":"allow","%s/**":"allow"}}' "$wd" "$wd")"
@@ -179,9 +179,9 @@ OPENCODE_CONFIG=$ROOT/.opencode/opencode.json
 OPENCODE_DISABLE_PROJECT_CONFIG=1
 ```
 
-`run_headless`'s opencode leg sets both when the operator's copy exists. A
-caller that sets `OPENCODE_CONFIG` itself wins untouched, the same rule
-`OPENCODE_PERMISSION` already had.
+`run_headless`'s opencode leg (`bin/aw:466`) sets both when the operator's copy
+exists. A caller that sets `OPENCODE_CONFIG` itself wins untouched, the same
+rule `OPENCODE_PERMISSION` already had.
 
 **The cost.** With the project config off, opencode no longer reads the
 worktree's `AGENTS.md`/`CLAUDE.md`, the worktree's `.opencode/` directory, or a
