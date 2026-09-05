@@ -2,6 +2,9 @@
 
 Plan: .agents/plans/NNNN-slug.md
 Zone: assist | auto
+<!-- Fence-profile: NAME   optional. Uncomment for a task that must read or
+     edit a path in [fence], and only with a profile that names providers
+     you are willing to send it to. See README § Fence profiles. -->
 
 ## Files
 <!-- The ONLY files the implementer may touch. -->

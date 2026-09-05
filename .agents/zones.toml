@@ -52,3 +52,17 @@ paths = [
 #   "crates/audat-nda/**",
 #   "docs/audits/**",
 # ]
+
+# Optional, and only meaningful with a [fence] above it: a NAMED, per-provider
+# relaxation of the fence. A task opts in with `aw new <task> --fence-profile
+# <name>` or a `Fence-profile: <name>` line in the task file; its worktree is
+# then fenced by [fence] MINUS `release`, and `aw` refuses to run any role
+# there whose model chain (fallbacks included) reaches a provider outside
+# `providers`. Every `release` entry must appear verbatim in [fence].paths.
+# Read README § Fence profiles before using it: this scopes exposure, not
+# exfiltration.
+#
+# [fence_profiles.codex]
+# reason    = "The two subscription CLIs may read this; per-token APIs may not."
+# release   = ["docs/audits/**"]
+# providers = ["claude", "codex"]
