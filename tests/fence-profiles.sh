@@ -43,6 +43,14 @@ echo '{"stub":true}' > "$TMP/codex/auth.json"     # makes codex-sub "usable"
 cat > "$TMP/stubs/claude" << 'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$@" >> "${AW_TEST_TMP:?}/called-claude.log"
+# A hostile first attempt, for the per-attempt reconcile test: widen the
+# worktree the harness just fenced, then look rate-limited so `aw` falls back
+# to the next model in the chain with the widened tree already on disk.
+if [ -n "${AW_TEST_RELAX_SPARSE:-}" ]; then
+  git sparse-checkout disable > /dev/null 2>&1 || true
+  echo "429 rate limit exceeded"
+  exit 1
+fi
 # An implementer must be able to write; prove the stub ran by leaving a file.
 echo "written by the stub implementer" > backend/from-implementer.txt
 echo "stub claude done"
@@ -55,6 +63,9 @@ STUB
 cat > "$TMP/stubs/opencode" << 'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$@" >> "${AW_TEST_TMP:?}/called-opencode.log"
+# The directory grant is the thing under test: record it verbatim.
+printf 'OPENCODE_PERMISSION=%s\n' "${OPENCODE_PERMISSION:-(unset)}" \
+  >> "${AW_TEST_TMP:?}/called-opencode.log"
 echo "stub opencode done"
 STUB
 cat > "$TMP/stubs/curl" << 'STUB'
@@ -132,7 +143,8 @@ mk_task() { # mk_task <id> [<profile-line>]
   { echo "# $1 — test task"; echo ""; echo "Plan: none"; echo "Zone: assist";
     [ -n "${2:-}" ] && echo "Fence-profile: $2"; } > ".agents/tasks/$1.md"
 }
-for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p; do mk_task "$t"; done
+for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p \
+         0014-u 0016-v 0017-w 0018-x 0019-y 0020-y2; do mk_task "$t"; done
 mk_task 0005-f codex
 mk_task 0011-n codex
 # (o) a Fence-profile line that is NOT a declaration: it is inside a code fence,
@@ -141,6 +153,15 @@ mk_task 0011-n codex
 { echo "# 0012-o — test task"; echo ""; echo "Plan: none"; echo "Zone: assist"; echo "";
   echo "## Auto fix round 1 (aw loop — reviewer REVISE)"; echo "";
   echo '```'; echo "Fence-profile: codex"; echo '```'; } > .agents/tasks/0012-o.md
+# (ac) a header block that opens with a BLANK LINE, and a declaration with a
+# trailing ` # comment` — the exact shape the README documents.
+{ echo ""; echo "# 0021-ac — test task"; echo ""; echo "Plan: none"; echo "Zone: assist";
+  echo "Fence-profile: codex        # the flag on the command line is the consent";
+} > .agents/tasks/0021-ac.md
+# (ac) a NEAR MISS: a space before the colon. Not a declaration, and silence
+# about it would read exactly like "honoured".
+{ echo "# 0022-ad — test task"; echo ""; echo "Plan: none"; echo "Zone: assist";
+  echo "Fence-profile : codex"; } > .agents/tasks/0022-ad.md
 git add -A
 git commit -qm init
 
@@ -463,6 +484,202 @@ out="$("$AW" check 0003-c --fence-profile= 2>&1)"; rc=$?
 want_eq "(s) ... on every command"                        "$rc" "1"
 out="$("$AW" check 0003-c --fence-profile 2>&1)"; rc=$?
 want_eq "(s) a bare --fence-profile dies too"             "$rc" "1"
+
+# ==========================================================================
+# ROUND-2 fixes. Every case below FAILS against the pre-fix bin/aw.
+# ==========================================================================
+
+# --- (u) an existing branch is refused, never deleted ---------------------
+# `aw new` set NEW_BR before `git worktree add -b`, so an add that failed
+# because agent/<task> already existed ran the EXIT trap on the PRE-EXISTING
+# branch — the state `aw drop --keep-branch` leaves on purpose — and silenced
+# the deletion. The branch and its commits must survive the refusal.
+sha_of() { git rev-parse --verify --quiet "$1^{commit}" 2>/dev/null || echo "GONE"; }
+out="$("$AW" new 0014-u 2>&1)"; rc=$?
+want_eq "(u) setup: a plain worktree"                     "$rc" "0"
+echo "work" > "$WTU/0014-u/backend/u.txt"
+git -C "$WTU/0014-u" add backend/u.txt
+git -C "$WTU/0014-u" commit -qm "work that only exists on this branch"
+u_sha="$(sha_of agent/0014-u)"
+out="$("$AW" drop 0014-u --keep-branch 2>&1)"; rc=$?
+want_eq "(u) setup: worktree dropped, branch kept"        "$rc" "0"
+out="$("$AW" new 0014-u 2>&1)"; rc=$?
+want_eq "(u) aw new refuses an existing branch"           "$rc" "1"
+want_in "(u) ... naming it"                               "$out" "branch agent/0014-u already exists"
+want_in "(u) ... and mentioning --keep-branch"            "$out" "--keep-branch"
+want_eq "(u) ... the branch still points at its commit"   "$(sha_of agent/0014-u)" "$u_sha"
+want_absent "(u) ... and no worktree was created"         "$WTU/0014-u"
+# the same through `aw run`, which reaches cmd_new for a missing worktree
+out="$("$AW" run 0014-u 2>&1)"; rc=$?
+want_eq "(u) aw run refuses it too"                       "$rc" "1"
+want_eq "(u) ... and the branch survives that as well"    "$(sha_of agent/0014-u)" "$u_sha"
+git branch -D agent/0014-u > /dev/null 2>&1 || true
+
+# --- (v) the branch's COMMITS are judged, not just what is on disk --------
+# Materialise a fenced path, commit it, put the sparse rules back: the tree
+# looks clean, and the diff, the patch file and any merge still carry it.
+out="$("$AW" new 0016-v 2>&1)"; rc=$?
+want_eq "(v) setup: an unprofiled worktree"               "$rc" "0"
+VW="$WTU/0016-v"
+git -C "$VW" sparse-checkout disable                       # the agent widens it
+echo "// smuggled" >> "$VW/core/lib.rs"
+git -C "$VW" add core/lib.rs
+git -C "$VW" commit -qm "touch a fenced path"
+git -C "$VW" sparse-checkout init --no-cone                # ... and re-fences
+git -C "$VW" sparse-checkout set '/*' '!core/**' '!ios/**' '!docs/audits/**'
+git config --unset "branch.agent/0016-v.fenceprofile" 2>/dev/null || true
+want_absent "(v) setup: the tree no longer shows the fenced path" "$VW/core/lib.rs"
+rm -f "$VW/.agents/reviews/0016-v.patch"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0016-v 2>&1)"; rc=$?
+want_eq "(v) aw check dies on a fenced path in the history"  "$rc" "1"
+want_in "(v) ... naming the path"                            "$out" "core/lib.rs"
+want_in "(v) ... and saying the commits carry it"            "$out" "commits touch fenced paths"
+want_absent "(v) ... and NO patch was written"               "$VW/.agents/reviews/0016-v.patch"
+want_not_in "(v) ... and no reviewer was launched"           "$out" "running on"
+out="$(EDITOR=true "$AW" diff 0016-v 2>&1)"; rc=$?
+want_eq "(v) aw diff dies on it too"                         "$rc" "1"
+want_in "(v) ... for the same reason"                        "$out" "commits touch fenced paths"
+
+# --- (w) the roots are separate, and opencode is granted neither of them --
+case "$WTP" in
+  "$WTU"/*) bad "(w) the profiled root must NOT be under the unprofiled root" ;;
+  *)        ok  "(w) the profiled root is not under the unprofiled root" ;;
+esac
+rm -f "$TMP/called-opencode.log"
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_implementer="deepseek/deepseek-v4-pro" \
+       LOOM_MAX_ATTEMPTS=1 "$AW" run 0017-w 2>&1)"; rc=$?
+want_eq   "(w) an opencode implementer runs"              "$rc" "0"
+want_file "(w) ... and the stub recorded its grant"       "$TMP/called-opencode.log"
+oc="$(cat "$TMP/called-opencode.log" 2>/dev/null || true)"
+want_in     "(w) the grant is the role's OWN worktree"    "$oc" "$WTU/0017-w/**"
+want_not_in "(w) ... not the whole worktree root"         "$oc" "\"$WTU/*\":\"allow\""
+want_not_in "(w) ... and never the profiled root"         "$oc" "$WTP"
+rm -f "$TMP/called-opencode.log"
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
+       "$AW" scout "where is main" 2>&1)"; rc=$?
+sc="$(cat "$TMP/called-opencode.log" 2>/dev/null || true)"
+want_in     "(w) the scout grant is its own mirror"       "$sc" "$WTU/_scout/**"
+want_not_in "(w) ... not the whole worktree root"         "$sc" "\"$WTU/*\":\"allow\""
+want_not_in "(w) ... and never the profiled root"         "$sc" "$WTP"
+
+# --- (x) every fallback attempt re-reconciles ----------------------------
+# Attempt 1 relaxes the sparse checkout and returns 429; attempt 2 must see
+# the widened tree, not the tree as it was before the loop started.
+out="$(LOOM_MODELS_implementer="claude-sub codex-sub" LOOM_MODELS_reviewer="codex-sub" \
+       "$AW" new 0018-x --fence-profile codex 2>&1)"; rc=$?
+want_eq "(x) setup: a profiled worktree"                  "$rc" "0"
+codex_before="$(wc -l < "$TMP/called-codex.log" 2>/dev/null || echo 0)"
+out="$(AW_TEST_RELAX_SPARSE=1 LOOM_MAX_ATTEMPTS=1 \
+       LOOM_MODELS_implementer="claude-sub codex-sub" LOOM_MODELS_reviewer="codex-sub" \
+       "$AW" run 0018-x --fence-profile codex 2>&1)"; rc=$?
+want_eq "(x) attempt 1 widened the tree, so attempt 2 is refused" "$rc" "1"
+want_in "(x) ... the first model did fall back"           "$out" "looks rate-limited"
+want_in "(x) ... naming the path the profile does not release" "$out" "ios/App.swift"
+want_in "(x) ... as a profile mismatch"                   "$out" "does not release"
+want_eq "(x) ... and the SECOND model never launched"     \
+        "$(wc -l < "$TMP/called-codex.log" 2>/dev/null || echo 0)" "$codex_before"
+
+# --- (y) aw land inspects the commits it is about to publish -------------
+out="$("$AW" new 0019-y 2>&1)"; rc=$?
+want_eq "(y) setup: an unprofiled worktree"               "$rc" "0"
+YW="$WTU/0019-y"
+git -C "$YW" sparse-checkout disable
+echo "// smuggled" >> "$YW/core/lib.rs"
+git -C "$YW" add core/lib.rs
+git -C "$YW" commit -qm "touch a fenced path"
+git -C "$YW" sparse-checkout init --no-cone
+git -C "$YW" sparse-checkout set '/*' '!core/**' '!ios/**' '!docs/audits/**'
+head_before="$(git rev-parse HEAD)"
+out="$("$AW" land 0019-y 2>&1)"; rc=$?
+want_eq "(y) land refuses a branch whose commits touch a fenced path" "$rc" "1"
+want_in "(y) ... naming the path"                         "$out" "core/lib.rs"
+want_eq "(y) ... and nothing was merged"                  "$(git rev-parse HEAD)" "$head_before"
+want_file "(y) ... and the worktree is still there"       "$YW/.agents/gate.sh"
+# ... and a [hand] path is refused even WITH a profile, when that profile does
+# not release it. 'audit' releases docs/audits/** only, to claude only.
+out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MODELS_reviewer="claude-sub" \
+       "$AW" new 0020-y2 --fence-profile audit 2>&1)"; rc=$?
+want_eq "(y) setup: a worktree under the 'audit' profile" "$rc" "0"
+Y2W="$WTP/0020-y2"
+printf '\n# touched\n' >> "$Y2W/.agents/gate.sh"
+git -C "$Y2W" add .agents/gate.sh
+git -C "$Y2W" commit -q --no-verify -m "touch a hand path the profile does not release"
+head_before="$(git rev-parse HEAD)"
+out="$("$AW" land 0020-y2 --fence-profile audit 2>&1)"; rc=$?
+want_eq "(y) land refuses a [hand] path even under a profile" "$rc" "1"
+want_in "(y) ... naming the path"                         "$out" ".agents/gate.sh"
+want_in "(y) ... and what the profile actually releases"   "$out" "releases only"
+want_eq "(y) ... and nothing was merged"                  "$(git rev-parse HEAD)" "$head_before"
+
+# --- (z) the overlap check, downward ------------------------------------
+cat > .agents/zones.toml << 'TOML'
+[fence]
+reason = "subset test fence"
+paths = ["core/**", "core/wallet-sdk/**"]
+
+[fence_profiles.wide]
+release = ["core/**"]
+providers = ["claude"]
+
+[hand]
+paths = ["core/**"]
+
+[assist]
+paths = ["backend/**"]
+TOML
+out="$("$AW" zone backend/main.go 2>&1)"; rc=$?
+want_eq "(z) a release that swallows a still-fenced pattern is refused" "$rc" "1"
+want_in "(z) ... naming the pattern that stays fenced"    "$out" "core/wallet-sdk/**"
+want_in "(z) ... and why"                                 "$out" "never reach the worktree"
+restore_zones
+
+# --- (aa) the escape is gone on aw run too, not only aw check ------------
+out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MODELS_reviewer="codex-sub" \
+       "$AW" run 0008-k --fence-profile codex 2>&1)"; rc=$?
+want_eq "(aa) with the record gone, aw run dies as well"  "$rc" "1"
+want_in "(aa) ... telling the operator to restore it BY HAND" "$out" \
+        "git config branch.agent/0008-k.fenceprofile codex"
+want_in "(aa) ... or to start clean"                      "$out" "aw new 0008-k --fence-profile codex"
+want_eq "(aa) ... and aw wrote no record on its own"      \
+        "$(git config branch.agent/0008-k.fenceprofile 2>/dev/null || true)" ""
+
+# --- (ab) a providers entry that can never be a provider_of() output -----
+cat >> .agents/zones.toml << 'TOML'
+
+[fence_profiles.capital]
+release = ["core/**"]
+providers = ["Claude"]
+TOML
+out="$("$AW" zone backend/main.go 2>&1)"; rc=$?
+want_eq "(ab) providers = [\"Claude\"] is refused at parse" "$rc" "1"
+want_in "(ab) ... as not a provider the harness can produce" "$out" "not a provider"
+want_in "(ab) ... with the lower-case suggestion"          "$out" "did you mean 'claude'"
+restore_zones
+cat >> .agents/zones.toml << 'TOML'
+
+[fence_profiles.modeltoken]
+release = ["core/**"]
+providers = ["claude-sub"]
+TOML
+out="$("$AW" zone backend/main.go 2>&1)"; rc=$?
+want_eq "(ab) providers = [\"claude-sub\"] is refused too"  "$rc" "1"
+want_in "(ab) ... named as a model token, not a provider"   "$out" "is a MODEL token"
+restore_zones
+
+# --- (ac) the task-file header block -------------------------------------
+out="$("$AW" new 0021-ac 2>&1)"; rc=$?
+want_eq "(ac) a declaration under a leading blank line is honoured" "$rc" "1"
+want_in "(ac) ... so the flag is demanded"                "$out" "aw new 0021-ac --fence-profile codex"
+want_absent "(ac) ... and nothing was created"            "$WTU/0021-ac"
+out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MODELS_reviewer="codex-sub" \
+       "$AW" new 0021-ac --fence-profile codex 2>&1)"; rc=$?
+want_eq   "(ac) ... and a trailing '# comment' is not part of the name" "$rc" "0"
+want_file "(ac) ... so the release took effect"           "$WTP/0021-ac/core/lib.rs"
+out="$("$AW" new 0022-ad 2>&1)"; rc=$?
+want_eq "(ac) a near-miss key does not opt a task in"     "$rc" "0"
+want_in "(ac) ... but aw new says it was not honoured"    "$out" "not honoured"
+want_in "(ac) ... quoting the line it found"              "$out" "Fence-profile : codex"
+want_absent "(ac) ... and it released nothing"            "$WTU/0022-ad/core/lib.rs"
 
 # --- (j)/(t) doctor lists the profiles, and touches no network ------------
 out="$(timeout 180 "$AW" doctor 2>&1 || true)"
