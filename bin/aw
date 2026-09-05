@@ -600,6 +600,22 @@ is_released() { # is_released <path>
   profile_releases "$FENCE_PROFILE" "$1"
 }
 
+# 0 = this worktree was BUILT under <profile>: it holds at least one fenced path,
+# and every fenced path it holds is one the profile releases. This is the only
+# evidence that exists. The branch record costs one `git config` from inside the
+# worktree; the tree costs a checkout nobody but `aw new` performs.
+profile_materialised() { # profile_materialised <worktree> <profile>
+  local wt="$1" prof="$2" present p
+  [ -d "$wt" ] || return 1
+  present="$(zones_py fence-present-full "$wt")" || return 1
+  [ -n "$present" ] || return 1
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    profile_releases "$prof" "$p" || return 1
+  done <<< "$present"
+  return 0
+}
+
 # Every model that could run against a profiled worktree must belong to a
 # provider the profile names — the WHOLE chain, not just the first entry: a
 # fallback fires on a rate limit without asking anyone.
@@ -938,9 +954,22 @@ Pass it again — every command needs the operator's consent, not a stored one:
 Use '$rec', or start clean:  aw drop $task && aw new $task --fence-profile $flag"
     fi
     if [ -z "$rec" ] && [ -n "$flag" ]; then
-      die "task $task has no fence-profile record — a profile cannot be introduced
-after 'aw new'. Start clean:
+      # A profile may not be INTRODUCED after `aw new`. The missing record is
+      # the first sign of that — but a missing record is not proof either way
+      # (removing one is a `git config --unset`), so the tree decides: a
+      # worktree that already holds exactly what this profile releases WAS
+      # built under it, and the record was lost. Restore it, loudly. Anything
+      # else is an introduction, and dies.
+      if profile_materialised "$(wt_path "$task")" "$flag"; then
+        echo "aw: WARNING: no fence-profile record for $task, but its worktree holds the" >&2
+        echo "aw: WARNING: paths '$flag' releases and nothing else fenced — the record was" >&2
+        echo "aw: WARNING: removed or lost. Restoring it from your flag; the tree decided." >&2
+        git config "branch.$(branch_of "$task").fenceprofile" "$flag"
+      else
+        die "task $task has no fence-profile record, and its worktree does not hold the
+paths '$flag' releases — a profile cannot be introduced after 'aw new'. Start clean:
   aw drop $task && aw new $task --fence-profile $flag"
+      fi
     fi
   fi
   # No branch yet: nothing to contradict. `aw new` (which run/loop call) applies
