@@ -218,6 +218,74 @@ would make every path resolve to `assist` and `aw guard` exit 0 — the fence
 would quietly disarm the hand-zone boundary — and removing `gate.sh` would make
 the gate exit 127 and burn every retry.
 
+### Fence profiles
+
+The fence answers "may a model read this?" with one bit for all models. The
+question is usually finer: a custody core can be fine for the two subscription
+CLIs whose vendors already hold the rest of the repo, and not fine for a
+per-token API in a third jurisdiction. A **fence profile** is a named, opt-in,
+per-provider relaxation of the fence. Schema, in full:
+
+```toml
+[fence]
+reason = "..."
+paths  = ["core/**", "ios/**", "spike/**", "docs/audits/**"]
+
+# zero or more profiles; the name is the opt-in token
+[fence_profiles.codex]
+reason    = "Anthropic + OpenAI may read and edit the custody core."   # optional
+release   = ["core/**", "docs/audits/**"]   # REQUIRED. Each entry must appear
+                                            # verbatim in [fence].paths.
+providers = ["claude", "codex"]             # REQUIRED. provider_of() values:
+                                            # claude, codex, zai-coding-plan,
+                                            # deepseek, moonshotai, ...
+```
+
+Semantics:
+
+- **Effective fence** = `[fence].paths` minus the active profile's `release`.
+  Every fence operation — the sparse checkout at `aw new`, the re-apply and
+  verify on `aw run`, `aw zone`'s fencing report — answers with that set. With
+  no profile active (the default, and every existing repo) it is the whole
+  fence, unchanged.
+- **Provider rule.** Before a worktree is created, and again before each role
+  runs, `aw` walks the *entire* model chain of every role that will run there
+  (implementer, reviewer, and the auto-fix rounds through the implementer) and
+  dies unless `provider_of(model)` is in `providers` for all of them. Chains,
+  not first entries: a fallback fires on a rate limit without asking. The scout
+  is exempt because it is never given a profiled tree — its mirror is shared by
+  every task and always carries the full fence.
+- **Opt-in, recorded on the branch.** `aw new <task> --fence-profile <name>` or
+  a `Fence-profile: <name>` line in the task file (parsed like `Zone:`), stored
+  as `branch.agent/<task>.fenceprofile`, the same durable place as the diff
+  base. Later commands read the branch, not the file, so a task file edited
+  mid-flight cannot silently re-fence a tree an agent has already worked in;
+  the mismatch is refused instead.
+- **The guard follows.** Fenced paths are conventionally duplicated into
+  `[hand]` so that a *commit* to them is blocked even where the fence is not
+  applied. Under a profile, `aw guard` accepts exactly the released patterns
+  and keeps blocking the rest of `[hand]`. The reviewer prompt is told the same
+  fact, so a released path is not reported as an unauthorized change.
+- **Fail-closed parsing.** Unknown profile name, unknown key in the table, a
+  `release` entry that is not a `[fence]` pattern, a missing or empty list,
+  a `[fence_profiles]` that is not a table — each one dies, in every mode,
+  before any answer is given. `AW_FENCE_PROFILE` from the environment is
+  ignored and cleared at startup: a profile is a property of a task branch, not
+  of whoever exported a variable.
+- **Write permissions are per ROLE.** `codex exec` runs `--sandbox read-only`
+  for a reviewer and `--sandbox workspace-write --add-dir <wt>/.agents` for an
+  implementer (its sandbox otherwise keeps the worktree's dot-directories
+  read-only, which blocks the done/blocked notes). `claude -p` gets
+  `--permission-mode acceptEdits` plus a gate-script allowlist for an
+  implementer, and nothing for a reviewer — an unmodified `-p` run denies every
+  permission prompt, which is exactly the read-only behaviour a reviewer wants.
+
+The caveats of § 5 all still apply, caveat 1 above all: the object store is
+shared, so a profile scopes **exposure**, not exfiltration. What it buys is
+that the exposure is now a written, checked, reviewable decision — which
+provider may see which subsystem — instead of an all-or-nothing switch that
+pushes you into doing the work by hand.
+
 ---
 
 ## 6. Lockout avoidance, concretely

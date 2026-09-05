@@ -38,7 +38,8 @@ bin/loom-session           tmux layout, works with plain vim
 .agents/
   gate.sh                  fmt / clippy / test. The deterministic reviewer.
                            A `gate:` target in your Makefile wins over auto-detection.
-  zones.toml               hand / assist / auto, plus optional [fence].
+  zones.toml               hand / assist / auto, plus optional [fence]
+                           and [fence_profiles] (per-provider relaxations).
                            Enforced by pre-commit hook (hand) and sparse
                            checkout (fence).
   PLAN_TEMPLATE.md  TASK_TEMPLATE.md
@@ -166,6 +167,9 @@ in `.agents/reviews/<task>-review.md` — the run transcript is kept just long
 enough to spot a rate limit, which falls through to the next model in the chain
 like any other provider. `LOOM_SKIP="codex"` takes it out.
 
+Codex can also be the *implementer* — a writable sandbox, granted per role, not
+per model. See "Fence profiles" below: that is where it earns its keep.
+
 Any role's chain can be replaced from the environment, without editing `aw`:
 
 ```sh
@@ -231,6 +235,116 @@ Read the honest limits in `ARCHITECTURE.md` § 5 before relying on it — in
 particular, a fenced path the build needs will break the build in the worktree.
 `aw zone <path>` reports fencing, and `aw doctor` warns about fence patterns
 that match no tracked file.
+
+#### Fence profiles
+
+The fence is provider-agnostic: it hides a path from *every* agent. That is one
+decision too coarse when the reason for fencing is "not this provider" rather
+than "not any model" — a custody core you are happy to hand to the two
+subscription CLIs you already trust with the rest of the repo, and unwilling to
+send to a third-party API. A **fence profile** is a named, per-provider
+relaxation of the fence:
+
+```toml
+[fence]
+paths = ["core/**", "ios/**", "spike/**", "docs/audits/**"]
+
+[fence_profiles.codex]
+reason    = "Anthropic + OpenAI may read and edit the custody core."
+release   = ["core/**", "docs/audits/**"]   # must be [fence].paths, verbatim
+providers = ["claude", "codex"]             # provider_of(), not model IDs
+```
+
+A task that opts into `codex` gets a worktree fenced by `[fence]` **minus**
+`release` — `core/**` and `docs/audits/**` are there, `ios/**` and `spike/**`
+are still gone. Everything else behaves exactly as it does today: a task with
+no profile is fenced by the whole `[fence]`, byte for byte as before.
+
+**The rule is fail-closed.** Before the worktree is created, `aw` checks every
+model in every chain that will run against it — implementer, reviewer, and the
+auto-fix rounds of `aw loop`, fallbacks included, because a fallback fires on a
+rate limit without asking anyone. One model outside `providers` and it dies,
+naming the role and the override that fixes it:
+
+```
+$ aw new 0007-c --fence-profile codex
+aw: fence profile 'codex' releases fenced paths into this worktree,
+but the implementer chain would run 'zai-coding-plan/glm-5.3' (provider 'zai-coding-plan').
+The profile allows only: claude codex
+Restrict the chain for this task, e.g.:
+  LOOM_MODELS_implementer="claude-sub codex-sub" aw ...
+```
+
+An unknown profile name, a `release` pattern that is not in `[fence].paths`, a
+missing `providers` list — all of them die, in every command, the way a
+malformed `zones.toml` already does. The scout is never covered by a profile:
+its mirror is shared by every task, so it always runs at the full fence.
+
+**Two ways to opt in**, both recorded on the task branch
+(`git config branch.agent/<task>.fenceprofile`, the same pattern as the diff
+base) so `run`, `check`, `loop`, `rebase`, `land`, `ls` and the commit guard
+all agree afterwards:
+
+```sh
+aw new 0007-c --fence-profile codex     # on the command line
+```
+```markdown
+Zone: assist
+Fence-profile: codex                     # or a line in the task file
+```
+
+Editing the task file after `aw new` does not change the worktree's fence —
+`aw` refuses the mismatch and tells you to `aw drop` and re-create, rather than
+re-fencing a tree an agent already worked in.
+
+**The commit guard follows the profile.** Fenced paths are conventionally
+listed under `[hand]` too (that is what blocks a *commit* to them); under a
+profile the guard accepts commits to exactly the released patterns and still
+blocks everything else in `[hand]` — `.agents/zones.toml`, migrations, whatever
+your repo lists. The reviewer is told the same thing, so a released path does
+not come back as an "unauthorized hand/fence change" REVISE.
+
+**Codex as an implementer.** `codex-sub` is a reviewer by default. Under a
+profile it is also the obvious *implementer*, so `aw` gives implementer-class
+roles (`implementer`, and the auto-fix rounds that go through it) a writable
+sandbox and leaves reviewer and scout read-only:
+
+| role | codex-sub | claude-sub |
+|---|---|---|
+| implementer | `codex exec --sandbox workspace-write --add-dir <wt>/.agents` | `claude -p --permission-mode acceptEdits --allowedTools 'Bash(./.agents/gate.sh…)'` |
+| reviewer / scout | `codex exec --sandbox read-only` | `claude -p` (no mode flag: every prompt is denied) |
+
+Two measured details behind that table. codex's `workspace-write` keeps the
+workspace's dot-directories read-only, so without `--add-dir` the implementer
+cannot write its `.agents/reviews/<task>-done.md` (or a `-blocked.md`) —
+`--add-dir` re-opens exactly that directory, inside the worktree. And
+`claude -p` has nobody to answer a permission prompt, so `acceptEdits`
+pre-approves the file edits but a Bash call is still denied: the gate is
+allowlisted by name. Widen it deliberately for a repo whose implementer needs
+more shell:
+
+```sh
+export LOOM_CLAUDE_ALLOWED_TOOLS='Bash(./.agents/gate.sh:*),Bash(cargo test:*)'
+```
+
+**If Codex refuses the task, run the same profile on Anthropic.** Codex has
+declined security-remediation prompts; the profile allows both providers
+precisely so that is a one-line retry, not a dead end:
+
+```sh
+LOOM_MODELS_implementer=claude-sub aw run 0007-c
+```
+
+**What a profile is not.** It scopes *exposure*, it does not prevent
+exfiltration: the git object store is shared with every worktree, so a
+determined agent can still reach a fenced blob through git plumbing
+(`ARCHITECTURE.md` § 5, caveat 1). A profile only changes which files an agent
+finds in front of it, and which providers are allowed to be that agent. If your
+threat model includes a model actively working around the rule, you need a
+separate repository, not a profile.
+
+`aw doctor` lists every profile, what it releases, to whom, and warns when a
+role's default chain could not run under it.
 
 ## Editors
 
