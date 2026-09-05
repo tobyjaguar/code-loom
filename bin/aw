@@ -59,30 +59,16 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
   echo "aw: not inside a git repository" >&2; exit 1; }
 cd "$ROOT"
+# The repo's PHYSICAL path, for comparing against the worktree roots below.
+ROOT_REAL="$(pwd -P)"
 
 AGENTS_DIR="$ROOT/.agents"
 PROMPTS_DIR="$ROOT/.opencode/prompts"
-WT_ROOT="${LOOM_WORKTREES:-$(dirname "$ROOT")/.loom-worktrees/$(basename "$ROOT")}"
-# Trailing slashes are stripped before anything is derived from this. With
-# LOOM_WORKTREES=/x/wt/ the profiled root below would otherwise be
-# "/x/wt/-profiled" — a CHILD of the unprofiled root, which is the one thing it
-# must never be.
-while :; do
-  case "$WT_ROOT" in
-    /|"") break ;;
-    */)   WT_ROOT="${WT_ROOT%/}" ;;
-    *)    break ;;
-  esac
-done
-# (die() is defined further down; this runs before it exists.)
-[ -n "$WT_ROOT" ] || { echo "aw: LOOM_WORKTREES is empty" >&2; exit 1; }
-# A task under a fence profile holds paths the fence normally removes, so its
-# worktree lives under a SEPARATE root. Nothing that runs unprofiled — no
-# unprofiled role, and not the shared `_scout` mirror, which stays under
-# $WT_ROOT — is ever handed a directory that CONTAINS a profiled worktree.
-# Derived from $WT_ROOT so LOOM_WORKTREES stays the one knob, and deliberately
-# a sibling, not a child: "$WT_ROOT-profiled" is not under "$WT_ROOT/".
-WT_ROOT_PROFILED="${WT_ROOT}-profiled"
+# The two worktree roots are derived and VERIFIED further down, after
+# .agents/loom.env has been sourced (it may set LOOM_WORKTREES) and after die()
+# exists. Anything preset in the environment for WT_ROOT_PROFILED is captured
+# here, before a single path is derived from it.
+WT_ROOT_PRESET="${WT_ROOT_PROFILED:-}"
 TIER="${LOOM_TIER:-standard}"
 MAX_ATTEMPTS="${LOOM_MAX_ATTEMPTS:-3}"
 SKIP="${LOOM_SKIP:-}"
@@ -106,6 +92,118 @@ fi
 
 die()  { echo "aw: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# ------------------------------------------------------------ worktree roots
+# Two roots, and `aw` must be able to say where each one physically IS before
+# it puts anything in them. A task under a fence profile holds paths the fence
+# normally removes, so its worktree lives under a SEPARATE root: nothing that
+# runs unprofiled — no unprofiled role, and not the shared `_scout` mirror,
+# which stays under $WT_ROOT — is ever handed a directory that CONTAINS a
+# profiled worktree.
+#
+# The profiled root is DERIVED, never taken: "$WT_ROOT-profiled", from the
+# normalised $WT_ROOT and nothing else, so LOOM_WORKTREES stays the one knob
+# and a preset WT_ROOT_PROFILED cannot aim released content somewhere else. It
+# is deliberately a SIBLING, not a child ("$WT_ROOT-profiled" is not under
+# "$WT_ROOT/"), which is why the normalisation below strips both "/" and "/."
+# — with LOOM_WORKTREES=/x/wt/ or /x/wt/. the naive concatenation would produce
+# "/x/wt/-profiled" or "/x/wt/.-profiled", both CHILDREN of the unprofiled root.
+#
+# Then each root is resolved with `pwd -P` and refused if the resolved path is
+# not the literal one. A root that is a symlink is not the directory the
+# operator named: an agent that plants "$WT_ROOT-profiled -> $WT_ROOT/T5" would
+# otherwise have every released path checked out inside a directory an
+# unprofiled run is pointed at.
+resolve_root() { # resolve_root <literal-dir>  -> its physical path
+  local lit="$1" parent base real want
+  mkdir -p "$lit" 2>/dev/null \
+    || die "cannot create the worktree root $lit — check LOOM_WORKTREES"
+  # The PARENT chain is resolved (a repo under a symlinked /tmp is ordinary and
+  # not an attack); the final component is then required to be a real directory
+  # with the name the operator asked for.
+  parent="$(cd "$(dirname "$lit")" 2>/dev/null && pwd -P)" \
+    || die "cannot resolve the parent of the worktree root $lit"
+  base="$(basename "$lit")"
+  case "$parent" in /) want="/$base" ;; *) want="$parent/$base" ;; esac
+  real="$(cd "$lit" 2>/dev/null && pwd -P)" || die "cannot resolve the worktree root $lit"
+  [ "$real" = "$want" ] || die "worktree root $lit resolves to $real, which is not
+where its name says it is. Something replaced it with a symlink; inspect it, do
+not re-run."
+  printf '%s\n' "$real"
+}
+
+WT_ROOT="${LOOM_WORKTREES:-$(dirname "$ROOT")/.loom-worktrees/$(basename "$ROOT")}"
+case "$WT_ROOT" in /*) ;; *) die "LOOM_WORKTREES must be an absolute path (got '$WT_ROOT')" ;; esac
+while :; do
+  case "$WT_ROOT" in
+    /|"") break ;;
+    */)   WT_ROOT="${WT_ROOT%/}" ;;
+    */.)  WT_ROOT="${WT_ROOT%/.}" ;;
+    *)    break ;;
+  esac
+done
+[ -n "$WT_ROOT" ] && [ "$WT_ROOT" != / ] \
+  || die "LOOM_WORKTREES normalises to '$WT_ROOT', which is not a usable worktree root"
+WT_ROOT="$(resolve_root "$WT_ROOT")"
+WT_ROOT_PROFILED="${WT_ROOT}-profiled"
+if [ -n "$WT_ROOT_PRESET" ] && [ "$WT_ROOT_PRESET" != "$WT_ROOT_PROFILED" ]; then
+  die "WT_ROOT_PROFILED is preset to '$WT_ROOT_PRESET', but it is DERIVED from
+LOOM_WORKTREES and must be '$WT_ROOT_PROFILED'. A profiled worktree holds paths
+the fence normally removes; where it lands is not something the environment or
+.agents/loom.env gets to redirect. Unset it, or set LOOM_WORKTREES instead."
+fi
+WT_ROOT_PROFILED="$(resolve_root "$WT_ROOT_PROFILED")"
+# Neither root may contain the other, and neither may sit inside the repo: a
+# released path under $ROOT is in YOUR checkout, and a profiled worktree under
+# $WT_ROOT is exactly what the split root exists to prevent.
+case "$WT_ROOT_PROFILED" in
+  "$WT_ROOT"|"$WT_ROOT"/*) die "the profiled worktree root $WT_ROOT_PROFILED is inside $WT_ROOT" ;;
+esac
+case "$WT_ROOT" in
+  "$WT_ROOT_PROFILED"|"$WT_ROOT_PROFILED"/*) die "the worktree root $WT_ROOT is inside $WT_ROOT_PROFILED" ;;
+esac
+for _r in "$WT_ROOT" "$WT_ROOT_PROFILED"; do
+  case "$_r" in
+    "$ROOT_REAL"|"$ROOT_REAL"/*) die "worktree root $_r is inside the repository $ROOT_REAL — \
+agent worktrees must live outside your checkout (set LOOM_WORKTREES)" ;;
+  esac
+done
+unset _r
+
+# Every `git worktree add` in this file is bracketed by these two. The roots
+# were verified at startup, but a directory is not a promise: the parent of the
+# path about to be created is re-resolved immediately before the add, and the
+# created worktree immediately after.
+assert_wt_parent() { # assert_wt_parent <worktree-path> <expected-root>
+  local wt="$1" want="$2" got
+  got="$(cd "$(dirname "$wt")" 2>/dev/null && pwd -P)" \
+    || die "cannot resolve $(dirname "$wt") — refusing to create a worktree there"
+  [ "$got" = "$want" ] || die "refusing to create the worktree $wt: its parent resolves to
+  $got
+but this command's worktree root is
+  $want
+Something moved or re-linked the root; inspect it, do not re-run."
+}
+assert_wt_under() { # assert_wt_under <worktree-path> <expected-root>
+  local wt="$1" want="$2" got
+  got="$(cd "$wt" 2>/dev/null && pwd -P)" \
+    || die "the worktree $wt was created but cannot be resolved"
+  case "$got" in
+    "$want"/*) ;;
+    *) die "the worktree $wt resolved to $got, which is not under $want — \
+remove it by hand and inspect the root" ;;
+  esac
+}
+
+# Which root a given worktree path belongs to. Used to name the root an add is
+# expected to land under, without re-deriving it from the path being checked.
+root_of_wt() { # root_of_wt <worktree-path>
+  case "$1" in
+    "$WT_ROOT_PROFILED"/*) printf '%s\n' "$WT_ROOT_PROFILED" ;;
+    "$WT_ROOT"/*)          printf '%s\n' "$WT_ROOT" ;;
+    *) die "internal error: $1 is under neither worktree root" ;;
+  esac
+}
 
 # Portable in-place sed (BSD sed on macOS needs -i '').
 sedi() {
@@ -1352,13 +1450,18 @@ fenced paths into this worktree. Confirm it on the command line:
     profile_provider_guard implementer reviewer
     echo "aw: fence profile '$prof' — released into this worktree: $FENCE_RELEASED" >&2
   fi
+  local wtroot; wtroot="$(root_of_wt "$wt")"
   mkdir -p "$(dirname "$wt")"
+  # The root was verified at startup; verify THIS path's parent again, here,
+  # immediately before anything is created under it.
+  assert_wt_parent "$wt" "$wtroot"
   NEW_WT="$wt"
   trap 'new_abort' EXIT
   trap 'new_abort; exit 130' INT TERM
   # --no-checkout first: the branch config is written while the tree is still
   # empty, so an interrupt can never leave released content without a record.
   git worktree add --no-checkout -b "$br" "$wt" HEAD >&2
+  assert_wt_under "$wt" "$wtroot"
   # Only NOW does this command own the branch, and only now may the trap delete
   # it. Anything above this line failed without creating a branch.
   NEW_BR="$br"
@@ -1741,7 +1844,9 @@ scout_root() {
       || die "scout mirror is wedged: remove $wt and retry"
   else
     git worktree prune
+    assert_wt_parent "$wt" "$WT_ROOT"
     git worktree add --detach --no-checkout "$wt" "$head" >&2
+    assert_wt_under "$wt" "$WT_ROOT"
     fence_apply "$wt"
     git -C "$wt" checkout >&2
   fi
