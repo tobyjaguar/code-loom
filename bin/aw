@@ -451,20 +451,31 @@ $prompt" ) < /dev/null > "$log" 2>&1 || rc=$?
     # The first alone is not a fix: it is merged BEFORE the project files, so
     # the worktree's copy would still win key by key.
     #
+    # The disable is UNCONDITIONAL — it does not depend on the operator having
+    # a config of their own. It used to, and that was backwards: a repo with no
+    # $ROOT/.opencode/opencode.json is exactly the repo where the worktree's
+    # copy is the ONLY config, so it is where an agent-written opencode.json
+    # would have been read in full. `aw` names the operator's config when one
+    # exists and turns the project's off either way; a repo that needs agent
+    # definitions must keep them in the operator's copy.
+    #
     # The cost, stated plainly: with the project config off, opencode no longer
     # reads the worktree's AGENTS.md/CLAUDE.md or any project-local plugin —
     # the role prompt now comes from $ROOT/.opencode (via `{file:./prompts/…}`
     # in the operator's config), which is the same copy the claude and codex
-    # legs already use. A caller that sets OPENCODE_CONFIG itself wins
-    # untouched, exactly like OPENCODE_PERMISSION.
-    local -a ocenv=("OPENCODE_PERMISSION=$perm")
+    # legs already use. A caller that sets OPENCODE_CONFIG/OPENCODE_CONFIG_DIR
+    # itself wins untouched, exactly like OPENCODE_PERMISSION — the disable is
+    # the one thing no caller turns off.
+    local -a ocenv=("OPENCODE_PERMISSION=$perm" "OPENCODE_DISABLE_PROJECT_CONFIG=1")
     if [ -n "${OPENCODE_CONFIG:-}" ]; then
       ocenv+=("OPENCODE_CONFIG=$OPENCODE_CONFIG")
-      [ -n "${OPENCODE_DISABLE_PROJECT_CONFIG:-}" ] \
-        && ocenv+=("OPENCODE_DISABLE_PROJECT_CONFIG=$OPENCODE_DISABLE_PROJECT_CONFIG")
     elif [ -f "$ROOT/.opencode/opencode.json" ]; then
-      ocenv+=("OPENCODE_CONFIG=$ROOT/.opencode/opencode.json"
-              "OPENCODE_DISABLE_PROJECT_CONFIG=1")
+      ocenv+=("OPENCODE_CONFIG=$ROOT/.opencode/opencode.json")
+    fi
+    if [ -n "${OPENCODE_CONFIG_DIR:-}" ]; then
+      ocenv+=("OPENCODE_CONFIG_DIR=$OPENCODE_CONFIG_DIR")
+    elif [ -d "$ROOT/.opencode" ]; then
+      ocenv+=("OPENCODE_CONFIG_DIR=$ROOT/.opencode")
     fi
     ( cd "$wd" && env "${ocenv[@]}" opencode run --agent "$role" --model "$model" "$prompt" ) \
       < /dev/null > "$log" 2>&1 || rc=$?
