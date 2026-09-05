@@ -167,8 +167,9 @@ in `.agents/reviews/<task>-review.md` — the run transcript is kept just long
 enough to spot a rate limit, which falls through to the next model in the chain
 like any other provider. `LOOM_SKIP="codex"` takes it out.
 
-Codex can also be the *implementer* — a writable sandbox, granted per role, not
-per model. See "Fence profiles" below: that is where it earns its keep.
+Codex can also be the *implementer*: a writable sandbox, granted per role, not
+per model, on any run — see "Codex (or Claude) as an implementer" below. It is
+not in a default chain, so it takes an explicit `LOOM_MODELS_implementer`.
 
 Any role's chain can be replaced from the environment, without editing `aw`:
 
@@ -234,7 +235,8 @@ paths = ["crates/audat-nda/**", "docs/audits/**"]
 Read the honest limits in `ARCHITECTURE.md` § 5 before relying on it — in
 particular, a fenced path the build needs will break the build in the worktree.
 `aw zone <path>` reports fencing, and `aw doctor` warns about fence patterns
-that match no tracked file.
+that match no tracked file. Both are repo-wide, not task-scoped: they always
+report the whole `[fence]`, never one task's relaxation of it.
 
 #### Fence profiles
 
@@ -257,8 +259,12 @@ providers = ["claude", "codex"]             # provider_of(), not model IDs
 
 A task that opts into `codex` gets a worktree fenced by `[fence]` **minus**
 `release` — `core/**` and `docs/audits/**` are there, `ios/**` and `spike/**`
-are still gone. Everything else behaves exactly as it does today: a task with
-no profile is fenced by the whole `[fence]`, byte for byte as before.
+are still gone. A task with no profile is fenced by the whole `[fence]`, as
+before. (Two things *did* change for unprofiled runs, and neither is about
+profiles: implementer-class roles on `claude-sub` and `codex-sub` now get a
+write-capable sandbox — see "Codex as an implementer" below — and `aw doctor`
+prints the parse error when `zones.toml` is unreadable instead of a generic
+line.)
 
 **The rule is fail-closed.** Before the worktree is created, `aw` checks every
 model in every chain that will run against it — implementer, reviewer, and the
@@ -276,63 +282,78 @@ Restrict the chain for this task, e.g.:
 ```
 
 An unknown profile name, a `release` pattern that is not in `[fence].paths`, a
-missing `providers` list — all of them die, in every command, the way a
-malformed `zones.toml` already does. The scout is never covered by a profile:
-its mirror is shared by every task, so it always runs at the full fence.
+`release` that another still-fenced pattern covers, a `providers` entry with a
+space or a glob character in it, a missing `providers` list — all of them die,
+in every command, the way a malformed `zones.toml` already does. The scout is
+never covered by a profile: its mirror is shared by every task, so it always
+runs at the full fence.
 
-**Two ways to opt in**, both recorded on the task branch
-(`git config branch.agent/<task>.fenceprofile`, the same pattern as the diff
-base) so `run`, `check`, `loop`, `rebase`, `land`, `ls` and the commit guard
-all agree afterwards:
+**You pass the flag every time.** `--fence-profile <name>` is required by
+`aw new`, `run`, `check`, `loop`, `rebase` and `land` for a task under a
+profile:
 
 ```sh
-aw new 0007-c --fence-profile codex     # on the command line
+aw new   0007-c --fence-profile codex
+aw run   0007-c --fence-profile codex
+aw check 0007-c --fence-profile codex
+aw land  0007-c --fence-profile codex
 ```
+
+`aw new` also records it (`git config branch.agent/<task>.fenceprofile`, the
+same pattern as the diff base), and `aw ls` shows it — but that record is a
+**consistency check, not an authorisation**. It can refuse a command three
+ways, and grant nothing:
+
+| situation | result |
+|---|---|
+| record exists, flag missing | dies, naming the flag to pass |
+| record and flag differ | dies |
+| flag given, no record | dies — a profile cannot be introduced after `aw new` |
+
+The reason is worth stating plainly: **branch config is agent-writable state.**
+Branch config lives in the shared `.git/config`, so anything running in the
+worktree can `git config branch.agent/<task>.fenceprofile codex` and, under a
+design that read the profile back from there, widen its own fence for the next
+`aw run`. Your flag is the consent; the record only checks it.
+
+A `Fence-profile: <name>` line in the task file is a third form, and the
+weakest — it *documents* the intent of a task (an architect agent may have
+written it), so `aw new` honours it only when you also pass the same name:
+
 ```markdown
 Zone: assist
-Fence-profile: codex                     # or a line in the task file
+Fence-profile: codex        # aw new 0007-c --fence-profile codex, or it dies
 ```
 
-Editing the task file after `aw new` does not change the worktree's fence —
-`aw` refuses the mismatch and tells you to `aw drop` and re-create, rather than
-re-fencing a tree an agent already worked in.
+Only the task file's header block is read, so a `Fence-profile:` line inside a
+code block — the shape `aw loop` appends when it pastes a reviewer's text back
+into the task file — is not a declaration.
 
-**The commit guard follows the profile.** Fenced paths are conventionally
-listed under `[hand]` too (that is what blocks a *commit* to them); under a
-profile the guard accepts commits to exactly the released patterns and still
-blocks everything else in `[hand]` — `.agents/zones.toml`, migrations, whatever
-your repo lists. The reviewer is told the same thing, so a released path does
-not come back as an "unauthorized hand/fence change" REVISE.
+**Enforcement comes off the disk, not off the record.** Before any role runs,
+`aw` asks the worktree which fenced paths are actually in it (against the whole
+`[fence]`, never the released subset) and refuses anything that does not line
+up: released paths present that your flag does not account for, or a flag whose
+released paths are nowhere on disk — a tree that was never built under that
+profile. It refuses rather than quietly re-fencing, because by then the tree's
+own diff and `.agents/reviews/<task>.patch` carry the content anyway.
 
-**Codex as an implementer.** `codex-sub` is a reviewer by default. Under a
-profile it is also the obvious *implementer*, so `aw` gives implementer-class
-roles (`implementer`, and the auto-fix rounds that go through it) a writable
-sandbox and leaves reviewer and scout read-only:
-
-| role | codex-sub | claude-sub |
-|---|---|---|
-| implementer | `codex exec --sandbox workspace-write --add-dir <wt>/.agents` | `claude -p --permission-mode acceptEdits --allowedTools 'Bash(./.agents/gate.sh…)'` |
-| reviewer / scout | `codex exec --sandbox read-only` | `claude -p` (no mode flag: every prompt is denied) |
-
-Two measured details behind that table. codex's `workspace-write` keeps the
-workspace's dot-directories read-only, so without `--add-dir` the implementer
-cannot write its `.agents/reviews/<task>-done.md` (or a `-blocked.md`) —
-`--add-dir` re-opens exactly that directory, inside the worktree. And
-`claude -p` has nobody to answer a permission prompt, so `acceptEdits`
-pre-approves the file edits but a Bash call is still denied: the gate is
-allowlisted by name. Widen it deliberately for a repo whose implementer needs
-more shell:
-
-```sh
-export LOOM_CLAUDE_ALLOWED_TOOLS='Bash(./.agents/gate.sh:*),Bash(cargo test:*)'
-```
+**The commit guard follows the profile — as a seatbelt.** Fenced paths are
+conventionally listed under `[hand]` too (that is what blocks a *commit* to
+them); under a profile the guard accepts commits to exactly the released
+patterns and still blocks everything else in `[hand]` — `.agents/zones.toml`,
+migrations, whatever your repo lists. It reads the branch record for that, and
+corroborates it against the tree first (a record whose released paths are not
+in the worktree refuses the commit). It is a pre-commit hook running in the
+agent's own context, where `--no-verify` exists: a seatbelt, not a lock. The
+reviewer is told the same thing, so a released path does not come back as an
+"unauthorized hand/fence change" REVISE.
 
 **If Codex refuses the task, run the same profile on Anthropic.** Codex has
 declined security-remediation prompts; the profile allows both providers
 precisely so that is a one-line retry, not a dead end:
 
 ```sh
-LOOM_MODELS_implementer=claude-sub aw run 0007-c
+LOOM_MODELS_implementer=claude-sub aw run 0007-c --fence-profile codex
 ```
 
 **What a profile is not.** It scopes *exposure*, it does not prevent
@@ -341,10 +362,45 @@ determined agent can still reach a fenced blob through git plumbing
 (`ARCHITECTURE.md` § 5, caveat 1). A profile only changes which files an agent
 finds in front of it, and which providers are allowed to be that agent. If your
 threat model includes a model actively working around the rule, you need a
-separate repository, not a profile.
+separate repository, not a profile. Four gaps in the surrounding machinery that
+a profile does **not** close are written down in
+[`docs/KNOWN-GAPS.md`](docs/KNOWN-GAPS.md) — read it before you rely on this.
 
 `aw doctor` lists every profile, what it releases, to whom, and warns when a
-role's default chain could not run under it.
+role's default chain reaches a provider the profile does not allow.
+
+#### Codex (or Claude) as an implementer
+
+Independent of fence profiles: this applies to **every** run, with or without
+one. It is described here because a profiled task is the first place
+`codex-sub` is an obvious implementer rather than a reviewer.
+
+The edit permission is granted per ROLE, never per model:
+
+| role | codex-sub | claude-sub | opencode providers |
+|---|---|---|---|
+| implementer | `codex exec --sandbox workspace-write --add-dir <wt>/.agents` | `claude -p --permission-mode acceptEdits --allowedTools 'Bash(./.agents/gate.sh…)'` | no OS sandbox |
+| reviewer / scout | `codex exec --sandbox read-only` | `claude -p` (no mode flag: every prompt is denied) | no OS sandbox |
+
+Note the third column: the opencode leg has **no OS sandbox in either row** — an
+opencode reviewer is held by its role prompt, the fence, and the profile's
+provider rule, not by the process. Note also that neither `codex-sub` nor
+`claude-sub` appears in a default implementer chain (those are GLM, DeepSeek and
+Kimi), so reaching this path at all takes an explicit `LOOM_MODELS_implementer`.
+
+Two measured details behind the table. codex's `workspace-write` keeps the
+workspace's dot-directories read-only, so without `--add-dir` the implementer
+cannot write its `.agents/reviews/<task>-done.md` (or a `-blocked.md`) —
+`--add-dir` re-opens exactly that directory, resolved with `pwd -P` and refused
+if it does not stay inside the worktree. And `claude -p` has nobody to answer a
+permission prompt, so `acceptEdits` pre-approves the file edits but a Bash call
+is still denied: the gate is allowlisted by name. That allowlist is a
+convenience boundary, not a sandbox — `.agents/gate.sh` is a file the
+implementer can edit — so widen it without ceremony when a repo needs it:
+
+```sh
+export LOOM_CLAUDE_ALLOWED_TOOLS='Bash(./.agents/gate.sh:*),Bash(cargo test:*)'
+```
 
 ## Editors
 

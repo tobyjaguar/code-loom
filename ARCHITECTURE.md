@@ -206,12 +206,14 @@ confused agent asks instead of digging.
    disappears from under your editor.
 5. **A worktree can predate the fence.** Sparse rules are applied when a
    worktree is built, so one created before `[fence]` existed — or before it
-   was widened — still holds the paths you have since fenced. `aw run` and
-   `aw scout` therefore re-apply and *verify* the fence on every call, and
-   refuse to run if a fenced file survives (git will not remove a file with
-   local modifications). Anything you drive by hand rather than through those
-   commands gets no such refresh: after changing `[fence]`, treat existing
-   worktrees in `aw ls` as stale and `aw drop` them.
+   was widened — still holds the paths you have since fenced. `aw scout`
+   re-applies and *verifies* the fence on every call. Every command that runs a
+   role in a task worktree goes through `fence_reconcile` instead (see "Fence
+   profiles" below), which is stricter: a worktree holding fenced paths that no
+   `--fence-profile` on the command line accounts for is **refused**, not
+   quietly re-fenced, because the tree's own diff would carry the content to
+   the next model regardless. Either way, after changing `[fence]`, treat
+   existing worktrees in `aw ls` as stale and `aw drop` them.
 
 Fencing `.agents/**` is refused outright. Removing `zones.toml` from a worktree
 would make every path resolve to `assist` and `aw guard` exit 0 — the fence
@@ -243,11 +245,46 @@ providers = ["claude", "codex"]             # REQUIRED. provider_of() values:
 
 Semantics:
 
-- **Effective fence** = `[fence].paths` minus the active profile's `release`.
-  Every fence operation — the sparse checkout at `aw new`, the re-apply and
-  verify on `aw run`, `aw zone`'s fencing report — answers with that set. With
-  no profile active (the default, and every existing repo) it is the whole
-  fence, unchanged.
+- **Effective fence** = `[fence].paths` minus the *asserted* profile's
+  `release`. The sparse checkout at `aw new` and the re-apply/verify inside
+  `fence_reconcile` answer with that set. `aw zone` and `aw doctor` are **not**
+  task-scoped and never assert a profile: they always report the full `[fence]`,
+  which is the honest answer to "what does this repo fence?" — the release is a
+  property of one task's worktree, not of a path.
+- **The opt-in is a fresh operator act, on every command.** `--fence-profile
+  <name>` is REQUIRED by `aw new`, `run`, `check`, `loop`, `rebase` and `land`
+  for any task under a profile. `aw new` also writes
+  `branch.agent/<task>.fenceprofile`, but that record is a **consistency check,
+  never an authorisation**: three rules, all fail-closed —
+  1. a record exists and the flag is absent → die, naming the flag to pass;
+  2. both exist and differ → die;
+  3. the flag is given and no record exists → die, unless the worktree itself
+     already holds exactly what that profile releases (in which case the record
+     was lost, and it is restored loudly).
+
+  The reason is unglamorous: **branch config is agent-writable state.** Anything
+  running inside the worktree can `git config branch.agent/<task>.fenceprofile
+  codex`, because branch config lives in the shared `.git/config`. A design that
+  read the profile from that record let an agent widen its own fence and have
+  the next `aw run` honour it. It can now only refuse a command.
+
+  A `Fence-profile: <name>` line in the task file is a third, weakest form: it
+  documents intent — an architect agent may have written it — and `aw new`
+  honours it only when the same name is passed on the command line. It is read
+  from the task file's **header block** alone, so a line inside a code fence
+  (the shape `aw loop` appends when it pastes a reviewer's text back into the
+  task file) is not a declaration.
+- **Enforcement is driven by the tree, not the record.** `fence_reconcile <wt>
+  <asserted>` runs before any role in `run`/`check`/`loop`/`rebase`/`land`, and
+  again inside `run_role` for any workdir under `$LOOM_WORKTREES`. It computes
+  "which fenced paths are on disk here" against the **full** `[fence]` — never
+  the effective set, which would be the profile vouching for itself — and then:
+  released paths on disk with no assertion covering them is a **dead stop**,
+  not a silent re-fence (the worktree's diff and `.agents/reviews/<task>.patch`
+  carry the content into the next model even after the files are gone); an
+  assertion whose released paths are nowhere on disk is a dead stop too,
+  because that tree was not built under the profile. In `aw check` it runs
+  before the patch is written.
 - **Provider rule.** Before a worktree is created, and again before each role
   runs, `aw` walks the *entire* model chain of every role that will run there
   (implementer, reviewer, and the auto-fix rounds through the implementer) and
@@ -255,36 +292,64 @@ Semantics:
   not first entries: a fallback fires on a rate limit without asking. The scout
   is exempt because it is never given a profiled tree — its mirror is shared by
   every task and always carries the full fence.
-- **Opt-in, recorded on the branch.** `aw new <task> --fence-profile <name>` or
-  a `Fence-profile: <name>` line in the task file (parsed like `Zone:`), stored
-  as `branch.agent/<task>.fenceprofile`, the same durable place as the diff
-  base. Later commands read the branch, not the file, so a task file edited
-  mid-flight cannot silently re-fence a tree an agent has already worked in;
-  the mismatch is refused instead.
-- **The guard follows.** Fenced paths are conventionally duplicated into
-  `[hand]` so that a *commit* to them is blocked even where the fence is not
-  applied. Under a profile, `aw guard` accepts exactly the released patterns
-  and keeps blocking the rest of `[hand]`. The reviewer prompt is told the same
-  fact, so a released path is not reported as an unauthorized change.
+- **The guard follows, as a seatbelt.** Fenced paths are conventionally
+  duplicated into `[hand]` so that a *commit* to them is blocked even where the
+  fence is not applied. Under a profile, `aw guard` accepts exactly the released
+  patterns and keeps blocking the rest of `[hand]`. But be clear about what it
+  is: the guard is a pre-commit hook that runs **in the agent's own context**,
+  where `git commit --no-verify` exists. It is a seatbelt, not a lock. It is
+  therefore allowed to read the agent-writable branch record for the released
+  set — and it corroborates that record against the tree before trusting it: a
+  record whose released paths are absent from the worktree, or a worktree
+  holding fenced paths the record's profile does not release, refuses the commit
+  rather than widening the guard. The reviewer prompt is told the same fact, so
+  a released path is not reported as an unauthorized change.
 - **Fail-closed parsing.** Unknown profile name, unknown key in the table, a
-  `release` entry that is not a `[fence]` pattern, a missing or empty list,
-  a `[fence_profiles]` that is not a table — each one dies, in every mode,
-  before any answer is given. `AW_FENCE_PROFILE` from the environment is
-  ignored and cleared at startup: a profile is a property of a task branch, not
-  of whoever exported a variable.
-- **Write permissions are per ROLE.** `codex exec` runs `--sandbox read-only`
-  for a reviewer and `--sandbox workspace-write --add-dir <wt>/.agents` for an
-  implementer (its sandbox otherwise keeps the worktree's dot-directories
-  read-only, which blocks the done/blocked notes). `claude -p` gets
-  `--permission-mode acceptEdits` plus a gate-script allowlist for an
-  implementer, and nothing for a reviewer — an unmodified `-p` run denies every
-  permission prompt, which is exactly the read-only behaviour a reviewer wants.
+  `release` entry that is not a `[fence]` pattern, a `release` entry another
+  still-fenced pattern covers, a `providers` entry with whitespace or a glob
+  character in it, a missing or empty list, a `[fence_profiles]` that is not a
+  table — each one dies, in every mode, before any answer is given.
+  `AW_FENCE_PROFILE` from the environment is ignored and cleared at startup: a
+  profile is something an operator types, not something a variable carries.
 
 The caveats of § 5 all still apply, caveat 1 above all: the object store is
 shared, so a profile scopes **exposure**, not exfiltration. What it buys is
 that the exposure is now a written, checked, reviewable decision — which
 provider may see which subsystem — instead of an all-or-nothing switch that
 pushes you into doing the work by hand.
+
+See also [`docs/KNOWN-GAPS.md`](docs/KNOWN-GAPS.md) for the gaps in the
+surrounding machinery that a fence profile does **not** close.
+
+### Write-capable sandboxes for implementer-class roles
+
+This is independent of fence profiles. It applies to **every** run, profiled or
+not, and it changed at the same time only because a profiled task is the first
+place `codex-sub` is an obvious implementer.
+
+The edit permission is granted per ROLE, never per model:
+
+| role | codex-sub | claude-sub | opencode providers |
+|---|---|---|---|
+| implementer / build | `codex exec --sandbox workspace-write --add-dir <wt>/.agents` | `claude -p --permission-mode acceptEdits --allowedTools 'Bash(./.agents/gate.sh…)'` | no OS sandbox |
+| reviewer / scout / architect | `codex exec --sandbox read-only` | `claude -p` (no mode flag: every prompt is denied) | no OS sandbox |
+
+Four things this table does *not* say:
+
+1. **The opencode leg has no OS sandbox at all**, in either row. An opencode
+   reviewer is held by its role prompt, by the fence applied to the worktree,
+   and by the profile's provider rule — not by the process.
+2. **`--allowedTools` does not confine a claude implementer's shell.** It names
+   `.agents/gate.sh`, which is a file the implementer can edit. It is a
+   convenience boundary that lets the implementer protocol run at all; what
+   actually confines that leg is the worktree and the fence applied to it.
+3. **`--add-dir` names a writable root**, so `<wt>/.agents` is resolved with
+   `pwd -P` and refused unless it is still under the resolved worktree — a
+   tracked directory can be replaced with a symlink out of the tree.
+4. **Neither `codex-sub` nor `claude-sub` is in a default implementer chain**
+   (they are `zai-coding-plan/glm-5.3`, `deepseek/deepseek-v4-pro`,
+   `moonshotai/kimi-*`). Reaching this code path takes an explicit
+   `LOOM_MODELS_implementer`.
 
 ---
 

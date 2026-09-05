@@ -55,12 +55,18 @@ paths = [
 
 # Optional, and only meaningful with a [fence] above it: a NAMED, per-provider
 # relaxation of the fence. A task opts in with `aw new <task> --fence-profile
-# <name>` or a `Fence-profile: <name>` line in the task file; its worktree is
-# then fenced by [fence] MINUS `release`, and `aw` refuses to run any role
-# there whose model chain (fallbacks included) reaches a provider outside
-# `providers`. Every `release` entry must appear verbatim in [fence].paths.
+# <name>`, and EVERY later command for that task repeats the flag (run, check,
+# loop, rebase, land). Its worktree is fenced by [fence] MINUS `release`, and
+# `aw` refuses to run any role there whose model chain (fallbacks included)
+# reaches a provider outside `providers`. A `Fence-profile: <name>` line in the
+# task file documents the intent but never opts in on its own.
+#
+# Every `release` entry must appear verbatim in [fence].paths, and must not be
+# covered by another pattern that stays fenced. Provider names are matched
+# exactly: no whitespace, no globs.
+#
 # Read README § Fence profiles before using it: this scopes exposure, not
-# exfiltration.
+# exfiltration, and docs/KNOWN-GAPS.md lists what it does not close.
 #
 # [fence_profiles.codex]
 # reason    = "The two subscription CLIs may read this; per-token APIs may not."
