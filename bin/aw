@@ -69,11 +69,48 @@
 
 set -euo pipefail
 
-ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+# ------------------------------------------------- the root is the MAIN checkout
+# Every file this dispatcher reads POLICY from — .agents/zones.toml (the zones,
+# the fence and its profiles), .agents/loom.env, .agents/gate.sh, .opencode/ —
+# comes from the MAIN checkout, and never from the tree the command happened to
+# be typed in. An agent worktree carries its own copy of all of them, and every
+# one of those copies is a file the agent writes: `cd $WT_ROOT/0007-c && aw new
+# t5` would otherwise fence the new task with the agent's zones.toml (i.e. not
+# at all) and source the agent's loom.env as shell, in your environment.
+#
+# `git rev-parse --git-common-dir` answers `.git` from the main checkout and the
+# ABSOLUTE path of the main `.git` from a linked worktree, so its parent is the
+# main checkout either way. That is the same derivation the operator record is
+# keyed by, which is what lets the pre-commit guard — running inside an agent's
+# worktree — read the record `aw new` wrote.
+#
+# One thing does still come from the invoking tree, and only one:
+# `aw guard`'s subject. The guard judges the commit that is happening HERE, so
+# it reads the staged files and the tree of $INVOKED_ROOT while reading the
+# policy it judges them by from $ROOT. That is the whole of the split.
+INVOKED_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
   echo "aw: not inside a git repository" >&2; exit 1; }
+cd "$INVOKED_ROOT"
+INVOKED_ROOT="$(pwd -P)"
+_common="$(git rev-parse --git-common-dir 2>/dev/null)" || {
+  echo "aw: cannot resolve this repository's git directory" >&2; exit 1; }
+[ -n "$_common" ] || {
+  echo "aw: cannot resolve this repository's git directory" >&2; exit 1; }
+ROOT="$(cd "$(dirname "$_common")" 2>/dev/null && pwd -P)" || {
+  echo "aw: cannot resolve this repository's main checkout — refusing to guess where
+the zones, the fence and the operator record live" >&2; exit 1; }
+unset _common
 cd "$ROOT"
 # The repo's PHYSICAL path, for comparing against the worktree roots below.
-ROOT_REAL="$(pwd -P)"
+# $ROOT came out of `pwd -P`, so this is the same string; it is kept as its own
+# name because that is what the worktree-root checks read.
+ROOT_REAL="$ROOT"
+# Said out loud rather than silently: a command typed inside an agent worktree
+# is answered from the main checkout, which is not where the operator is
+# looking.
+if [ "$INVOKED_ROOT" != "$ROOT" ]; then
+  echo "aw: invoked inside $INVOKED_ROOT — reading zones, fence and env from the main checkout $ROOT" >&2
+fi
 
 AGENTS_DIR="$ROOT/.agents"
 PROMPTS_DIR="$ROOT/.opencode/prompts"
@@ -133,17 +170,12 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # KNOWN-GAPS 3 already concedes — and this file is in it. What it removes is
 # the whole class of "a worktree rewrites the input to its own security check
 # with one git command", which is a different and much cheaper attack.
-# The MAIN checkout, never this worktree: in a linked worktree $ROOT is the
-# worktree, and the record belongs to the repository. --git-common-dir answers
-# `.git` in the main checkout (we are cd'd to $ROOT) and the absolute path of
-# the main .git in a linked one, so both resolve to the same directory — which
-# is what lets the pre-commit guard, running inside an agent worktree, read the
-# same record `aw new` wrote.
-STATE_COMMON="$(git rev-parse --git-common-dir 2>/dev/null)" \
-  || die "cannot resolve this repository's git directory"
-[ -n "$STATE_COMMON" ] || die "cannot resolve this repository's git directory"
-STATE_MAIN_ROOT="$(cd "$(dirname "$STATE_COMMON")" 2>/dev/null && pwd -P)" \
-  || die "cannot resolve this repository's main checkout — refusing to guess where the operator record lives"
+# The MAIN checkout, never the worktree a command was typed in — which is what
+# $ROOT already is (see the derivation at the top of this file, which used to
+# live here). It keeps its own name because the messages, the operator record's
+# key and the gate-script lookup all read as statements about the main checkout
+# rather than about "the root".
+STATE_MAIN_ROOT="$ROOT"
 STATE_KEY="$(printf '%s' "$STATE_MAIN_ROOT" | python3 -c 'import hashlib,sys; sys.stdout.write(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')" \
   || die "cannot compute the operator state key for $STATE_MAIN_ROOT"
 [ -n "$STATE_KEY" ] || die "cannot compute the operator state key for $STATE_MAIN_ROOT"
@@ -1393,7 +1425,13 @@ cmd_zone() {
 }
 
 cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
-  local branch; branch="$(git rev-parse --abbrev-ref HEAD)"
+  # The SUBJECT is the tree the commit is happening in ($INVOKED_ROOT: the
+  # agent's worktree when the hook fires there, your checkout when it fires
+  # here). The POLICY it is judged by is the main checkout's — $AGENTS_DIR and
+  # every zones_py call already read from $ROOT, which is the main checkout
+  # whichever tree this was invoked from. Reading the worktree's own zones.toml
+  # would have let an agent widen its own zone with the file it is committing.
+  local branch; branch="$(git -C "$INVOKED_ROOT" rev-parse --abbrev-ref HEAD)"
   case "$branch" in agent/*) ;; *) return 0 ;; esac
   # A fenced path is also a hand path by convention (that is what blocks a
   # commit to it), so a branch running under a fence profile must be allowed to
@@ -1416,7 +1454,7 @@ cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
   prof="$(state_read "${branch#agent/}" profile 2>/dev/null || true)"
   if [ -n "$prof" ]; then
     fence_profile_activate "$prof"     # dies on an unknown or unreadable profile
-    present="$(zones_py fence-present-full "$ROOT")" || {
+    present="$(zones_py fence-present-full "$INVOKED_ROOT")" || {
       echo "pre-commit: cannot tell which fenced paths are present here — refusing to guess" >&2
       exit 1; }
     while IFS= read -r p; do
@@ -1429,7 +1467,7 @@ cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
       echo "every fenced path by design — commit from the agent worktree instead.)" >&2
       exit 1
     done <<< "$present"
-    tracked="$(zones_py profile-tracked "$ROOT")" || {
+    tracked="$(zones_py profile-tracked "$INVOKED_ROOT")" || {
       echo "pre-commit: cannot tell which released paths this tree tracks — refusing to guess" >&2
       exit 1; }
     if [ -z "$present" ] && [ -n "$tracked" ]; then
@@ -1447,7 +1485,7 @@ cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
       violations="$violations
   $file"
     fi
-  done < <(git diff --cached --name-only)
+  done < <(git -C "$INVOKED_ROOT" diff --cached --name-only)
   if [ -n "$violations" ]; then
     echo "BLOCKED: agent branch '$branch' touches hand-zone paths:$violations" >&2
     echo "" >&2
