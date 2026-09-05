@@ -1,38 +1,43 @@
 #!/usr/bin/env bash
-# aw — agent worktree dispatcher (Loom)
+# loom — the Loom agent harness dispatcher.
 #
 # One task = one worktree = one branch = one reviewable diff.
 # Your working tree is never touched by an agent.
 #
-#   aw plan  "streaming resampler"   architect session (Claude sub via `claude`)
-#   aw plan -p "topic"               headless plan (falls back to cheap providers)
-#   aw scout "where is decode_flac"  one-shot cheap read-only lookup
-#   aw new   0007-c                  create worktree + branch for a task
-#   aw run   0007-c                  run the implementer in that worktree
-#   aw check 0007-c                  cheap cross-provider review of the diff
-#   aw loop  0007-c                  run, review, feed REVISE back, review again
-#   aw diff  0007-c                  open the task diff read-only in $EDITOR
-#   aw land  0007-c                  gate, merge, clean up, tick the checkbox
-#   aw land  0007-c --pr             gate, push agent/0007-c, print PR next steps
-#   aw drop  0007-c [--keep-branch]  discard worktree (and branch, unless kept)
-#   aw rebase 0007-c                 rebase the branch onto origin/main; re-point its diff base
-#   aw ls                            list active agent worktrees
-#   aw gate                          run the gate here
-#   aw zone  <path>                  which zone a path belongs to
-#   aw tier  lean|standard|deep      print export line for the model tier
-#   aw doctor                        verify binaries, keys, and MODEL IDS
-#   aw guard                         pre-commit zone check (used by the hook)
-#   aw install-hooks                 install the hand-zone commit guard
+#   loom plan  "streaming resampler"   architect session (Claude sub via `claude`)
+#   loom plan -p "topic"               headless plan (falls back to cheap providers)
+#   loom scout "where is decode_flac"  one-shot cheap read-only lookup
+#   loom new   0007-c                  create worktree + branch for a task
+#   loom run   0007-c                  run the implementer in that worktree
+#   loom check 0007-c                  cheap cross-provider review of the diff
+#   loom loop  0007-c                  run, review, feed REVISE back, review again
+#   loom diff  0007-c                  show the task diff (pager, or $LOOM_DIFF_CMD)
+#   loom land  0007-c                  gate, merge, clean up, tick the checkbox
+#   loom land  0007-c --pr             gate, push agent/0007-c, print PR next steps
+#   loom drop  0007-c [--keep-branch]  discard worktree (and branch, unless kept)
+#   loom rebase 0007-c                 rebase the branch onto origin/main; re-point its diff base
+#   loom ls                            list active agent worktrees
+#   loom gate                          run the gate here
+#   loom zone  <path>                  which zone a path belongs to
+#   loom tier  lean|standard|deep      print export line for the model tier
+#   loom doctor                        verify binaries, keys, and MODEL IDS
+#   loom guard                         pre-commit zone check (used by the hook)
+#   loom install-hooks                 install the hand-zone commit guard
 #
 # Env:
 #   LOOM_TIER=lean|standard|deep   model tier            (default standard)
 #   LOOM_SKIP="zai deepseek"       providers to skip     (claude|zai|moonshotai|deepseek)
 #   LOOM_MAX_ATTEMPTS=3            implementer gate retries
-#   LOOM_LOOP_ROUNDS=2             review rounds in `aw loop`
+#   LOOM_LOOP_ROUNDS=2             review rounds in `loom loop`
 #   LOOM_MODELS_<role>="m1 m2"     replace one role's chain outright
 #   LOOM_WORKTREES=/path           where worktrees live
 #   LOOM_LAND=merge|pr             land by merging here, or by pushing a branch
 #                                  for review (--pr / --merge win over this)
+#   LOOM_DIFF_CMD="delta"          how `loom diff` shows a patch; the patch path
+#                                  is appended. Default: git's own pager. Split
+#                                  on whitespace, no quoting — wrap a path with
+#                                  spaces in a one-line script.
+#   LOOM_ENV=/path                 provider key file  (default ~/.config/loom/env)
 #
 # Anthropic policy: subscription only, on purpose. The architect runs through
 # the `claude` CLI (your Claude Code login). There is no ANTHROPIC_API_KEY
@@ -42,7 +47,7 @@
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
-  echo "aw: not inside a git repository" >&2; exit 1; }
+  echo "loom: not inside a git repository" >&2; exit 1; }
 cd "$ROOT"
 
 AGENTS_DIR="$ROOT/.agents"
@@ -53,7 +58,7 @@ MAX_ATTEMPTS="${LOOM_MAX_ATTEMPTS:-3}"
 SKIP="${LOOM_SKIP:-}"
 
 # Provider keys live in one file outside every repo (chmod 600). Sourced here
-# so aw and everything it launches (opencode included) see them without the
+# so loom and everything it launches (opencode included) see them without the
 # keys ever entering a repo or a shell profile.
 LOOM_ENV="${LOOM_ENV:-$HOME/.config/loom/env}"
 if [ -f "$LOOM_ENV" ]; then set -a; . "$LOOM_ENV"; set +a; fi
@@ -69,7 +74,7 @@ if [ -n "${ZAI_API_KEY:-}" ] && [ -z "${ZHIPU_API_KEY:-}" ]; then
   export ZHIPU_API_KEY="$ZAI_API_KEY"
 fi
 
-die()  { echo "aw: $*" >&2; exit 1; }
+die()  { echo "loom: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # Portable in-place sed (BSD sed on macOS needs -i '').
@@ -88,7 +93,7 @@ relpath() { # relpath <path> [<base>]
 # Ordered fallback chains. "claude-sub" means the `claude` CLI on your
 # subscription and "codex-sub" the `codex` CLI on your ChatGPT one; everything
 # else is opencode's built-in provider/model IDs.
-# Verify IDs with: aw doctor   (they move fast)
+# Verify IDs with: loom doctor   (they move fast)
 models_for() {
   local role="$1" override
   # LOOM_MODELS_reviewer="codex-sub deepseek/deepseek-v4-pro" replaces the whole
@@ -158,7 +163,7 @@ looks_rate_limited() { # looks_rate_limited <logfile>
 
 # Headless model calls read stdin for appended message input when it is a
 # non-TTY stream; a caller that keeps stdin open (CI, cron, another agent's
-# shell) therefore hangs the run forever in poll. Found live: `aw run` from a
+# shell) therefore hangs the run forever in poll. Found live: `loom run` from a
 # backgrounded shell sat 100 minutes in ep_poll before the first model call.
 # /dev/null guarantees EOF for both legs.
 run_headless() { # run_headless <role> <model> <workdir> <prompt> <logfile>
@@ -176,7 +181,7 @@ run_headless() { # run_headless <role> <model> <workdir> <prompt> <logfile>
     # the log verbatim into the review file, so the final message goes to a
     # sidecar and replaces the log on success. A failed run keeps the
     # transcript: looks_rate_limited reads it.
-    last="$(mktemp "${TMPDIR:-/tmp}/aw-codex.XXXXXX")"
+    last="$(mktemp "${TMPDIR:-/tmp}/loom-codex.XXXXXX")"
     ( cd "$wd" && codex exec --sandbox read-only --skip-git-repo-check \
         --output-last-message "$last" \
         "$(cat "$PROMPTS_DIR/$role.md")
@@ -205,17 +210,17 @@ $prompt" ) < /dev/null > "$log" 2>&1 || rc=$?
 
 run_role() { # run_role <role> <workdir> <prompt> [<logfile>]
   local role="$1" wd="$2" prompt="$3"
-  local log="${4:-$(mktemp "${TMPDIR:-/tmp}/aw-$role.XXXXXX")}"
+  local log="${4:-$(mktemp "${TMPDIR:-/tmp}/loom-$role.XXXXXX")}"
   local m tried=""
   for m in $(candidates "$role"); do
     tried="yes"
-    echo "aw: [$role] running on $m (tier $TIER)"
+    echo "loom: [$role] running on $m (tier $TIER)"
     if run_headless "$role" "$m" "$wd" "$prompt" "$log"; then
       return 0
     elif looks_rate_limited "$log"; then
-      echo "aw: [$role] $m looks rate-limited — falling back" >&2
+      echo "loom: [$role] $m looks rate-limited — falling back" >&2
     else
-      echo "aw: [$role] $m failed (not a rate limit) — see output above" >&2
+      echo "loom: [$role] $m failed (not a rate limit) — see output above" >&2
       return 1
     fi
   done
@@ -234,7 +239,7 @@ zones_py() { # zones_py <mode> [arg]
 import sys, os, re, fnmatch, subprocess
 
 def die(msg):                        # exit 2 = "cannot answer", never "no"
-    sys.stderr.write("aw: %s\n" % msg)
+    sys.stderr.write("loom: %s\n" % msg)
     raise SystemExit(2)
 
 try:
@@ -279,14 +284,23 @@ def hit(p, g):
 def fence_sanity():
     """Fencing the contract layer would disable the very things that police
     the agent: no zones.toml in the worktree means every path resolves to
-    "assist" and `aw guard` exits 0, and no gate.sh means the gate exits 127
-    and burns every attempt. Refuse instead of silently disarming."""
-    for essential in (".agents/zones.toml", ".agents/gate.sh"):
+    "assist" and `loom guard` exits 0; no gate.sh means the gate exits 127
+    and burns every attempt; no .agents/reviews/ means the gate log the
+    dispatcher writes there sits outside the sparse-checkout definition, so
+    `git add -A` fails after a green gate and nothing is committed. Refuse
+    instead of silently disarming. The directory is checked by probing a
+    file the dispatcher will create in it, so `dir/*` patterns count too."""
+    essentials = (
+        (".agents/zones.toml", ".agents/zones.toml", "which disables the zone guard"),
+        (".agents/gate.sh",    ".agents/gate.sh",    "which disables the gate"),
+        (".agents/reviews/",   ".agents/reviews/0000-x-gate.log",
+         "which the dispatcher writes the gate log, patch and review into"),
+    )
+    for shown, probe, why in essentials:
         for g in fence:
-            if hit(essential, g):
+            if hit(probe, g):
                 die("fence pattern '%s' would remove %s from agent worktrees, "
-                    "which disables the zone guard and the gate — narrow the pattern"
-                    % (g, essential))
+                    "%s — narrow the pattern" % (g, shown, why))
 
 def zone_of(path):
     for zone in ("hand", "assist", "auto"):
@@ -342,7 +356,7 @@ zone_of() { # zone_of <repo-relative-path>   (fails loudly: callers gate commits
 
 # Fence lookups fail CLOSED. If zones.toml cannot be read we do not know what is
 # fenced, and "nothing is fenced" would hand a fenced tree to a third-party
-# model. Parsed once per `aw` invocation and cached, so subshells inherit it.
+# model. Parsed once per `loom` invocation and cached, so subshells inherit it.
 FENCE_PATTERNS=""
 FENCE_LOADED=""
 load_fence() {
@@ -398,11 +412,11 @@ fence_verify() { # fence_verify <worktree>
   die "fenced paths are STILL present in $wt:
 $(printf '%s\n' "$left" | sed 's/^/  /')
 git will not drop a file with local changes. Commit or discard them in the
-worktree, or start clean with: aw drop <task-id>"
+worktree, or start clean with: loom drop <task-id>"
 }
 
 # (Re-)apply the fence to a worktree that may predate it, then prove it took.
-# No-op when no fence is configured. Called on every `aw run` and `aw scout`,
+# No-op when no fence is configured. Called on every `loom run` and `loom scout`,
 # because a worktree created before a fence was added or widened would
 # otherwise hand the fenced paths straight to the implementer.
 fence_enforce() { # fence_enforce <worktree>
@@ -412,7 +426,7 @@ fence_enforce() { # fence_enforce <worktree>
 }
 
 cmd_zone() {
-  local p="${1:?usage: aw zone <path>}" z
+  local p="${1:?usage: loom zone <path>}" z
   p="$(relpath "$p")"
   z="$(zone_of "$p")" || die "zone lookup failed for $p"
   if is_fenced "$p"; then
@@ -441,13 +455,23 @@ cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
   fi
 }
 
+# The pre-commit hook git actually runs: honours core.hooksPath and, from
+# inside a linked worktree, resolves to the shared common dir. May be
+# relative — fine, loom cd's to $ROOT at startup and never leaves it.
+hook_path() { git rev-parse --git-path hooks/pre-commit; }
+
 # ----------------------------------------------------------------- worktrees
 wt_path()   { echo "$WT_ROOT/$1"; }
+# git cannot track an empty directory, so .agents/reviews/ is absent from a
+# fresh worktree unless the repo happens to keep a .gitkeep in it. Every write
+# into it (gate log, patch, review) would then fail on the redirect — which
+# `loom run` reads as a red gate and burns all its attempts on. Create it.
+reviews_dir() { mkdir -p "$1/.agents/reviews"; }
 branch_of() { echo "agent/$1"; }
 base_of()   { git config "branch.$(branch_of "$1").loombase" 2>/dev/null || git rev-parse HEAD; }
 
 cmd_new() {
-  local task="${1:?usage: aw new <task-id>}"
+  local task="${1:?usage: loom new <task-id>}"
   local wt br
   wt="$(wt_path "$task")"; br="$(branch_of "$task")"
   [ -d "$wt" ] && die "worktree already exists: $wt"
@@ -467,17 +491,18 @@ cmd_new() {
 }
 
 cmd_run() {
-  local task="${1:?usage: aw run <task-id>}"
+  local task="${1:?usage: loom run <task-id>}"
   local wt br attempt=1 gate_note="" title fnote
   wt="$(wt_path "$task")"; br="$(branch_of "$task")"
   [ -d "$wt" ] || wt="$(cmd_new "$task")"
   fence_enforce "$wt"        # the worktree may predate the fence, or a widening
+  reviews_dir "$wt"          # the implementer writes -done/-blocked there on attempt 1
   title="$(head -1 "$AGENTS_DIR/tasks/$task.md" | sed 's/^#[[:space:]]*//')"
   load_fence; fnote="$(fence_note)"
 
-  echo "aw: task $task  branch $br  tier $TIER"
+  echo "loom: task $task  branch $br  tier $TIER"
   while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
-    echo "aw: attempt $attempt/$MAX_ATTEMPTS"
+    echo "loom: attempt $attempt/$MAX_ATTEMPTS"
     run_role implementer "$wt" "Implement the task in .agents/tasks/$task.md. \
 Read the plan it references first. Touch only the files it lists — check \
 .agents/zones.toml and never edit hand-zone paths. Run ./.agents/gate.sh and \
@@ -486,13 +511,18 @@ fix failures until it exits 0. Write brief notes on what you did to \
 .agents/reviews/$task-blocked.md and stop.$fnote$gate_note" || true
 
     if ( cd "$wt" && ./.agents/gate.sh > "$wt/.agents/reviews/$task-gate.log" 2>&1 ); then
-      echo "aw: gate green"
-      ( cd "$wt" && git add -A && git commit -q -m "agent($task): $title" )
-      echo "aw: committed on $br — review with: aw check $task && aw diff $task"
+      echo "loom: gate green"
+      # Checked explicitly: from `loom loop` this function runs under `|| rc=$?`,
+      # which switches set -e off, and a failed add/commit (sparse-checkout
+      # refusal, a hook, nothing to commit) would otherwise print "committed"
+      # over an unchanged branch.
+      ( cd "$wt" && git add -A && git commit -q -m "agent($task): $title" ) \
+        || die "commit failed in $wt (nothing to commit, or git refused) — nothing landed on $br"
+      echo "loom: committed on $br — review with: loom check $task && loom diff $task"
       return 0
     fi
     if [ -f "$wt/.agents/reviews/$task-blocked.md" ]; then
-      echo "aw: implementer reported blocked — see .agents/reviews/$task-blocked.md"
+      echo "loom: implementer reported blocked — see .agents/reviews/$task-blocked.md"
       return 2
     fi
     gate_note=" PREVIOUS ATTEMPT FAILED THE GATE. Failing output (tail):
@@ -500,26 +530,27 @@ $(tail -40 "$wt/.agents/reviews/$task-gate.log" 2>/dev/null)"
     attempt=$((attempt + 1))
   done
 
-  echo "aw: gate never went green after $MAX_ATTEMPTS attempts." >&2
-  echo "aw: this usually means the task spec is wrong. Revisit it with the architect." >&2
+  echo "loom: gate never went green after $MAX_ATTEMPTS attempts." >&2
+  echo "loom: this usually means the task spec is wrong. Revisit it with the architect." >&2
   return 1
 }
 
 cmd_check() {
-  local task="${1:?usage: aw check <task-id>}"
+  local task="${1:?usage: loom check <task-id>}"
   local wt base review log
   wt="$(wt_path "$task")"
   [ -d "$wt" ] || die "no worktree for $task"
   base="$(base_of "$task")"
+  reviews_dir "$wt"
   ( cd "$wt" && git diff "$base" HEAD > ".agents/reviews/$task.patch" )
   review="$wt/.agents/reviews/$task-review.md"
-  log="$(mktemp "${TMPDIR:-/tmp}/aw-review.XXXXXX")"
+  log="$(mktemp "${TMPDIR:-/tmp}/loom-review.XXXXXX")"
   run_role reviewer "$wt" "Review the diff at .agents/reviews/$task.patch \
 against the task spec .agents/tasks/$task.md and the plan it references. \
 Print your review to stdout: scope check, correctness concerns, test coverage, \
 and end with a final line 'VERDICT: APPROVE' or 'VERDICT: REVISE — <reason>'." "$log"
   cp "$log" "$review"
-  echo "aw: review saved to $(relpath "$review")"
+  echo "loom: review saved to $(relpath "$review")"
 }
 
 # Bounded implement -> review -> fix -> review. A reviewer that still says
@@ -528,7 +559,7 @@ and end with a final line 'VERDICT: APPROVE' or 'VERDICT: REVISE — <reason>'."
 # The REVISE text is appended to the task file INSIDE the worktree: the copy
 # the implementer reads, and never your tree.
 cmd_loop() {
-  local task="${1:?usage: aw loop <task-id>}"
+  local task="${1:?usage: loom loop <task-id>}"
   local rounds="${LOOM_LOOP_ROUNDS:-2}"
   local wt review verdict tfile i=1
   wt="$(wt_path "$task")"
@@ -545,8 +576,8 @@ cmd_loop() {
     cmd_run "$task" || rc=$?
     case "$rc" in
       0) return 0 ;;
-      2) die "aw loop: implementer reported blocked — read $(relpath "$wt/.agents/reviews/$task-blocked.md")" ;;
-      *) die "aw loop: implementer never reached a green gate for $task — the spec is probably wrong" ;;
+      2) die "loom loop: implementer reported blocked — read $(relpath "$wt/.agents/reviews/$task-blocked.md")" ;;
+      *) die "loom loop: implementer never reached a green gate for $task — the spec is probably wrong" ;;
     esac
   }
 
@@ -554,44 +585,59 @@ cmd_loop() {
   review="$wt/.agents/reviews/$task-review.md"
   tfile="$wt/.agents/tasks/$task.md"
   while [ "$i" -le "$rounds" ]; do
-    echo "aw: [loop] review round $i/$rounds"
+    echo "loom: [loop] review round $i/$rounds"
     cmd_check "$task"
     verdict="$(grep '^VERDICT:' "$review" 2>/dev/null | tail -1 || true)"
     # No verdict line at all means a truncated or derailed review, not a
     # rejection — re-implementing on it would act on nothing.
-    [ -n "$verdict" ] || die "no VERDICT line in $(relpath "$review") — review truncated — re-run aw check $task"
+    [ -n "$verdict" ] || die "no VERDICT line in $(relpath "$review") — review truncated — re-run loom check $task"
     case "$verdict" in
-      *APPROVE*) echo "aw: [loop] APPROVE after $i round(s) — next: aw diff $task && aw land $task"
+      *APPROVE*) echo "loom: [loop] APPROVE after $i round(s) — next: loom diff $task && loom land $task"
                  return 0 ;;
     esac
     if [ "$i" -eq "$rounds" ]; then
-      echo "aw: [loop] still REVISE after $rounds round(s) — escalating to the coordinator." >&2
-      echo "aw: [loop] read $(relpath "$review"), then fix the task spec by hand." >&2
+      echo "loom: [loop] still REVISE after $rounds round(s) — escalating to the coordinator." >&2
+      echo "loom: [loop] read $(relpath "$review"), then fix the task spec by hand." >&2
       return 1
     fi
     [ -f "$tfile" ] || die "no task file in the worktree at $tfile — is .agents/tasks/ gitignored? commit it so agent worktrees see it"
     {
-      printf '\n## Auto fix round %s (aw loop — reviewer REVISE)\n\n' "$i"
+      printf '\n## Auto fix round %s (loom loop — reviewer REVISE)\n\n' "$i"
       printf '%s\n' "The reviewer returned REVISE. Address every point below. Keep all existing"
       printf '%s\n' "rulings from earlier rounds; do not weaken or delete tests to satisfy the"
       printf '%s\n\n' "reviewer."
       cat "$review"
     } >> "$tfile"
-    echo "aw: [loop] REVISE — fix round $i appended to $(relpath "$tfile" "$wt") in the worktree"
+    echo "loom: [loop] REVISE — fix round $i appended to $(relpath "$tfile" "$wt") in the worktree"
     implement
     i=$((i + 1))
   done
 }
 
 cmd_diff() {
-  local task="${1:?usage: aw diff <task-id>}"
+  local task="${1:?usage: loom diff <task-id>}"
   local wt base patch
   wt="$(wt_path "$task")"
   [ -d "$wt" ] || die "no worktree for $task"
   base="$(base_of "$task")"
   patch="$wt/.agents/reviews/$task.patch"
+  reviews_dir "$wt"
   ( cd "$wt" && git diff "$base" HEAD > "$patch" )
-  ${EDITOR:-vim} -R -c 'set filetype=diff' "$patch"
+  echo "loom: patch at $(relpath "$patch")" >&2
+  # No editor is assumed. LOOM_DIFF_CMD takes the patch path as its last
+  # argument (`delta`, `bat`, `less`, `code --wait`, `vim -R` — whatever you
+  # use); otherwise git shows it through its own pager, honouring your
+  # color.diff and core.pager settings.
+  if [ -n "${LOOM_DIFF_CMD:-}" ]; then
+    # Word-split on purpose: the value is a command line, not one filename.
+    # shellcheck disable=SC2086
+    set -- $LOOM_DIFF_CMD
+    [ "$#" -gt 0 ] || die "LOOM_DIFF_CMD is blank — the patch is at $patch"
+    have "$1" || die "LOOM_DIFF_CMD: '$1' is not on PATH — the patch is at $patch"
+    "$@" "$patch"
+  else
+    ( cd "$wt" && git diff "$base" HEAD )
+  fi
 }
 
 cmd_land() {
@@ -602,17 +648,17 @@ cmd_land() {
       --force)      force=yes ;;
       --pr)         mode="pr" ;;
       --merge)      mode="merge" ;;
-      -*)           die "aw land: unknown flag '$a' — usage: aw land <task-id> [--pr|--merge] [--force]" ;;
-      *)            if [ -z "$task" ]; then task="$a"; else die "aw land: unexpected argument '$a'"; fi ;;
+      -*)           die "loom land: unknown flag '$a' — usage: loom land <task-id> [--pr|--merge] [--force]" ;;
+      *)            if [ -z "$task" ]; then task="$a"; else die "loom land: unexpected argument '$a'"; fi ;;
     esac
   done
-  [ -n "$task" ] || die "usage: aw land <task-id> [--pr|--merge] [--force]"
+  [ -n "$task" ] || die "usage: loom land <task-id> [--pr|--merge] [--force]"
   case "$mode" in merge|pr) ;; *) die "LOOM_LAND must be 'merge' or 'pr' (got '$mode')" ;; esac
   wt="$(wt_path "$task")"; br="$(branch_of "$task")"
   [ -d "$wt" ] || die "no worktree for $task"
   if [ -z "$force" ]; then
-    echo "aw: running gate in worktree before landing"
-    ( cd "$wt" && ./.agents/gate.sh ) || die "gate is red in $br — fix it or land with: aw land $task --force"
+    echo "loom: running gate in worktree before landing"
+    ( cd "$wt" && ./.agents/gate.sh ) || die "gate is red in $br — fix it or land with: loom land $task --force"
   fi
 
   if [ "$mode" = pr ]; then
@@ -621,12 +667,12 @@ cmd_land() {
     title="$(head -1 "$AGENTS_DIR/tasks/$task.md" 2>/dev/null | sed 's/^#[[:space:]]*//')"
     [ -n "$title" ] || title="$task"
     echo ""
-    echo "aw: pushed $br. NOT merged — next steps are yours:"
+    echo "loom: pushed $br. NOT merged — next steps are yours:"
     echo ""
     echo "    gh pr create --head $br --title \"agent($task): $title\""
     echo ""
-    echo "aw: worktree kept at $wt (drop it once the PR exists: aw drop $task --keep-branch)"
-    echo "aw: tick the plan checkbox for $task by hand when the PR merges."
+    echo "loom: worktree kept at $wt (drop it once the PR exists: loom drop $task --keep-branch)"
+    echo "loom: tick the plan checkbox for $task by hand when the PR merges."
     return 0
   fi
 
@@ -635,7 +681,7 @@ cmd_land() {
   git branch -d "$br"
   plan="$(grep -rl -- "$task" "$AGENTS_DIR/plans" 2>/dev/null | head -1 || true)"
   [ -n "$plan" ] && sedi "s/- \[ \] $task/- [x] $task/" "$plan"
-  echo "aw: landed $task"
+  echo "loom: landed $task"
 }
 
 cmd_rebase() { # rebase agent/<task> onto origin/main and re-point loombase
@@ -646,10 +692,10 @@ cmd_rebase() { # rebase agent/<task> onto origin/main and re-point loombase
   # since as "unauthorized" changes and an auto-fix round may try to revert
   # them. This rebases and re-points the base at the REPLAYED base commit
   # (matched by patch-id), falling back to the merge-base with a warning.
-  local task="${1:?usage: aw rebase <task-id> [<upstream>]}" upstream="${2:-origin/main}"
+  local task="${1:?usage: loom rebase <task-id> [<upstream>]}" upstream="${2:-origin/main}"
   local wt br old_base old_pid new_base mb c
   wt="$(wt_path "$task")"; br="$(branch_of "$task")"
-  [ -d "$wt" ] || die "no worktree for $task (aw new first)"
+  [ -d "$wt" ] || die "no worktree for $task (loom new first)"
   [ -z "$(git -C "$wt" status --porcelain)" ] || die "worktree $wt is dirty — commit or stash first"
   old_base="$(git config "branch.$br.loombase" 2>/dev/null)" || die "no loombase recorded for $br"
   old_pid="$(git show "$old_base" | git patch-id --stable | cut -d' ' -f1)"
@@ -668,11 +714,11 @@ cmd_rebase() { # rebase agent/<task> onto origin/main and re-point loombase
     done
     if [ -z "$new_base" ]; then
       new_base="$mb"
-      echo "aw: replayed base not found by patch-id; loombase set to the merge-base $(git rev-parse --short "$mb") — the reviewer may now see the plan/task commit as a change" >&2
+      echo "loom: replayed base not found by patch-id; loombase set to the merge-base $(git rev-parse --short "$mb") — the reviewer may now see the plan/task commit as a change" >&2
     fi
   fi
   git config "branch.$br.loombase" "$new_base"
-  echo "aw: $br rebased onto $upstream; loombase $(git rev-parse --short "$old_base") -> $(git rev-parse --short "$new_base")"
+  echo "loom: $br rebased onto $upstream; loombase $(git rev-parse --short "$old_base") -> $(git rev-parse --short "$new_base")"
 }
 
 cmd_drop() {
@@ -681,11 +727,11 @@ cmd_drop() {
   for a in "$@"; do
     case "$a" in
       --keep-branch) keep=yes ;;
-      -*)            die "aw drop: unknown flag '$a' — usage: aw drop <task-id> [--keep-branch]" ;;
-      *)             if [ -z "$task" ]; then task="$a"; else die "aw drop: unexpected argument '$a'"; fi ;;
+      -*)            die "loom drop: unknown flag '$a' — usage: loom drop <task-id> [--keep-branch]" ;;
+      *)             if [ -z "$task" ]; then task="$a"; else die "loom drop: unexpected argument '$a'"; fi ;;
     esac
   done
-  [ -n "$task" ] || die "usage: aw drop <task-id> [--keep-branch]"
+  [ -n "$task" ] || die "usage: loom drop <task-id> [--keep-branch]"
   wt="$(wt_path "$task")"; br="$(branch_of "$task")"
   git worktree remove "$wt" --force 2>/dev/null || true
   if [ -n "$keep" ]; then
@@ -699,10 +745,10 @@ cmd_drop() {
     else
       where="— NOT on origin yet: git push -u origin $br"
     fi
-    echo "aw: dropped worktree for $task — branch $br kept $where"
+    echo "loom: dropped worktree for $task — branch $br kept $where"
   else
     git branch -D "$br" 2>/dev/null || true
-    echo "aw: dropped $task"
+    echo "loom: dropped $task"
   fi
 }
 
@@ -712,9 +758,9 @@ cmd_ls() { git worktree list | grep -F "$WT_ROOT" || echo "(no agent worktrees)"
 cmd_plan() {
   local headless="" topic
   [ "${1:-}" = "-p" ] && { headless=yes; shift; }
-  topic="${*:?usage: aw plan [-p] \"<topic>\"}"
+  topic="${*:?usage: loom plan [-p] \"<topic>\"}"
   mkdir -p "$AGENTS_DIR/plans" "$AGENTS_DIR/tasks" "$AGENTS_DIR/reviews" "$AGENTS_DIR/decisions"
-  local prompt="Design: $topic. For codebase questions run 'aw scout \"<question>\"' \
+  local prompt="Design: $topic. For codebase questions run 'loom scout \"<question>\"' \
 in the shell instead of reading source files yourself, and treat uncited scout \
 claims as unknown. Write a plan to .agents/plans/ (next number, kebab-slug) \
 following .agents/PLAN_TEMPLATE.md, and one task file per non-HAND task in \
@@ -724,9 +770,9 @@ todo!(), a failing test — never the implementation). Do not create or edit any
 file outside .agents/."
   local first; first="$(pick_model architect)"
   if [ "$first" = claude-sub ] && [ -z "$headless" ]; then
-    echo "aw: architect on your Claude subscription (interactive). Ctrl-D to end."
+    echo "loom: architect on your Claude subscription (interactive). Ctrl-D to end."
     claude --append-system-prompt "$(cat "$PROMPTS_DIR/architect.md")" "$prompt" \
-      || { echo "aw: claude exited non-zero — if rate-limited, try: eval \"\$(aw tier lean)\" && aw plan -p \"$topic\"" >&2; return 1; }
+      || { echo "loom: claude exited non-zero — if rate-limited, try: eval \"\$(loom tier lean)\" && loom plan -p \"$topic\"" >&2; return 1; }
   else
     run_role architect "$ROOT" "$prompt"
   fi
@@ -755,7 +801,7 @@ scout_root() {
 }
 
 cmd_scout() {
-  local q="${*:?usage: aw scout \"<question>\"}"
+  local q="${*:?usage: loom scout \"<question>\"}"
   local wd; load_fence; wd="$(scout_root)"
   run_role scout "$wd" "$q$(fence_note)"
 }
@@ -763,10 +809,10 @@ cmd_scout() {
 cmd_gate() { exec "$AGENTS_DIR/gate.sh"; }
 
 cmd_tier() {
-  local t="${1:?usage: aw tier lean|standard|deep}"
+  local t="${1:?usage: loom tier lean|standard|deep}"
   case "$t" in lean|standard|deep) ;; *) die "unknown tier: $t" ;; esac
   echo "export LOOM_TIER=$t"
-  echo "# apply with: eval \"\$(aw tier $t)\"" >&2
+  echo "# apply with: eval \"\$(loom tier $t)\"" >&2
 }
 
 # -------------------------------------------------------------------- doctor
@@ -821,7 +867,7 @@ cmd_doctor() {
     else note "key file $LOOM_ENV mode is $perms — run: chmod 600 $LOOM_ENV"; fi
     grep -q 'PASTE-YOUR' "$LOOM_ENV" && note "key file still has placeholder values"
   else
-    note "no key file at $LOOM_ENV (aw sources it if present)"
+    note "no key file at $LOOM_ENV (loom sources it if present)"
   fi
   [ -n "${ZHIPU_API_KEY:-}" ]    && pass "ZHIPU_API_KEY set (Z.ai)"      || note "ZHIPU_API_KEY not set (ZAI_API_KEY also accepted)"
   [ -n "${MOONSHOT_API_KEY:-}" ] && pass "MOONSHOT_API_KEY set"          || note "MOONSHOT_API_KEY not set"
@@ -855,22 +901,41 @@ cmd_doctor() {
             [ -n "$orphan" ] && note "fence pattern matches no tracked file (typo?): $orphan"
           done < <(zones_py fence-orphans 2>/dev/null || true)
           while IFS= read -r odd; do
-            [ -n "$odd" ] && note "fence pattern is not the plain 'subsystem/**' form: $odd — sparse checkout reads it as gitignore, aw zone as fnmatch (ARCHITECTURE.md § 5, caveat 3)"
+            [ -n "$odd" ] && note "fence pattern is not the plain 'subsystem/**' form: $odd — sparse checkout reads it as gitignore, loom zone as fnmatch (ARCHITECTURE.md § 5, caveat 3)"
           done < <(zones_py fence-shape 2>/dev/null || true)
         fi
       else
-        fail "${fpaths#aw: }"
+        fail "${fpaths#loom: }"
       fi
     else
       fail "zones.toml unreadable (bad TOML, or no tomllib/tomli — see binaries): agent/* commits are BLOCKED until this is fixed"
     fi
   else note "no zones.toml — everything defaults to assist"; fi
-  [ -x "$ROOT/.git/hooks/pre-commit" ] && pass "pre-commit hook installed" || note "pre-commit hook not installed (aw install-hooks)"
-  if [ -x "$ROOT/.git/hooks/pre-commit.pre-loom" ]; then
+  # A hook written before the aw→loom rename calls `aw guard`, and its own
+  # "not on PATH" branch exits 0 — so the hand-zone guard is silently disarmed
+  # rather than broken. That has to read as a failure, not a warning.
+  local hookf; hookf="$(hook_path)"
+  if [ -x "$hookf" ]; then
+    if grep -q 'aw guard' "$hookf"; then
+      fail "pre-commit hook still calls the pre-rename 'aw' dispatcher — with aw off PATH the hand-zone guard skips silently. Fix with: loom install-hooks"
+    else
+      pass "pre-commit hook installed"
+    fi
+  else
+    note "pre-commit hook not installed (loom install-hooks)"
+  fi
+  if [ -x "$hookf.pre-loom" ]; then
     pass "pre-existing pre-commit hook chained (pre-commit.pre-loom)"
   fi
+  # install.sh never overwrites these, so a pre-rename repo keeps `aw` in them;
+  # the VS Code tasks and the AGENTS.md scout line actually invoke it.
+  local stale_f stale_list=""
+  for stale_f in .vscode/tasks.json AGENTS.md .opencode/opencode.json .agents/zones.toml; do
+    if [ -f "$ROOT/$stale_f" ] && grep -qw aw "$ROOT/$stale_f"; then stale_list="$stale_list $stale_f"; fi
+  done
+  if [ -n "$stale_list" ]; then note "still say the pre-rename 'aw' command — edit by hand:$stale_list"; fi
   if [ "${LOOM_LAND:-merge}" = pr ]; then
-    have gh && pass "LOOM_LAND=pr — gh on PATH ($(command -v gh)); aw prints the command, never runs it" \
+    have gh && pass "LOOM_LAND=pr — gh on PATH ($(command -v gh)); loom prints the command, never runs it" \
              || note "LOOM_LAND=pr — gh not on PATH; open the PR from the printed branch by hand"
   fi
 
@@ -909,38 +974,49 @@ cmd_doctor() {
   done
 
   echo ""
-  echo "aw doctor: $ok ok, $warn warnings, $bad failures"
+  echo "loom doctor: $ok ok, $warn warnings, $bad failures"
   [ "$bad" -eq 0 ]
 }
 
 cmd_install_hooks() {
-  local hook="$ROOT/.git/hooks/pre-commit"
-  local prev="$hook.pre-loom"
+  local hook prev; hook="$(hook_path)"; prev="$hook.pre-loom"
+  # Under core.hooksPath the hook may live in a tracked directory (.githooks/):
+  # that file is the team's, and rewriting it would ride into the next commit.
+  # Refuse and say what to add by hand. A RELATIVE hooksPath is also
+  # per-worktree, so agent worktrees only see a hook that is committed.
+  if git ls-files --error-unmatch "$hook" >/dev/null 2>&1; then
+    die "$hook is tracked by git (core.hooksPath) — add this line to it by hand instead: loom guard || exit \$?"
+  fi
+  case "$(git config core.hooksPath 2>/dev/null || true)" in
+    "") ;;
+    /*) echo "loom: note — core.hooksPath is set; installing the guard at $hook" >&2 ;;
+    *)  echo "loom: note — core.hooksPath is relative, so agent worktrees will only run this hook once it is committed: $hook" >&2 ;;
+  esac
   mkdir -p "$(dirname "$hook")"
   # Never silently eat somebody else's hook: move it aside and chain to it.
   # Re-running is a no-op because our own hook carries the marker string.
   if [ -e "$hook" ] && ! grep -q 'Loom hand-zone guard' "$hook"; then
     [ -e "$prev" ] && die "$hook is not Loom's and $prev already exists — merge them by hand, then re-run"
     mv "$hook" "$prev"
-    echo "aw: existing pre-commit hook moved to $prev (it still runs, after the guard)"
-    [ -x "$prev" ] || echo "aw: note — $prev is not executable, so it stays inert (as it was)"
+    echo "loom: existing pre-commit hook moved to $prev (it still runs, after the guard)"
+    [ -x "$prev" ] || echo "loom: note — $prev is not executable, so it stays inert (as it was)"
   fi
   cat > "$hook" << 'HOOK'
 #!/usr/bin/env bash
-# Loom hand-zone guard. Logic lives in `aw guard` so it stays in one place.
+# Loom hand-zone guard. Logic lives in `loom guard` so it stays in one place.
 # Any hook that was here before is preserved as pre-commit.pre-loom and runs
 # after the guard, so installing Loom never disables an existing hook.
-if command -v aw >/dev/null 2>&1; then
-  aw guard || exit $?
+if command -v loom >/dev/null 2>&1; then
+  loom guard || exit $?
 else
-  echo "pre-commit: aw not on PATH — hand-zone guard skipped" >&2
+  echo "pre-commit: loom not on PATH — hand-zone guard skipped" >&2
 fi
 prev="$(dirname "$0")/pre-commit.pre-loom"
 [ -x "$prev" ] && exec "$prev" "$@"
 exit 0
 HOOK
   chmod +x "$hook"
-  echo "aw: installed $hook"
+  echo "loom: installed $hook"
 }
 
 # ------------------------------------------------------------------ dispatch
@@ -963,5 +1039,5 @@ case "${1:-}" in
   guard)  shift; cmd_guard "$@" ;;
   install-hooks) shift; cmd_install_hooks "$@" ;;
   ""|-h|--help|help) awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0" ;;
-  *) die "unknown command '$1' — try: aw help" ;;
+  *) die "unknown command '$1' — try: loom help" ;;
 esac

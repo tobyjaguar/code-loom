@@ -12,25 +12,25 @@
     {
       "label": "loom: scout",
       "type": "shell",
-      "command": "aw scout \"${input:scoutQ}\"",
+      "command": "loom scout \"${input:scoutQ}\"",
       "problemMatcher": []
     },
     {
       "label": "loom: run task",
       "type": "shell",
-      "command": "aw run ${input:taskId}",
+      "command": "loom run ${input:taskId}",
       "problemMatcher": []
     },
     {
       "label": "loom: check task (cross-provider review)",
       "type": "shell",
-      "command": "aw check ${input:taskId}",
+      "command": "loom check ${input:taskId}",
       "problemMatcher": []
     },
     {
       "label": "loom: doctor",
       "type": "shell",
-      "command": "aw doctor",
+      "command": "loom doctor",
       "problemMatcher": []
     }
   ],
