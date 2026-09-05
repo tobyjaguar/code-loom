@@ -11,7 +11,7 @@
 #   aw run   0007-c                  run the implementer in that worktree
 #   aw check 0007-c                  cheap cross-provider review of the diff
 #   aw loop  0007-c                  run, review, feed REVISE back, review again
-#   aw diff  0007-c                  open the task diff read-only in $EDITOR
+#   aw diff  0007-c                  write + open the task diff read-only in $EDITOR
 #   aw land  0007-c                  gate, merge, clean up, tick the checkbox
 #   aw land  0007-c --pr             gate, push agent/0007-c, print PR next steps
 #   aw drop  0007-c [--keep-branch]  discard worktree (and branch, unless kept)
@@ -24,14 +24,18 @@
 #   aw guard                         pre-commit zone check (used by the hook)
 #   aw install-hooks                 install the hand-zone commit guard
 #
-#   --fence-profile <name>           REQUIRED on new, run, check, loop, rebase
-#                                    and land for a task under a fence profile,
-#                                    every time. The patterns the profile
-#                                    releases stay in the worktree, and every
-#                                    model that runs there must be one the
-#                                    profile allows. The branch record only
-#                                    checks your flag; it never replaces it.
-#                                    (README § Fence profiles)
+#   --fence-profile <name>           REQUIRED on new, run, check, loop, diff,
+#                                    rebase and land for a task under a fence
+#                                    profile, every time. The patterns the
+#                                    profile releases stay in the worktree, and
+#                                    every model that runs there must be one
+#                                    the profile allows. Its worktree lives
+#                                    under a separate root ($LOOM_WORKTREES
+#                                    with "-profiled" appended). The branch
+#                                    record only checks your flag; it never
+#                                    replaces it, and a missing record is a
+#                                    refusal, not something aw infers from the
+#                                    worktree. (README § Fence profiles)
 #
 # Env:
 #   LOOM_TIER=lean|standard|deep   model tier            (default standard)
@@ -1137,22 +1141,46 @@ base_of()   { git config "branch.$(branch_of "$1").loombase" 2>/dev/null || git 
 # weakest: it documents the intent of a task, and `aw new` honours it only when
 # the same name is also passed on the command line. The file is written by
 # whoever wrote the task — an architect agent included.
-task_profile() { # task_profile <task>  -> declared profile, or "" (never fails)
-  local f="$AGENTS_DIR/tasks/$1.md" line
+# The task file's HEADER BLOCK: the metadata paragraph under the title, where
+# `Zone:` lives. Scanning the whole file would let a `Fence-profile:` line
+# inside a code fence read as a declaration — and `aw loop` appends reviewer
+# output, verbatim, to this very file.
+#
+# The title is skipped wherever it is, not only on line 1: a file that opens
+# with a blank line used to have its `# title` treated as the whole header
+# block, and the blank line after it ended the block before `Fence-profile:`
+# was ever reached — a declaration silently ignored.
+task_header() { # task_header <task>   -> the header block on stdout
+  local f="$AGENTS_DIR/tasks/$1.md"
   [ -f "$f" ] || return 0
-  # The HEADER BLOCK only: the metadata paragraph under the title, where `Zone:`
-  # lives. Scanning the whole file would let a `Fence-profile:` line inside a
-  # code fence read as a declaration — and `aw loop` appends reviewer output,
-  # verbatim, to this very file.
-  line="$(awk '
-      /^[[:space:]]*(```|~~~)/ { exit }
-      /^##/                    { exit }
-      /^[[:space:]]*$/         { if (started) exit; next }
-      NR == 1 && /^#/          { next }
+  awk '
+      /^[[:space:]]*(```|~~~)/       { exit }
+      /^##/                          { exit }
+      /^[[:space:]]*$/               { if (started) exit; next }
+      !started && !title && /^#/     { title = 1; next }
       { started = 1; print }
-    ' "$f" | grep -m1 -i '^[[:space:]]*Fence-profile:' || true)"
+    ' "$f"
+}
+
+task_profile() { # task_profile <task>  -> declared profile, or "" (never fails)
+  local line
+  line="$(task_header "$1" | grep -m1 -i '^[[:space:]]*Fence-profile:' || true)"
   [ -n "$line" ] || return 0
-  printf '%s' "${line#*:}" | tr -d '[:space:]'
+  # `Fence-profile: codex   # confirm on the command line` is a comment, not
+  # part of the name (the README's own example is written that way). A profile
+  # name cannot contain '#', so cutting at the first whitespace-then-'#' is
+  # exact rather than lenient.
+  printf '%s' "${line#*:}" | sed 's/[[:space:]]#.*$//' | tr -d '[:space:]'
+}
+
+# Header-block lines that were MEANT to be a `Fence-profile:` declaration and
+# are not one: `Fence-profile :`, `Fence profile:`, `Fence_profile:`. Silence
+# here reads as "the declaration was honoured", which is the one thing it must
+# never read as, so `aw new` says so out loud.
+task_profile_nearmiss() { # task_profile_nearmiss <task>
+  task_header "$1" \
+    | grep -i -E '^[[:space:]]*fence[-_ ]?profile[[:space:]]*:' \
+    | grep -v -i -E '^[[:space:]]*fence-profile:' || true
 }
 
 branch_profile() { git config "branch.$(branch_of "$1").fenceprofile" 2>/dev/null || true; }
@@ -1284,6 +1312,15 @@ aw drop $task first.
 (If you used 'aw drop $task --keep-branch', that branch is holding work: land it
 or delete it deliberately with 'git branch -D $br' before reusing the task id.)"
   [ -f "$AGENTS_DIR/tasks/$task.md" ] || die "no task file: .agents/tasks/$task.md"
+  # A key that was meant to be `Fence-profile:` and is not one is worse than no
+  # key at all: it looks like a declaration and does nothing. Say so.
+  local nm
+  while IFS= read -r nm; do
+    [ -n "$nm" ] || continue
+    echo "aw: WARN: .agents/tasks/$task.md header contains '$(printf '%s' "$nm" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')'" >&2
+    echo "aw: WARN: — that is NOT a fence-profile declaration and was not honoured." >&2
+    echo "aw: WARN: The key is spelled exactly 'Fence-profile:' (no space before the colon)." >&2
+  done <<< "$(task_profile_nearmiss "$task")"
   # The task file's declaration is intent, the flag is consent. A declaration
   # alone never opts a task in: the file is written by whoever wrote the task.
   decl="$(task_profile "$task")"
