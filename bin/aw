@@ -2401,6 +2401,15 @@ record a base this branch does not descend from. Inspect $wt, do not re-run."
     bad_h="$(zones_py_full history-hand "${HIST_PATHS[@]}")" \
       || die "cannot tell which zones the commits under the new base touch — refusing to guess"
     if [ -n "$bad_f$bad_h" ]; then
+      # Put the branch back first. The rebase has already replayed it, and a
+      # branch left sitting on the refused upstream carries those commits in
+      # `old_base..tip` — so every later command, INCLUDING the
+      # `--accept-upstream` re-run, would die on the branch's own history
+      # instead. A refusal has to leave the task exactly as it found it. The
+      # tree was verified clean above, so this discards nothing.
+      git -C "$wt" reset --hard "$PINNED_TIP" >/dev/null 2>&1 \
+        || echo "aw: WARNING: could not put $br back at $PINNED_TIP after refusing this
+rebase — the branch is left on $upstream. Inspect $wt." >&2
       die "the commits this rebase would put UNDER task $task's base touch paths aw will
 not bury silently:
 ${bad_f:+
@@ -2415,8 +2424,9 @@ $(git log --oneline "$old_base..$new_base" 2>/dev/null | sed 's/^/    /')
 Below the base nothing looks at them again — not the fence check, not the hand
 check, not the review patch. 'origin/main' is one 'git update-ref' away from any
 commit, and unlike your own 'main' a moved 'origin/main' is visible nowhere.
-The base was NOT moved; the branch has been replayed, so read those commits and
-then either accept them under the base:
+Nothing changed: the base was not moved and the branch is back at
+$(git rev-parse --short "$PINNED_TIP"). Read those commits, then either accept
+them under the base:
   aw rebase $task $upstream${FLAG_PROFILE:+ --fence-profile $FLAG_PROFILE} --accept-upstream
 or throw the task away:  aw drop $task"
     fi
