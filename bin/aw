@@ -146,8 +146,8 @@ RESOLVE
   real="$(printf '%s\n' "$out" | sed -n 2p)"
   [ -n "$want" ] && [ -n "$real" ] || die "cannot resolve the worktree root $lit"
   [ "$real" = "$want" ] || die "worktree root $lit resolves to $real, which is not
-where its name says it is. Something replaced it with a symlink; inspect it, do
-not re-run."
+where its name says it is — a '..' component in the path, or something that
+replaced the root itself with a symlink. Inspect it, do not re-run."
   printf '%s\n' "$want"
 }
 
@@ -755,7 +755,13 @@ def tracked_in(wt=None):
 def static_prefix(g):
     """The leading directory part of a pattern that contains no glob
     metacharacter — the place on disk a walk for it has to start.
-    'core/**' -> 'core', 'crates/*/tests/**' -> 'crates', '*.key' -> ''."""
+    'core/**' -> 'core', 'crates/*/tests/**' -> 'crates', '*.key' -> ''.
+
+    A pattern whose FIRST segment globs ('*.key', '*/secrets/**') therefore
+    returns '', and present_on_disk then walks the whole worktree for it. That
+    is correct and it is not free: it is the cost of a fence pattern that does
+    not start with a literal directory. `aw doctor`'s fence-shape warning
+    already flags every pattern that is not the plain 'subsystem/**' form."""
     out = []
     for seg in g.split("/"):
         if any(c in seg for c in "*?["):
@@ -1122,7 +1128,7 @@ fence_enforce() { # fence_enforce <worktree>
 #   present  = fenced paths (the FULL [fence]) actually in the worktree
 #   asserted = the profile the OPERATOR named on this command line ("" = none)
 #
-# Four rules, and there is no fifth:
+# Five rules, and there is no sixth:
 #   1. present, and a profile is asserted that releases every one of them:
 #      re-apply that profile's effective fence, verify, run. (The caller has
 #      already checked the chain of the role about to run.)
@@ -1144,7 +1150,8 @@ fence_enforce() { # fence_enforce <worktree>
 #      the fix.
 #   5. nothing present, nothing asserted: the ordinary path — apply and verify
 #      the full fence, as `aw run` has always done. (Not a rule about a
-#      release; the ordinary case.)
+#      release; it is the ordinary case, and it is numbered so that the count
+#      above matches the list.)
 fence_reconcile() { # fence_reconcile <worktree> <asserted-profile-or-empty>
   local wt="$1" asserted="${2:-}" present p stray=""
   [ -d "$wt" ] || return 0
@@ -1166,7 +1173,14 @@ This worktree was built under a different fence. Start clean:
     # Nothing released is on disk. If the profile releases nothing tracked there
     # is nothing to introduce and nothing to check; otherwise this tree predates
     # the profile and must not gain it now.
-    if [ -z "$present" ] && [ -n "$(zones_py profile-tracked "$wt")" ]; then
+    #
+    # The exit status is captured, not inferred from the output: `[ -n "$(…)" ]`
+    # reads a zones_py that DIED as "this profile releases nothing tracked" and
+    # walks straight past the refusal. Fail-closed by construction.
+    local tracked=""
+    tracked="$(zones_py profile-tracked "$wt")" \
+      || die "cannot tell which of fence profile '$asserted's released paths are tracked in $wt — refusing to guess"
+    if [ -z "$present" ] && [ -n "$tracked" ]; then
       die "worktree $wt holds none of the paths fence profile '$asserted' releases.
 It was not created under that profile, and a profile cannot be introduced after
 'aw new' — the branch record is not evidence, the tree is. Start clean:
@@ -1330,7 +1344,7 @@ cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
   # whether released content ever reaches a provider is the operator's
   # --fence-profile flag on `aw new`, checked again on every later command,
   # and `aw land`'s check of the commits themselves.
-  local prof present p
+  local prof present p tracked
   prof="$(git config "branch.$branch.fenceprofile" 2>/dev/null || true)"
   if [ -n "$prof" ]; then
     fence_profile_activate "$prof"     # dies on an unknown or unreadable profile
@@ -1347,7 +1361,10 @@ cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
       echo "every fenced path by design — commit from the agent worktree instead.)" >&2
       exit 1
     done <<< "$present"
-    if [ -z "$present" ] && [ -n "$(zones_py profile-tracked "$ROOT")" ]; then
+    tracked="$(zones_py profile-tracked "$ROOT")" || {
+      echo "pre-commit: cannot tell which released paths this tree tracks — refusing to guess" >&2
+      exit 1; }
+    if [ -z "$present" ] && [ -n "$tracked" ]; then
       echo "pre-commit: BLOCKED — this branch records fence profile '$prof', but none of" >&2
       echo "the paths that profile releases are in this worktree. The record was not" >&2
       echo "written by the 'aw new' that built this tree; refusing to honour it." >&2
