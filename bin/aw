@@ -493,7 +493,7 @@ run_role() { # run_role <role> <workdir> <prompt> [<logfile>]
 zones_py() { # zones_py <mode> [arg]
   #   parse | zone <path> | fenced <path> | fence-paths
   #   fence-orphans | fence-shape | fence-present <worktree>
-  #   fence-present-full <worktree>
+  #   fence-present-full <worktree>   (both answer from the index AND the disk)
   #   history-fence <path>... | history-hand <path>...
   #   profiles | profile-release | profile-providers | profile-released <path>
   #   profile-tracked <worktree>
@@ -703,6 +703,75 @@ def tracked_in(wt=None):
         die("git ls-files failed in %s" % (wt or os.getcwd()))
     return r.stdout.splitlines()
 
+def static_prefix(g):
+    """The leading directory part of a pattern that contains no glob
+    metacharacter — the place on disk a walk for it has to start.
+    'core/**' -> 'core', 'crates/*/tests/**' -> 'crates', '*.key' -> ''."""
+    out = []
+    for seg in g.split("/"):
+        if any(c in seg for c in "*?["):
+            break
+        out.append(seg)
+    return "/".join(out)
+
+def present_on_disk(wt, patterns):
+    """Every path under <wt> that one of `patterns` covers and that is ACTUALLY
+    ON DISK — tracked or not. `git ls-files` answers the index, and the index
+    is not the tree: `git show HEAD:core/lib.rs > core/copy.rs` puts fenced
+    content back into a fenced directory without touching the index at all,
+    and a reconcile that only reads the index never sees it.
+
+    Not covered, and never will be: content copied to a path the fence does
+    NOT name (core/lib.rs -> backend/notes.txt). That is the exfiltration
+    class — ARCHITECTURE.md § 5, caveat 1 — and the answer to it is a separate
+    repository, not a check.
+
+    A directory that a pattern covers WHOLE (the pattern also matches a probe
+    path beneath it) is reported as itself and not descended into: hit() is
+    prefix-shaped for those patterns, so every file under it would carry the
+    same verdict from profile_releases, and a 60k-file build directory under a
+    fenced path must not cost a walk on every model launch. The config
+    validator has already refused a release that swallows a pattern which
+    stays fenced, so 'same verdict' holds for the profile lookup too."""
+    found = set()
+    starts = set()
+    for g in patterns:
+        pre = static_prefix(g)
+        starts.add(pre)
+    for pre in sorted(starts):
+        root = os.path.join(wt, pre) if pre else wt
+        rel0 = pre
+        if os.path.islink(root) or not os.path.exists(root):
+            # A symlink standing where a fenced path should be is itself a
+            # thing that is present.
+            if os.path.islink(root) and any(hit(rel0, g) for g in patterns):
+                found.add(rel0)
+            continue
+        if not os.path.isdir(root):
+            if any(hit(rel0, g) for g in patterns):
+                found.add(rel0)
+            continue
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            rel = os.path.relpath(dirpath, wt)
+            rel = "" if rel == "." else rel.replace(os.sep, "/")
+            keep = []
+            for d in dirnames:
+                sub = ("%s/%s" % (rel, d)) if rel else d
+                if sub == ".git" or sub.endswith("/.git"):
+                    continue
+                whole = [g for g in patterns
+                         if hit(sub, g) and hit(sub + "/__aw_probe__", g)]
+                if whole:
+                    found.add(sub)          # stands for everything beneath it
+                    continue
+                keep.append(d)
+            dirnames[:] = keep
+            for f in filenames:
+                sub = ("%s/%s" % (rel, f)) if rel else f
+                if any(hit(sub, g) for g in patterns):
+                    found.add(sub)
+    return found
+
 if mode == "parse":                                    # exit 0 = readable TOML
     pass
 elif mode == "zone":
@@ -726,24 +795,29 @@ elif mode == "fence-shape":    # patterns where gitignore and fnmatch may differ
     for g in fence:
         if not plain.match(g):
             print(g)
-elif mode == "fence-present":  # fenced files still on disk in <worktree>
-    fence_sanity()
-    wt = args[0]
-    for p in tracked_in(wt):
-        if any(hit(p, g) for g in eff) and os.path.exists(os.path.join(wt, p)):
-            print(p)
-elif mode == "fence-present-full":
-    # The same question asked of the FULL [fence], whatever profile is active.
-    # This is what `fence_reconcile` reconciles against: "which fenced paths
-    # are on disk here" must not be answered by the very profile whose right
-    # to be active is what we are deciding. (The answer can only ever REFUSE a
+elif mode in ("fence-present", "fence-present-full"):
+    # Fenced paths still on disk in <worktree>: the EFFECTIVE fence for
+    # `fence-present` (what `fence_verify` proves), the FULL [fence] for
+    # `fence-present-full`, whatever profile is active. The full-fence form is
+    # what `fence_reconcile` reconciles against: "which fenced paths are on
+    # disk here" must not be answered by the very profile whose right to be
+    # active is what we are deciding. (The answer can only ever REFUSE a
     # command — a tree is writable by whatever runs in it, so it vouches for
     # nothing. The operator's flag is the consent.)
+    #
+    # Two sources, unioned: the index (tracked files that survived the sparse
+    # checkout) and the filesystem under each pattern's static prefix
+    # (anything the index does not know about — see present_on_disk).
     fence_sanity()
     wt = args[0]
+    pats = eff if mode == "fence-present" else fence
+    out = set()
     for p in tracked_in(wt):
-        if any(hit(p, g) for g in fence) and os.path.exists(os.path.join(wt, p)):
-            print(p)
+        if any(hit(p, g) for g in pats) and os.path.exists(os.path.join(wt, p)):
+            out.add(p)
+    out |= present_on_disk(wt, pats)
+    for p in sorted(out):
+        print(p)
 elif mode in ("history-fence", "history-hand"):
     # The paths a BRANCH's commits touch, judged without looking at the tree.
     # A worktree can be re-fenced after the fact — `git sparse-checkout set`
@@ -963,15 +1037,18 @@ fence_apply() { # fence_apply <worktree>
 }
 
 # Applying the patterns is not proof they took: git refuses to remove a file
-# with local modifications and only warns. Check the tree, not the config.
+# with local modifications and only warns, and a sparse checkout never touches
+# an UNTRACKED file at all. Check the tree — the real one, on disk — not the
+# config and not the index.
 fence_verify() { # fence_verify <worktree>
   local wt="$1" left
   left="$(zones_py fence-present "$wt")" || die "cannot verify the fence in $wt"
   [ -z "$left" ] && return 0
   die "fenced paths are STILL present in $wt:
 $(printf '%s\n' "$left" | sed 's/^/  /')
-git will not drop a file with local changes. Commit or discard them in the
-worktree, or start clean with: aw drop <task-id>"
+git will not drop a tracked file with local changes, and a sparse checkout
+never removes an untracked one. Commit or discard the changes in the worktree,
+delete the untracked files, or start clean with: aw drop <task-id>"
 }
 
 # (Re-)apply the fence to a worktree that may predate it, then prove it took.
@@ -988,7 +1065,10 @@ fence_enforce() { # fence_enforce <worktree>
 
 # ---------------------------------------------------------------- reconcile
 # THE gate between a worktree and a model. Driven by what is ON DISK — never by
-# branch.<br>.fenceprofile, which anything running in the worktree can write.
+# branch.<br>.fenceprofile, which anything running in the worktree can write,
+# and not by the index either: `git show HEAD:core/lib.rs > core/copy.rs`
+# leaves the index untouched, so "present" is answered from the filesystem as
+# well as from `git ls-files` (zones_py's present_on_disk).
 #
 #   present  = fenced paths (the FULL [fence]) actually in the worktree
 #   asserted = the profile the OPERATOR named on this command line ("" = none)

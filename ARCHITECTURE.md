@@ -190,6 +190,16 @@ confused agent asks instead of digging.
    exposure, not against exfiltration by an adversarial agent.** If your threat
    model includes the model actively trying to read what it was told not to,
    you need a separate repository, not a sparse checkout.
+
+   Be precise about where the line now falls, because the reconciler moved it
+   once. `fence_reconcile` asks "which fenced paths are present in this
+   worktree" of **both** the index and the filesystem: a path under a fenced
+   pattern is caught whether it is tracked, untracked, or a symlink standing
+   where the directory should be — so `git show HEAD:core/lib.rs >
+   core/copy.rs` is a dead stop, not an invisible one. What is still **not**
+   covered, and never will be by a check of this shape, is the same content
+   written to a path the fence does not name (`… > backend/notes.txt`), or
+   simply held in the model's context. That is the exfiltration class above.
 2. **Fenced code is genuinely missing from the build.** A fenced cargo
    workspace member, python package or npm workspace will fail to build *in the
    worktree*, because it is not there. Fence whole subsystems that you also
@@ -300,7 +310,9 @@ Semantics:
   once before the loop: attempt 1 can relax the sparse checkout and then hit a
   rate limit, and attempt 2 is a different provider. It computes "which fenced
   paths are on disk here" against the **full** `[fence]` — never the effective
-  set, which would be the profile vouching for itself — and then: released
+  set, which would be the profile vouching for itself — from the index *and*
+  from the filesystem under each pattern (tracked or not; caveat 1 above), and
+  then: released
   paths on disk with no assertion covering them is a **dead stop**, not a
   silent re-fence (the worktree's diff and `.agents/reviews/<task>.patch` carry
   the content into the next model even after the files are gone); an assertion
