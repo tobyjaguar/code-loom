@@ -269,9 +269,12 @@ run_role() { # run_role <role> <workdir> <prompt> [<logfile>]
 zones_py() { # zones_py <mode> [arg]
   #   parse | zone <path> | fenced <path> | fence-paths
   #   fence-orphans | fence-shape | fence-present <worktree>
+  #   fence-present-full <worktree>
   #   profiles | profile-release | profile-providers | profile-released <path>
+  #   profile-tracked <worktree>
   # The fence modes answer with the EFFECTIVE fence: [fence] minus the
-  # release list of $AW_FENCE_PROFILE, when one is set.
+  # release list of $AW_FENCE_PROFILE, when one is set. `fence-present-full`
+  # is the exception, and the one the reconciler uses: the FULL fence, always.
   python3 - "$AGENTS_DIR/zones.toml" "$@" << 'PY'
 import sys, os, re, fnmatch, subprocess
 
@@ -311,6 +314,22 @@ for _sec in ("hand", "assist", "auto", "fence"):
 
 fence = globs("fence")
 
+def hit(p, g):
+    if fnmatch.fnmatch(p, g): return True
+    if g.endswith("/**"):
+        base = g[:-3]
+        return p == base or fnmatch.fnmatch(p, base + "/*")
+    return False
+
+def probes(g):
+    """Sample paths a fence pattern stands for. Used to compare one pattern
+    against another (a release against the patterns that stay fenced), where
+    there is no file list to compare through."""
+    if g.endswith("/**"):
+        base = g[:-3]
+        return [base, base + "/__aw_probe__"]
+    return [g]
+
 # ---------------------------------------------------------- fence profiles
 # [fence_profiles.<name>] release = [...]  providers = [...]
 #
@@ -338,11 +357,35 @@ for _name, _p in profiles.items():
         if not isinstance(_v, list) or not _v or any(not isinstance(x, str) for x in _v):
             die("%s: [fence_profiles.%s].%s must be a non-empty list of strings"
                 % (zf, _name, _key))
+    # A provider name is compared against provider_of() output and is expanded
+    # unquoted in more than one shell loop upstream. Whitespace or a glob
+    # character here is not a typo, it is an escalation: providers = ["*"]
+    # would match anything a `for p in $allowed` loop globbed out of $ROOT.
+    for _x in _p["providers"]:
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_.@-]*$", _x):
+            die("%s: [fence_profiles.%s].providers contains %r — a provider name is "
+                "letters, digits, '_', '.', '@' and '-' only: no spaces, no glob "
+                "characters, not empty. Use provider_of() names, one per entry: "
+                "claude, codex, deepseek, moonshotai, zai, zai-coding-plan"
+                % (zf, _name, _x))
     for _g in _p["release"]:
         if _g not in fence:
             die("%s: [fence_profiles.%s].release lists '%s', which is not one of "
                 "[fence].paths — a profile may only release what the fence holds"
                 % (zf, _name, _g))
+    # A released pattern that another, still-fenced pattern also covers is a
+    # trap in both directions: the path never arrives in the worktree (the
+    # effective fence still hides it), while `aw guard` starts accepting
+    # commits to it. Reject the configuration rather than half-release.
+    _stay = [g for g in fence if g not in _p["release"]]
+    for _g in _p["release"]:
+        for _probe in probes(_g):
+            for _h in _stay:
+                if hit(_probe, _h):
+                    die("%s: [fence_profiles.%s].release lists '%s', but [fence] pattern "
+                        "'%s' still covers it — the release could not take effect, while "
+                        "the commit guard would start accepting it. Release '%s' as well, "
+                        "or narrow the fence." % (zf, _name, _g, _h, _h))
 
 prof = os.environ.get("AW_FENCE_PROFILE", "").strip()
 if prof and prof not in profiles:
@@ -350,13 +393,6 @@ if prof and prof not in profiles:
         % (prof, zf, ", ".join(sorted(profiles)) or "(none)"))
 released = profiles[prof]["release"] if prof else []
 eff = [g for g in fence if g not in released]   # the fence this run applies
-
-def hit(p, g):
-    if fnmatch.fnmatch(p, g): return True
-    if g.endswith("/**"):
-        base = g[:-3]
-        return p == base or fnmatch.fnmatch(p, base + "/*")
-    return False
 
 def fence_sanity():
     """Fencing the contract layer would disable the very things that police
@@ -413,11 +449,22 @@ elif mode == "fence-present":  # fenced files still on disk in <worktree>
     for p in tracked_in(wt):
         if any(hit(p, g) for g in eff) and os.path.exists(os.path.join(wt, p)):
             print(p)
+elif mode == "fence-present-full":
+    # The same question asked of the FULL [fence], whatever profile is active.
+    # This is what `fence_reconcile` reconciles against: the tree is the fact,
+    # and "which fenced paths are on disk here" must not be answered by the
+    # very profile whose right to be active is what we are deciding.
+    fence_sanity()
+    wt = args[0]
+    for p in tracked_in(wt):
+        if any(hit(p, g) for g in fence) and os.path.exists(os.path.join(wt, p)):
+            print(p)
 elif mode == "profiles":       # doctor listing: name \t providers \t release
     for name in sorted(profiles):
         pr = profiles[name]
         print("%s\t%s\t%s" % (name, ",".join(pr["providers"]), ",".join(pr["release"])))
-elif mode in ("profile-release", "profile-providers", "profile-released"):
+elif mode in ("profile-release", "profile-providers", "profile-released",
+              "profile-tracked"):
     if not prof:
         die("internal error: mode '%s' needs AW_FENCE_PROFILE" % mode)
     pr = profiles[prof]
@@ -427,6 +474,13 @@ elif mode in ("profile-release", "profile-providers", "profile-released"):
     elif mode == "profile-providers":
         for x in pr["providers"]:
             print(x)
+    elif mode == "profile-tracked":
+        # Tracked files this profile's release covers, in <worktree>. "None of
+        # these is on disk" is how `aw` tells a worktree that was BUILT under
+        # the profile from one a profile is being introduced into after the fact.
+        for p in tracked_in(args[0] if args else None):
+            if any(hit(p, g) for g in pr["release"]):
+                print(p)
     else:                      # 0 = released by this profile, 3 = still fenced
         raise SystemExit(0 if any(hit(args[0], g) for g in pr["release"]) else 3)
 else:
