@@ -305,7 +305,10 @@ part of the branch that still changes your runs:
   the exfiltration class; see "What a profile is not".)
 - **An existing branch is refused**, never walked over: `aw new` used to arm
   its cleanup trap before `git worktree add -b`, so an add that failed because
-  `agent/<task>` already existed deleted that branch and its commits.
+  `agent/<task>` already existed deleted that branch and its commits. A branch
+  the failing `aw new` *itself* created **is** removed, and it says so — `git
+  worktree add -b` creates the branch and can then fail on the path, and an
+  orphan there made the task id unusable forever.
 - **A fence that was widened under an existing worktree is refused**, not
   quietly re-applied — the worktree's own diff carries the content regardless.
   There is no "the record says this would have been fine" arm any more.
@@ -326,6 +329,68 @@ part of the branch that still changes your runs:
   the same copy the `claude` and `codex` legs already used — so if a repo's
   opencode roles depended on `AGENTS.md` reaching the model, that content has
   to move into the role prompt.
+- **Policy comes from the MAIN checkout, whichever tree you typed the command
+  in.** `$ROOT` used to be `git rev-parse --show-toplevel`, so `cd
+  <a worktree> && aw new t5` read *that worktree's* `.agents/zones.toml` (the
+  fence it was about to apply — an agent that emptied it got an unfenced task)
+  and sourced *that worktree's* `.agents/loom.env` as shell in your
+  environment. It is now the parent of `git rev-parse --git-common-dir`. One
+  thing still comes from the invoking tree, and only one: `aw guard`'s subject —
+  the staged files and the tree it is judging are the ones the commit is
+  happening in, while the zones it judges them by are the main checkout's.
+  (That also closes `docs/KNOWN-GAPS.md` gap 1.)
+- **The branch tip is resolved once per command, into a sha.** Every command
+  used to re-resolve `refs/heads/agent/<task>` per use — the history check, the
+  review patch, the merge, the push — and the ref lives in the shared `.git`,
+  one `git update-ref` from something else. The checks, the patch, `git merge
+  --no-ff <sha>` and `git push origin <sha>:refs/heads/agent/<task>` are now all
+  the same sha.
+- **`aw check` records the tip it reviewed; `aw land` refuses any other**,
+  naming both shas and asking for a fresh `aw check`. A commit added after the
+  reviewer read the patch does not ride the review into the merge. `--force`
+  skips the gate, not this. `aw rebase` clears the stamp, because the sha a
+  reviewer read no longer exists on a rebased branch.
+- **`aw run` and `aw land` run the OPERATOR's `.agents/gate.sh`** (with the
+  worktree as its cwd), never `<worktree>/.agents/gate.sh`. The worktree's copy
+  is a file the implementer edits — the `claude` leg even allowlists running it
+  — and it was deciding "green, commit it" and "green, land it". The
+  implementer still runs the worktree's copy for its own iteration; the verdict
+  `aw` acts on is yours.
+- **Landing refuses a dirty worktree.** Uncommitted work is not the branch's
+  work: what the reviewer read and what the merge would carry have come apart.
+  `.agents/reviews/` is excluded, because that is where `aw check` and `aw diff`
+  write the review patch themselves — **gitignore that directory** in a
+  consuming repo.
+- **`aw rebase` will not bury upstream commits under your base.** A rebase is
+  the one command that moves a recorded base, and everything between the old
+  base and the new one stops being the branch's work — it slides *under* the
+  base, where no fence check, no hand check and no review patch looks again.
+  `refs/remotes/origin/main` is one `git update-ref` from any commit, and unlike
+  your own `main` (the branch you are standing on, which moves in front of you)
+  a moved `origin/main` is visible nowhere. So the range `old_base..new_base` is
+  mapped through the **full** `[fence]` and `[hand]` — a profile releases paths
+  for the *task's* commits, and nobody released anything for what arrives from
+  upstream — and a hit refuses the rebase, printing the paths and `git log
+  --oneline old_base..new_base`, leaving the base where it was and the branch
+  where it was. `--accept-upstream` is the operator saying "I have read those
+  commits and I accept them under the base"; it prints them too. A failed `git
+  fetch` is a refusal for the same reason: replaying onto a stale upstream
+  succeeds quietly.
+- **`remote.origin.url` is pinned to the task.** Recorded at `aw new`;
+  `aw rebase` (before it fetches) and `aw land --pr` (before it pushes) refuse
+  when it differs. Remote config is in the shared `.git/config`.
+- **`aw run` with no operator record refuses before the model runs.** It used to
+  run one and commit, with the refusal arriving at `aw check` and the content
+  already on the branch.
+- **opencode's config variables never come out of the tree.** `OPENCODE_CONFIG`,
+  `OPENCODE_CONFIG_DIR`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_PERMISSION` and
+  `OPENCODE_DISABLE_PROJECT_CONFIG` are snapshotted before `.agents/loom.env` is
+  sourced and restored after, with a WARN naming any the file tried to set —
+  they decide which config opencode loads, and that config carries
+  `provider.<name>.options.baseURL`, which is the provider *identity* the whole
+  `providers` rule rests on. A caller that exports them still wins; the file
+  does not. `OPENCODE_CONFIG_CONTENT` (a whole config inline in a variable) is
+  stripped from every launch outright, caller included.
 - Independent of all of it: implementer-class roles on `claude-sub` and
   `codex-sub` get a write-capable sandbox (see "Codex as an implementer"
   below), and `aw doctor` prints the parse error when `zones.toml` is
@@ -358,11 +423,12 @@ runs at the full fence.
 a profile:
 
 ```sh
-aw new   0007-c --fence-profile codex
-aw run   0007-c --fence-profile codex
-aw check 0007-c --fence-profile codex
-aw diff  0007-c --fence-profile codex
-aw land  0007-c --fence-profile codex
+aw new    0007-c --fence-profile codex
+aw run    0007-c --fence-profile codex
+aw check  0007-c --fence-profile codex
+aw diff   0007-c --fence-profile codex
+aw rebase 0007-c --fence-profile codex
+aw land   0007-c --fence-profile codex
 ```
 
 **A profiled task's worktree lives under its own root.** `$LOOM_WORKTREES` with
@@ -434,14 +500,25 @@ The tree is only half the question, because a tree can be re-fenced after the
 fact: materialise `core/**`, commit it, put the sparse rules back, and the
 worktree looks clean while the *history* still carries it into every diff,
 patch file and merge. So the branch's commits are judged too — every path in
-`git diff <security base> HEAD`, mapped through the full `[fence]` — wherever
-history is handed onward: `aw check` (before the patch is written), each round
-of `aw loop`, `aw diff`, `aw rebase`, and `aw land` before it merges or pushes.
-`aw land` additionally refuses any `[hand]` path in those commits that the
-profile does not release; `--force` skips the gate, not this.
+`git diff <security base> refs/heads/agent/<task>`, mapped through the full
+`[fence]` — wherever history is handed onward: `aw check` (before the patch is
+written), each round of `aw loop`, `aw diff`, `aw rebase`, and `aw land` before
+it merges or pushes. `aw land` additionally refuses any `[hand]` path in those
+commits that the profile does not release; `--force` skips the gate, not this.
+
+Two honest limits of a diff between two endpoints. It answers "what do these
+commits, taken together, touch" — so a fenced path **added and then deleted
+again on the same branch** is not in it, even though both commits are in the
+history and `git log -p` shows the content. (The reconciler catches it while it
+is on disk, and the *first* command to run after the add sees it in the range;
+what is not covered is a branch that adds and removes it between two `aw`
+commands.) And it says nothing about what the model read: content copied to a
+path the fence does not name is the exfiltration class, below.
 
 The *base* is the operator record described above, and the *endpoint* is
-`refs/heads/agent/<task>` read in your checkout. Neither comes from the
+`refs/heads/agent/<task>` read in your checkout — resolved to a SHA **once per
+command**, and used as that sha for the history check, the review patch, the
+merge and the push. Neither comes from the
 worktree, and neither comes from anything in `.git` — that is the same sentence
 as three paragraphs up, and it cost a whole class of bypass (a `loombase`
 pointed at the branch's own tip, or an `origin/main` moved there with `git
@@ -455,7 +532,10 @@ only command that moves a recorded base, and it is one of yours.
 conventionally listed under `[hand]` too (that is what blocks a *commit* to
 them); under a profile the guard accepts commits to exactly the released
 patterns and still blocks everything else in `[hand]` — `.agents/zones.toml`,
-migrations, whatever your repo lists. It reads the operator record for that
+`.agents/gate.sh`, `.agents/loom.env`, migrations, whatever your repo lists.
+The zones it applies are the **main checkout's**, even though it is running
+inside the agent's worktree; only the staged files and the tree it inspects are
+the worktree's. It reads the operator record for the released set
 (the hook runs as you, so it can), and corroborates it against the tree first
 (a record whose released paths are not in the worktree refuses the commit). It
 is a pre-commit hook running in the agent's own context, where `--no-verify`

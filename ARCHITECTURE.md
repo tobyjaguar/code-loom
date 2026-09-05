@@ -213,7 +213,12 @@ confused agent asks instead of digging.
    which catches the usual typo.
 4. **It is per-worktree, not per-repo.** Your own working tree is untouched —
    the sparse config is written to the worktree-scoped config, so nothing
-   disappears from under your editor.
+   disappears from under your editor. The *definition* of the fence is
+   per-repo and comes from ONE place: `.agents/zones.toml` in the MAIN
+   checkout, which `aw` finds as the parent of `git rev-parse
+   --git-common-dir` whichever tree the command was typed in. A command run
+   from inside an agent worktree used to read that worktree's copy — the
+   file the agent can edit — and fence the next task with it.
 5. **A worktree can predate the fence.** Sparse rules are applied when a
    worktree is built, so one created before `[fence]` existed — or before it
    was widened — still holds the paths you have since fenced. `aw scout`
@@ -229,6 +234,14 @@ Fencing `.agents/**` is refused outright. Removing `zones.toml` from a worktree
 would make every path resolve to `assist` and `aw guard` exit 0 — the fence
 would quietly disarm the hand-zone boundary — and removing `gate.sh` would make
 the gate exit 127 and burn every retry.
+
+The three control-plane files an agent must be able to READ and must never
+COMMIT — `.agents/zones.toml`, `.agents/gate.sh` and `.agents/loom.env` — are
+`[hand]` paths in the shipped template, which is what makes `aw land` refuse a
+branch that changed them. They are each an input to the checks that judge the
+agent's own work: the zones and the fence, the script whose exit status means
+"commit it" and "land it", and a file `aw` `.`-sources as shell in your
+environment on every invocation.
 
 ### Fence profiles
 
@@ -338,7 +351,9 @@ Semantics:
   `codex` legs already used.
 - **Enforcement is a consistency check against the tree AND the commits.**
   `fence_reconcile <wt> <asserted>` runs before any role in
-  `run`/`check`/`loop`/`rebase`/`land`, and again inside `run_role` for any
+  `run`/`check`/`loop`/`diff`/`rebase`/`land` — `diff` included, because it
+  writes the same `.agents/reviews/<task>.patch` a reviewer is handed — and
+  again inside `run_role` for any
   workdir under either worktree root — **before every fallback attempt**, not
   once before the loop: attempt 1 can relax the sparse checkout and then hit a
   rate limit, and attempt 2 is a different provider. It computes "which fenced
@@ -353,14 +368,25 @@ Semantics:
   tree was not built under the profile.
 
   The tree alone is not enough, because a tree can be re-fenced after the fact.
-  `fence_reconcile_history <wt> <base> <asserted>` therefore judges what the
-  branch's **commits** touch — `git diff --no-renames --name-only <base> HEAD`,
-  a rename counted on both sides — against the full `[fence]` minus the
-  asserted release, wherever history is handed to a role or to the operator:
-  `aw check` before the patch is written, each round of `aw loop`, `aw diff`,
-  `aw rebase`, and `aw land`. With nothing asserted, nothing is released, so
-  any fenced path in the history is a dead stop; with no fenced path touched it
-  is a no-op.
+  `fence_reconcile_history <task> <base> <asserted>` therefore judges what the
+  branch's **commits** touch — `git diff --no-renames --name-only <base>
+  $PINNED_TIP`, a rename counted on both sides — against the full `[fence]`
+  minus the asserted release, wherever history is handed to a role or to the
+  operator: `aw check` before the patch is written, each round of `aw loop`,
+  `aw diff`, `aw rebase`, and `aw land`. The endpoint is `$PINNED_TIP`, the
+  **sha** this command resolved `refs/heads/agent/<task>` to, once, before any
+  of it — never the ref name re-read per use, and never the worktree's `HEAD`.
+  With nothing asserted, nothing is released, so any fenced path in the history
+  is a dead stop; with no fenced path touched it is a no-op.
+
+  Two limits of a two-endpoint diff, stated so they are not mistaken for
+  coverage. A fenced path **added and deleted again on the same branch** is not
+  in `git diff <base> <tip>` even though both commits are in the history and
+  `git log -p` carries the content: the tree reconciler catches it while it is
+  on disk, and the first `aw` command after the add sees it in the range, but a
+  branch that does both between two commands is invisible to this check. And a
+  diff says nothing about what was *read* — that is caveat 1's exfiltration
+  class, and no check of this shape reaches it.
 - **One base, and it is the operator's — kept outside the repo.** `<base>`
   above is `security_base <task>`: the commit `$ROOT` was checked out at when
   `aw new` created the task, read from the **operator record**
@@ -394,7 +420,8 @@ Semantics:
   There is no second base. The review patch `aw check` and `aw diff` write is
   cut from the same range the history check just cleared, so there is nothing
   left to clamp — and nothing for an agent to shrink.
-- **The endpoint is the branch ref, never the worktree's HEAD.**
+- **The endpoint is the branch ref, never the worktree's HEAD — and it is
+  resolved to a SHA exactly once per command.**
   `fence_reconcile_history` and the review-patch cut both read
   `refs/heads/agent/<task>` in `$ROOT` — the ref `aw land` merges and `aw land
   --pr` pushes. Measuring from the worktree's `HEAD` meant `git checkout
@@ -402,6 +429,53 @@ Semantics:
   history while the branch still carried the commit onward. A worktree whose
   `HEAD` is not `refs/heads/agent/<task>` (`git symbolic-ref -q HEAD`) is
   refused outright as well: it is not a state `aw` produces.
+
+  Naming the ref was not enough either, because a name is resolved at the
+  moment it is used and `refs/heads/*` is in the shared `.git`. A command that
+  said `agent/<task>` four times — the history check, the patch, the merge, the
+  push — resolved it four times, and one `git update-ref` between any two of
+  them (the gate script `aw land` used to run out of the worktree is one line
+  of shell) landed something other than what was checked. `pin_branch_tip
+  <task>` resolves it once into `$PINNED_TIP`, and every one of the four uses
+  that sha: `git merge --no-ff <sha>`, `git push origin
+  <sha>:refs/heads/agent/<task>`.
+- **What was reviewed is recorded, and landing refuses anything else.**
+  `aw check` writes `reviewed=<sha>` into the operator record after the review
+  is saved; `aw land` refuses when `$PINNED_TIP` is not that sha, naming both
+  and asking for a fresh `aw check`. `--force` skips the gate, not this. A
+  rebase clears the stamp, because the sha a reviewer read does not exist on a
+  rebased branch. Landing also refuses a worktree with uncommitted changes —
+  what the reviewer read and what a merge would carry have come apart —
+  excluding `.agents/reviews/`, which is where `aw check` and `aw diff` write
+  the review patch themselves (consumers should gitignore that directory).
+- **The gate `aw` acts on is the operator's.** `aw run` (green -> commit) and
+  `aw land` (green -> merge/push) execute `<main checkout>/.agents/gate.sh`
+  with the worktree as its cwd, never `<worktree>/.agents/gate.sh`. The
+  worktree's copy is a file the implementer edits — the `claude` leg allowlists
+  running it by name, and under a fence profile that releases it the guard
+  would even accept committing it — so a gate that rewrites itself to `exit 0`,
+  or that re-points the branch on the way past, is one line of shell. The
+  implementer still runs the worktree's copy for its own iteration; that is its
+  business. `.agents/gate.sh`, `.agents/zones.toml` and `.agents/loom.env`
+  belong in `[hand]` for the same reason, and the shipped template lists them.
+- **A rebase does not bury upstream commits under the base.** `aw rebase` is the
+  one command that moves a recorded base, and everything in
+  `old_base..new_base` stops being the branch's work: it is upstream now, below
+  the base, where no fence check, no hand check and no review patch looks
+  again. `refs/remotes/origin/main` is one `git update-ref` from any commit —
+  and unlike `refs/heads/main`, which is the branch the operator is standing on
+  and moves in front of them, a moved `origin/main` is visible nowhere. So the
+  range is mapped through the **full** `[fence]` and the **full** `[hand]` (a
+  profile releases paths for the *task's* commits; nobody released anything for
+  what arrives from upstream), and a hit refuses the rebase — printing the
+  paths and `git log --oneline old_base..new_base`, leaving the recorded base
+  untouched and resetting the branch back to `$PINNED_TIP`, so the refusal
+  leaves the task exactly as it found it. `--accept-upstream` is the operator's
+  "I have read those commits and I accept them under the base", and prints them
+  as well. `git fetch` losing its `|| true` belongs to the same rule: replaying
+  onto a stale upstream succeeds quietly. And `remote.origin.url` is recorded at
+  `aw new`, with `aw rebase` (before the fetch) and `aw land --pr` (before the
+  push) refusing when it has changed.
 - **Landing inspects what it is about to publish.** Before it merges and before
   it pushes, `aw land` maps every path in `<security base>..agent/<task>` through
   `zone_of` and the asserted profile's release list: a fenced path the profile
@@ -421,7 +495,19 @@ Semantics:
   fence is not applied. Under a profile, `aw guard` accepts exactly the released
   patterns and keeps blocking the rest of `[hand]`. But be clear about what it
   is: the guard is a pre-commit hook that runs **in the agent's own context**,
-  where `git commit --no-verify` exists. It is a seatbelt, not a lock. It is
+  where `git commit --no-verify` exists. It is a seatbelt, not a lock.
+
+  Two things follow from "the agent's own context", and they point in opposite
+  directions. The zones it applies are the **main checkout's**: `$ROOT` is
+  derived from `git rev-parse --git-common-dir`, so a `.agents/zones.toml` the
+  agent edited in its own worktree is not the file the guard reads — only the
+  staged files, the branch and the tree it inspects come from the invoking
+  worktree, because that is what the commit is. But the operator record it looks
+  up is found through `$XDG_CONFIG_HOME`, which is *the agent's* environment: a
+  process that can set that variable can point the lookup at a record of its
+  own. That is not a hole to plug so much as the shape of the thing — the whole
+  hook is dominated by `--no-verify`, which needs no environment at all.
+  `aw land`'s checks are the lock; this is the seatbelt. It is
   therefore allowed to read the operator record for the released set — it runs
   as the same OS user, and resolves the same state directory from inside the
   worktree — and it checks that record against the tree before trusting it: a

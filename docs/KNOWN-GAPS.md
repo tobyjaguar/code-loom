@@ -1,44 +1,63 @@
 # Known gaps
 
-Holes an adversarial review found in the harness that are **not fixed** on this
-branch. All four pre-date fence profiles and none is *caused* by them — but
-gap 4's consequence is **widened** by profiles, because a worktree under a
-profile holds paths the fence normally removes, and a grant that reaches
-another worktree therefore reaches more than it used to. Round 2 narrowed that
-grant and split profiled worktrees onto their own root; what is left of gap 4
-is a confirmation, and it is written up that way below.
+Holes an adversarial review found in the harness. Two of the five are **closed
+on this branch** (gaps 1 and 5) and are kept here because each closure has a
+cost or a residual worth naming; the rest are **not fixed**, and are written
+down so that the fence-profile work is not mistaken for closing them and so
+they are not re-discovered from scratch.
 
-They are written down here so that the fence-profile work is not mistaken for
-closing them, and so they are not re-discovered from scratch.
-
-Gap 5 is different in kind: it is **closed**, and it is written down because
-the closure has a cost you should know about and a residual that is worth
-naming.
+None of them is *caused* by fence profiles — but gap 4's consequence is
+**widened** by profiles, because a worktree under a profile holds paths the
+fence normally removes, and a grant that reaches another worktree therefore
+reaches more than it used to. Round 2 narrowed that grant and split profiled
+worktrees onto their own root; what is left of gap 4 is a confirmation, and it
+is written up that way below.
 
 Every gap carries a `bin/aw:<line>` anchor as of this commit. Line numbers
 drift; the quoted text is the durable handle, so grep for it.
 
 ---
 
-## 1. `aw guard` reads the agent's own copy of `zones.toml`
+## 1. `aw guard` read the agent's own copy of `zones.toml` — CLOSED
 
-**Where.** `bin/aw:72` (`ROOT="$(git rev-parse --show-toplevel …)"`) and
-`bin/aw:78` (`AGENTS_DIR="$ROOT/.agents"`); the reader is `cmd_guard`,
-`bin/aw:1395`. `cmd_guard` runs as a pre-commit hook inside
-the agent's worktree, so `$ROOT` is that worktree and every zone lookup reads
-`<worktree>/.agents/zones.toml` — a file the agent can edit.
+**Status: fixed on this branch.** Kept here with its cost, and with the one
+part of the lookup that is still the agent's.
 
-**Why it is not urgent.** The guard is a pre-commit hook running in the agent's
-own context, where `git commit --no-verify` skips it outright. It is a seatbelt,
-not a lock. An agent that edits `zones.toml` to widen its own zone still has to
-get that edit past you in the diff, and `.agents/zones.toml` is itself a
-hand-zone path, so the guard blocks committing it.
+**What it was.** `$ROOT` was `git rev-parse --show-toplevel` and `AGENTS_DIR`
+was `$ROOT/.agents`, so a command running inside an agent worktree read that
+worktree's copies. `cmd_guard` runs as a pre-commit hook there, so every zone
+lookup read `<worktree>/.agents/zones.toml` — a file the agent can edit. The
+same derivation had a bigger consequence than the guard: `cd <a worktree> && aw
+new t5` fenced the new task with the agent's `zones.toml` (an emptied one means
+no fence at all) and `.`-sourced the agent's `.agents/loom.env` as shell, in
+your environment.
 
-**Suggested fix.** Have `cmd_guard` read the zones file from the *main*
-checkout — resolve `git rev-parse --git-common-dir`, take its parent, and read
-`<main>/.agents/zones.toml` — falling back to the local copy only when the two
-are the same tree. Cost: a repo whose `zones.toml` legitimately changes on a
-branch would be judged by main's copy, which is arguably the point.
+**What closes it.** `$ROOT` is now the **main checkout** for every command:
+`git rev-parse --git-common-dir` answers `.git` from the main checkout and the
+absolute path of the main `.git` from a linked worktree, so its parent is the
+main checkout either way — the same derivation the operator record is keyed by.
+Everything policy-shaped is read from there: `zones.toml` (zones, fence,
+profiles), `loom.env`, `.opencode/`, and `.agents/gate.sh`.
+
+One thing still comes from the invoking tree, and only one: **`aw guard`'s
+subject.** The commit is happening in that worktree, so the branch, the staged
+file list and the tree the reconciler inspects are read from `$INVOKED_ROOT`
+while the zones they are judged by come from `$ROOT`. `aw` says so in one line
+whenever the two differ. `tests/fence-profiles.sh` (av) asserts both halves:
+`aw new` from inside a worktree with an emptied `zones.toml` still applies the
+full fence, and a `loom.env` planted there is never sourced.
+
+**The cost.** A repo whose `zones.toml` legitimately changes *on a branch* is
+judged by the main checkout's copy until that change lands — which is the point
+(it is a hand-zone file), but it does mean a zones change cannot be tested by
+an agent from inside its own worktree.
+
+**The residual.** The record lookup itself is still keyed by
+`$XDG_CONFIG_HOME`, and the hook runs in the agent's session, so that variable
+is the agent's. A process that sets it points the lookup at a record of its
+own. That is not worth plugging: the entire hook is dominated by `git commit
+--no-verify`, which needs no environment at all. The guard is a seatbelt;
+`aw land`'s checks of the commits are the lock.
 
 ---
 
@@ -81,13 +100,27 @@ present in every agent worktree.
 it is a tracked file (so the change shows up in the diff you review), and an
 agent that can write files in your checkout has other options.
 
-**One variable is carved out of it**, because for that one the file is not
+**Some variables are carved out of it**, because for those the file is not
 merely a risk, it is a bypass:
 
 - `WT_ROOT_PROFILED` — where a profiled worktree's released paths land. It is
   derived from the normalised `$LOOM_WORKTREES` and a preset that differs is a
   refusal; `loom.env` may still set `LOOM_WORKTREES` itself, which moves both
   roots together and keeps them siblings.
+- `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR`, `OPENCODE_CONFIG_CONTENT`,
+  `OPENCODE_PERMISSION`, `OPENCODE_DISABLE_PROJECT_CONFIG` — which config
+  opencode loads, and therefore `provider.<name>.options.baseURL` (the provider
+  *identity* a fence profile's `providers` list is built on) and the role
+  prompts. All five are snapshotted before this file is sourced and restored
+  after, with a WARN naming any the file tried to set. A caller that exports
+  them wins untouched, as before; it is the file that does not.
+  `OPENCODE_CONFIG_CONTENT` — a whole config inline in a variable, with no file
+  for `aw` to point at — is additionally stripped from every opencode launch,
+  caller included.
+- The file is also a `[hand]` path in the shipped `zones.toml` template now,
+  alongside `.agents/gate.sh` and `.agents/zones.toml`, so `aw land` refuses a
+  branch that changed it. That is a review boundary, not a sandbox: the file
+  still runs as shell when you invoke `aw`.
 
 There used to be a second, `LOOM_BASE_REF`: the ref the security base was
 measured from, snapshotted before the file was sourced and restored after. That
