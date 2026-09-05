@@ -8,11 +8,6 @@
 #   aw plan -p "topic"               headless plan (falls back to cheap providers)
 #   aw scout "where is decode_flac"  one-shot cheap read-only lookup
 #   aw new   0007-c                  create worktree + branch for a task
-#   aw new   0007-c --fence-profile codex
-#                                    ... under a fence profile: the patterns it
-#                                    releases stay in the worktree, and every
-#                                    model that runs there must be one the
-#                                    profile allows (README § Fence profiles)
 #   aw run   0007-c                  run the implementer in that worktree
 #   aw check 0007-c                  cheap cross-provider review of the diff
 #   aw loop  0007-c                  run, review, feed REVISE back, review again
@@ -21,6 +16,15 @@
 #   aw land  0007-c --pr             gate, push agent/0007-c, print PR next steps
 #   aw drop  0007-c [--keep-branch]  discard worktree (and branch, unless kept)
 #   aw rebase 0007-c                 rebase the branch onto origin/main; re-point its diff base
+#
+#   --fence-profile <name>           REQUIRED on new, run, check, loop, rebase
+#                                    and land for a task under a fence profile,
+#                                    every time. The patterns the profile
+#                                    releases stay in the worktree, and every
+#                                    model that runs there must be one the
+#                                    profile allows. The branch record only
+#                                    checks your flag; it never replaces it.
+#                                    (README § Fence profiles)
 #   aw ls                            list active agent worktrees
 #   aw gate                          run the gate here
 #   aw zone  <path>                  which zone a path belongs to
@@ -175,14 +179,17 @@ looks_rate_limited() { # looks_rate_limited <logfile>
 # /dev/null guarantees EOF for both legs.
 run_headless() { # run_headless <role> <model> <workdir> <prompt> <logfile>
   local role="$1" model="$2" wd="$3" prompt="$4" log="$5" rc=0 last=""
-  # The edit permission is granted per ROLE, never per model: a reviewer keeps
-  # the read-only sandbox on every provider, an implementer-class role gets one
-  # that can write, confined to $wd. Measured, not assumed: `claude -p` with no
-  # mode flag denies every permission prompt (nobody is there to answer) and
-  # writes nothing — "I need permission to write these files"; `acceptEdits`
-  # pre-approves the edits and the gate run. `codex exec` already runs with
-  # approval policy "never", so the sandbox flag is the whole story there:
-  # read-only refuses the patch, workspace-write applies it.
+  # Resolve the workdir through its symlinks ONCE, and use the resolved path
+  # everywhere below: it is what the sandbox roots are computed from, and a
+  # sandbox root that is a symlink is not the directory the caller meant.
+  wd="$(cd "$wd" 2>/dev/null && pwd -P)" || die "workdir does not exist: $3"
+  # The edit permission is granted per ROLE, never per model. A reviewer keeps
+  # the most read-only shape each CLI offers — `codex exec --sandbox read-only`
+  # and a bare `claude -p`, which denies every permission prompt because nobody
+  # is there to answer it. The opencode leg has NO OS sandbox at all: an
+  # opencode reviewer is held by the role prompt, the fence, and the profile's
+  # provider rule, not by the process. An implementer-class role gets a
+  # write-capable sandbox, rooted at $wd.
   local -a claude_flags=(-p)
   local -a cflags=(--sandbox read-only)
   if writes_role "$role"; then
@@ -190,18 +197,37 @@ run_headless() { # run_headless <role> <model> <workdir> <prompt> <logfile>
     # acceptEdits pre-approves file edits, but a Bash call still asks — and a
     # `-p` run has nobody to answer, so it is denied. Measured: the implementer
     # wrote its files and then reported "every attempt to run the gate script
-    # was denied by the session's permission mode". The gate is the one command
-    # the implementer protocol requires, so it is allowlisted by name; widen
-    # deliberately with LOOM_CLAUDE_ALLOWED_TOOLS (same syntax as
+    # was denied by the session's permission mode". The gate is allowlisted by
+    # name so the implementer protocol can run at all.
+    #
+    # This is a CONVENIENCE BOUNDARY, not a sandbox: the allowlist names the
+    # gate SCRIPT, and .agents/gate.sh is a file the implementer can edit. An
+    # agent that wants a shell writes one into the gate. What actually confines
+    # the claude leg is the worktree it runs in and the fence applied to it.
+    # Widen deliberately with LOOM_CLAUDE_ALLOWED_TOOLS (same syntax as
     # `claude --allowedTools`) if a repo's implementer needs more shell.
     claude_flags+=(--allowedTools "${LOOM_CLAUDE_ALLOWED_TOOLS:-Bash(./.agents/gate.sh),Bash(./.agents/gate.sh:*),Bash(bash ./.agents/gate.sh:*),Bash(.agents/gate.sh:*)}")
     cflags=(--sandbox workspace-write)
     # codex's workspace-write sandbox keeps the workspace's dot-directories
     # read-only, so without this the implementer cannot write its done/blocked
     # notes — measured: "Could not write `.agents/reviews/<task>-done.md`
-    # because `.agents` is read-only in this workspace". The writable roots
-    # stay inside the worktree either way.
-    [ -d "$wd/.agents" ] && cflags+=(--add-dir "$wd/.agents")
+    # because `.agents` is read-only in this workspace".
+    #
+    # --add-dir names a writable ROOT, so it must not be handed a path that
+    # resolves outside the worktree. `.agents` is a tracked directory an agent
+    # can replace with a symlink; resolve it and refuse anything that leaves
+    # $wd, rather than granting write access to wherever it points.
+    if [ -d "$wd/.agents" ]; then
+      local adir
+      adir="$(cd "$wd/.agents" 2>/dev/null && pwd -P)" \
+        || die "cannot resolve $wd/.agents — refusing to open a sandbox root"
+      case "$adir" in
+        "$wd"/*) cflags+=(--add-dir "$adir") ;;
+        *) die "refusing to run $role in $wd: .agents resolves to $adir, outside the
+worktree. Something replaced it with a link out of the tree — inspect it, do
+not re-run." ;;
+      esac
+    fi
   fi
   if [ "$model" = claude-sub ]; then
     ( cd "$wd" && claude "${claude_flags[@]}" \
@@ -246,6 +272,14 @@ run_role() { # run_role <role> <workdir> <prompt> [<logfile>]
   local role="$1" wd="$2" prompt="$3"
   local log="${4:-$(mktemp "${TMPDIR:-/tmp}/aw-$role.XXXXXX")}"
   local m tried=""
+  # Defence in depth. Every caller already reconciles, but this is the last
+  # line before a model is pointed at a directory: any workdir under $WT_ROOT
+  # is checked against the tree once more, and the chain of THIS role against
+  # the profile the operator asserted.
+  if [ "${wd#"$WT_ROOT"/}" != "$wd" ]; then
+    fence_reconcile "$wd" "$FENCE_PROFILE"
+    profile_provider_guard "$role"
+  fi
   for m in $(candidates "$role"); do
     tried="yes"
     echo "aw: [$role] running on $m (tier $TIER)"
@@ -496,13 +530,24 @@ zone_of() { # zone_of <repo-relative-path>   (fails loudly: callers gate commits
 # A fence profile is a NAMED, per-provider relaxation of the read fence: the
 # worktree of a task that opts into it is fenced by [fence] MINUS the profile's
 # `release` list, and no role may run there on a provider the profile does not
-# name. It is opt-in per task and recorded on the task's branch
-# (branch.agent/<task>.fenceprofile), so every later command agrees.
+# name.
 #
-# The active profile is NEVER taken from the environment: an inherited
+# Two rules keep it honest, and they are the whole design:
+#
+#   1. The opt-in is a FRESH OPERATOR ACT on every command. `--fence-profile
+#      <name>` must be passed to `aw new`, `run`, `check`, `loop`, `rebase` and
+#      `land` alike. branch.agent/<task>.fenceprofile is kept, but ONLY as a
+#      consistency record — it is agent-writable state (anything running in the
+#      worktree can `git config` it), so it may refuse a command, never
+#      authorise one. A `Fence-profile:` line in the task file is documentation
+#      of intent; the flag is the consent.
+#   2. Enforcement is driven by what is ON DISK, never by the record. See
+#      fence_reconcile below: the tree is the fact, and a tree holding released
+#      paths that nobody vouched for on this command line is a dead stop.
+#
+# The active profile is NEVER taken from the environment either: an inherited
 # AW_FENCE_PROFILE would widen the fence for whoever exported it. `aw` sets it
-# itself, from the branch config or from an explicit flag, and clears anything
-# it inherited here.
+# itself, from the operator's flag, and clears anything it inherited here.
 unset AW_FENCE_PROFILE
 FENCE_PROFILE=""      # active profile name; "" = the full fence, today's behaviour
 FENCE_RELEASED=""     # its release patterns, space separated (for prompts/messages)
@@ -535,34 +580,55 @@ fence_profile_activate() { # fence_profile_activate <name>
   load_fence
 }
 
-# 0 = the active profile releases this path, 1 = it does not (or none is active).
-is_released() { # is_released <path>
+# 0 = <profile> releases this path, 1 = it does not. Side-effect free: the
+# lookup runs in a subshell, so it can be asked about a profile that is NOT the
+# active one (the reconciler asks exactly that).
+profile_releases() { # profile_releases <profile> <path>
   local rc=0
-  [ -n "$FENCE_PROFILE" ] || return 1
-  zones_py profile-released "$1" >/dev/null || rc=$?
+  [ -n "$1" ] || return 1
+  ( export AW_FENCE_PROFILE="$1"; zones_py profile-released "$2" >/dev/null ) || rc=$?
   case "$rc" in
     0) return 0 ;;
     3) return 1 ;;
-    *) die "cannot determine whether '$1' is released by profile '$FENCE_PROFILE' — refusing to guess" ;;
+    *) die "cannot determine whether '$2' is released by profile '$1' — refusing to guess" ;;
   esac
+}
+
+# 0 = the active profile releases this path, 1 = it does not (or none is active).
+is_released() { # is_released <path>
+  [ -n "$FENCE_PROFILE" ] || return 1
+  profile_releases "$FENCE_PROFILE" "$1"
 }
 
 # Every model that could run against a profiled worktree must belong to a
 # provider the profile names — the WHOLE chain, not just the first entry: a
 # fallback fires on a rate limit without asking anyone.
+#
+# `set -f` around the loops on purpose: $allowed and a model chain are data,
+# and an unquoted expansion of either would glob against $ROOT. zones_py also
+# rejects a provider entry containing a glob character, so this is the second
+# of two locks on the same door.
 profile_provider_guard() { # profile_provider_guard <role>...
   [ -n "$FENCE_PROFILE" ] || return 0
-  local allowed role m p a ok hint=""
-  allowed="$(zones_py profile-providers | tr '\n' ' ')" \
+  local allowed_raw allowed role m p a ok hint=""
+  local -a allow=() chain=()
+  allowed_raw="$(zones_py profile-providers)" \
     || die "cannot read the providers of fence profile '$FENCE_PROFILE'"
-  for a in $allowed; do
+  while IFS= read -r a; do [ -n "$a" ] && allow+=("$a"); done <<< "$allowed_raw"
+  allowed="${allow[*]}"
+  for a in "${allow[@]}"; do
     case "$a" in claude) hint="$hint claude-sub" ;; codex) hint="$hint codex-sub" ;; esac
   done
   [ -n "$hint" ] || hint=" <a model from: $allowed>"
   for role in "$@"; do
-    for m in $(models_for "$role"); do
+    chain=()
+    set -f
+    # shellcheck disable=SC2086  # a chain is a space-separated list; globbing is off
+    for m in $(models_for "$role"); do chain+=("$m"); done
+    set +f
+    for m in "${chain[@]}"; do
       p="$(provider_of "$m")"; ok=""
-      for a in $allowed; do [ "$a" = "$p" ] && ok=yes; done
+      for a in "${allow[@]}"; do [ "$a" = "$p" ] && ok=yes; done
       [ -n "$ok" ] && continue
       die "fence profile '$FENCE_PROFILE' releases fenced paths into this worktree,
 but the $role chain would run '$m' (provider '$p'). The profile allows only: $allowed
@@ -637,6 +703,86 @@ fence_enforce() { # fence_enforce <worktree>
   fence_verify "$1"
 }
 
+# ---------------------------------------------------------------- reconcile
+# THE gate between a worktree and a model. Driven by what is ON DISK — never by
+# branch.<br>.fenceprofile, which anything running in the worktree can write.
+#
+#   present  = fenced paths (the FULL [fence]) actually in the worktree
+#   asserted = the profile the OPERATOR named on this command line ("" = none)
+#
+# Five rules:
+#   1. present, and a profile is asserted that releases every one of them:
+#      re-apply that profile's effective fence, verify, run. (The caller has
+#      already checked the chain of the role about to run.)
+#   2. present, and the asserted profile does NOT release one of them: die.
+#      Silently re-fencing here would be worse than useless — the tree's own
+#      diff and patch file still carry the content into the next model.
+#   3. a profile is asserted but NONE of what it releases is on disk: die.
+#      That tree was not built under the profile, and a profile may not be
+#      introduced after `aw new` — that is how a forged branch record would
+#      otherwise cash out.
+#   4. present, nothing asserted: die, unless the branch record names a profile
+#      that would have released exactly these paths, in which case re-fence to
+#      the FULL fence and say so loudly.
+#   5. nothing present, nothing asserted: the ordinary path — apply and verify
+#      the full fence, as `aw run` has always done.
+fence_reconcile() { # fence_reconcile <worktree> <asserted-profile-or-empty>
+  local wt="$1" asserted="${2:-}" present p stray="" br rprof cover=yes
+  [ -d "$wt" ] || return 0
+  present="$(zones_py fence-present-full "$wt")" \
+    || die "cannot tell which fenced paths are present in $wt — refusing to guess"
+
+  if [ -n "$asserted" ]; then
+    [ "$FENCE_PROFILE" = "$asserted" ] || fence_profile_activate "$asserted"
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      profile_releases "$asserted" "$p" || stray="$stray
+  $p"
+    done <<< "$present"
+    if [ -n "$stray" ]; then
+      die "fence profile '$asserted' does not release paths that are present in $wt:$stray
+This worktree was built under a different fence. Start clean:
+  aw drop <task-id> && aw new <task-id> --fence-profile $asserted"
+    fi
+    # Nothing released is on disk. If the profile releases nothing tracked there
+    # is nothing to introduce and nothing to check; otherwise this tree predates
+    # the profile and must not gain it now.
+    if [ -z "$present" ] && [ -n "$(zones_py profile-tracked "$wt")" ]; then
+      die "worktree $wt holds none of the paths fence profile '$asserted' releases.
+It was not created under that profile, and a profile cannot be introduced after
+'aw new' — the branch record is not evidence, the tree is. Start clean:
+  aw drop <task-id> && aw new <task-id> --fence-profile $asserted"
+    fi
+    fence_apply "$wt"
+    fence_verify "$wt"
+    return 0
+  fi
+
+  if [ -n "$present" ]; then
+    br="$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+    rprof=""
+    [ -n "$br" ] && rprof="$(git config "branch.$br.fenceprofile" 2>/dev/null || true)"
+    if [ -n "$rprof" ]; then
+      while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        profile_releases "$rprof" "$p" || cover=""
+      done <<< "$present"
+    else
+      cover=""
+    fi
+    [ -n "$cover" ] || die "fenced paths are present in $wt and no fence profile is \
+asserted for this command:
+$(printf '%s\n' "$present" | sed 's/^/  /')
+Refusing to run a model here. Either name the profile these paths belong to
+(--fence-profile <name>, which must also be the profile the worktree was
+created under), or start clean:  aw drop <task-id>"
+    echo "aw: WARNING: $wt holds paths released by the recorded profile '$rprof', but" >&2
+    echo "aw: WARNING: no --fence-profile was given — re-applying the FULL fence and" >&2
+    echo "aw: WARNING: running at it. Pass --fence-profile $rprof if that was not what you meant." >&2
+  fi
+  fence_enforce "$wt"
+}
+
 # One sentence for the implementer prompt when a profile is in force, so the
 # agent knows the normally-fenced paths in front of it are deliberate.
 profile_note() {
@@ -662,14 +808,34 @@ cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
   case "$branch" in agent/*) ;; *) return 0 ;; esac
   # A fenced path is also a hand path by convention (that is what blocks a
   # commit to it), so a branch running under a fence profile must be allowed to
-  # commit the paths its profile released — and nothing else in [hand]. The
-  # profile comes from the branch config, which every worktree shares; it is
-  # never taken from the environment.
-  local prof
+  # commit the paths its profile released — and nothing else in [hand].
+  #
+  # This runs as a pre-commit hook, INSIDE the agent's own worktree, in the
+  # agent's own context. It is a seatbelt, not a lock: `--no-verify` skips it
+  # outright. So it may read the branch record (agent-writable state) for the
+  # released set — but it corroborates that record against the tree before
+  # trusting it, because a record alone costs one `git config` to forge.
+  local prof present p
   prof="$(git config "branch.$branch.fenceprofile" 2>/dev/null || true)"
   if [ -n "$prof" ]; then
-    fence_profile_activate "$prof" \
-      || { echo "pre-commit: fence profile '$prof' is unreadable — refusing to guess" >&2; exit 1; }
+    fence_profile_activate "$prof"     # dies on an unknown or unreadable profile
+    present="$(zones_py fence-present-full "$ROOT")" || {
+      echo "pre-commit: cannot tell which fenced paths are present here — refusing to guess" >&2
+      exit 1; }
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      is_released "$p" && continue
+      echo "pre-commit: BLOCKED — this branch records fence profile '$prof', but the" >&2
+      echo "worktree holds fenced path '$p', which that profile does not release." >&2
+      echo "The record does not match the tree; refusing to widen the guard on it." >&2
+      exit 1
+    done <<< "$present"
+    if [ -z "$present" ] && [ -n "$(zones_py profile-tracked "$ROOT")" ]; then
+      echo "pre-commit: BLOCKED — this branch records fence profile '$prof', but none of" >&2
+      echo "the paths that profile releases are in this worktree. The record was not" >&2
+      echo "written by the 'aw new' that built this tree; refusing to honour it." >&2
+      exit 1
+    fi
   fi
   local violations="" file z
   while IFS= read -r file; do
@@ -699,51 +865,112 @@ branch_of() { echo "agent/$1"; }
 base_of()   { git config "branch.$(branch_of "$1").loombase" 2>/dev/null || git rev-parse HEAD; }
 
 # --- where a task's fence profile comes from -------------------------------
-# Two opt-in forms, one durable record. `--fence-profile <name>` on `aw new`,
-# or a `Fence-profile: <name>` line in the task file (parsed like `Zone:`).
-# `aw new` writes the answer to branch.agent/<task>.fenceprofile — the same
-# place and pattern as loombase — and every later command reads it from there,
-# so `run`, `check`, `loop`, `rebase`, `land` and the commit guard agree even
-# if the task file is edited afterwards.
+# From the operator, on the command line, every single time. `--fence-profile
+# <name>` is required by `aw new`, `run`, `check`, `loop`, `rebase` and `land`
+# alike. branch.agent/<task>.fenceprofile is written at `aw new` and is a
+# CONSISTENCY RECORD, not an authorisation: it can refuse a command (the flag
+# is missing, or names a different profile) but it can never supply one,
+# because anything running inside the worktree can write it.
+#
+# A `Fence-profile: <name>` line in the task file is the third form, and the
+# weakest: it documents the intent of a task, and `aw new` honours it only when
+# the same name is also passed on the command line. The file is written by
+# whoever wrote the task — an architect agent included.
 task_profile() { # task_profile <task>  -> declared profile, or "" (never fails)
   local f="$AGENTS_DIR/tasks/$1.md" line
   [ -f "$f" ] || return 0
-  line="$(grep -m1 -i '^[[:space:]]*Fence-profile:' "$f" || true)"
+  # The HEADER BLOCK only: the metadata paragraph under the title, where `Zone:`
+  # lives. Scanning the whole file would let a `Fence-profile:` line inside a
+  # code fence read as a declaration — and `aw loop` appends reviewer output,
+  # verbatim, to this very file.
+  line="$(awk '
+      /^[[:space:]]*(```|~~~)/ { exit }
+      /^##/                    { exit }
+      /^[[:space:]]*$/         { if (started) exit; next }
+      NR == 1 && /^#/          { next }
+      { started = 1; print }
+    ' "$f" | grep -m1 -i '^[[:space:]]*Fence-profile:' || true)"
   [ -n "$line" ] || return 0
   printf '%s' "${line#*:}" | tr -d '[:space:]'
 }
 
 branch_profile() { git config "branch.$(branch_of "$1").fenceprofile" 2>/dev/null || true; }
 
-# Activate the profile recorded for a task. Used by every command that acts on
-# an existing task branch.
-resolve_profile() { # resolve_profile <task>
-  local task="$1" cfg decl
-  cfg="$(branch_profile "$task")"
-  decl="$(task_profile "$task")"
+# --- the flag ---------------------------------------------------------------
+# Pulled out of any command's argv, so every command spells it the same way and
+# an empty value is refused in one place.
+FLAG_PROFILE=""      # what the OPERATOR asserted on this command line
+FLAG_ARGS=()         # argv with --fence-profile removed
+scan_fence_flag() { # scan_fence_flag "$@"
+  FLAG_PROFILE=""; FLAG_ARGS=()
+  local seen=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --fence-profile|--fence-profile=*)
+        [ -z "$seen" ] || die "--fence-profile given twice"
+        if [ "$1" = --fence-profile ]; then
+          shift; [ $# -gt 0 ] || die "--fence-profile needs a profile name"
+          FLAG_PROFILE="$1"
+        else
+          FLAG_PROFILE="${1#*=}"
+        fi
+        [ -n "$FLAG_PROFILE" ] || die "--fence-profile needs a profile name (got an empty value)"
+        seen=yes; shift ;;
+      *) FLAG_ARGS+=("$1"); shift ;;
+    esac
+  done
+}
+
+# The three fail-closed rules, applied by every command that runs a role or
+# touches a task worktree. Activates the profile when the operator asserted one
+# and the record agrees.
+require_fence_flag() { # require_fence_flag <task> <command-name>
+  local task="$1" cmd="$2" rec="" flag="$FLAG_PROFILE"
   if git show-ref --verify --quiet "refs/heads/$(branch_of "$task")"; then
-    # The branch exists: its config is the record. A task file that has since
-    # gained or changed a Fence-profile line must not silently re-fence (or
-    # un-fence) a worktree that was built under a different one.
-    if [ -n "$decl" ] && [ "$decl" != "$cfg" ]; then
-      die "task file declares 'Fence-profile: $decl' but branch $(branch_of "$task") was created with ${cfg:-no profile}.
-Recreate the task to change it:  aw drop $task && aw new $task"
+    rec="$(branch_profile "$task")"
+    if [ -n "$rec" ] && [ -z "$flag" ]; then
+      die "task $task was created under fence profile '$rec'.
+Pass it again — every command needs the operator's consent, not a stored one:
+  aw $cmd $task --fence-profile $rec"
     fi
-  else
-    cfg="$decl"        # not created yet — aw new will record this
+    if [ -n "$rec" ] && [ "$rec" != "$flag" ]; then
+      die "--fence-profile '$flag' contradicts the record for $task ('$rec').
+Use '$rec', or start clean:  aw drop $task && aw new $task --fence-profile $flag"
+    fi
+    if [ -z "$rec" ] && [ -n "$flag" ]; then
+      die "task $task has no fence-profile record — a profile cannot be introduced
+after 'aw new'. Start clean:
+  aw drop $task && aw new $task --fence-profile $flag"
+    fi
   fi
-  [ -n "$cfg" ] && fence_profile_activate "$cfg"
+  # No branch yet: nothing to contradict. `aw new` (which run/loop call) applies
+  # its own rules to the flag and to the task file's declaration.
+  [ -n "$flag" ] && fence_profile_activate "$flag"
   return 0
 }
 
+# A worktree that exists without its branch config is a worktree nobody can
+# reason about later — released paths on disk with no record of why. `aw new`
+# therefore records first and checks out second, and unwinds the whole thing if
+# anything in between fails or the operator interrupts it.
+NEW_WT=""; NEW_BR=""
+new_abort() {
+  [ -n "$NEW_WT" ] || return 0
+  echo "aw: aborting — removing the half-built worktree $NEW_WT" >&2
+  git worktree remove --force "$NEW_WT" >/dev/null 2>&1 || true
+  git worktree prune >/dev/null 2>&1 || true
+  [ -n "$NEW_BR" ] && git branch -D "$NEW_BR" >/dev/null 2>&1 || true
+  NEW_WT=""; NEW_BR=""
+}
+
 cmd_new() {
-  local task="" prof="" decl
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --fence-profile)   prof="${2:-}"; [ -n "$prof" ] || die "aw new: --fence-profile needs a name"; shift 2 ;;
-      --fence-profile=*) prof="${1#*=}"; shift ;;
-      -*)                die "aw new: unknown flag '$1' — usage: aw new <task-id> [--fence-profile <name>]" ;;
-      *)                 if [ -z "$task" ]; then task="$1"; else die "aw new: unexpected argument '$1'"; fi; shift ;;
+  local task="" prof="" decl a
+  scan_fence_flag "$@"
+  prof="$FLAG_PROFILE"
+  for a in ${FLAG_ARGS[0]+"${FLAG_ARGS[@]}"}; do
+    case "$a" in
+      -*) die "aw new: unknown flag '$a' — usage: aw new <task-id> [--fence-profile <name>]" ;;
+      *)  if [ -z "$task" ]; then task="$a"; else die "aw new: unexpected argument '$a'"; fi ;;
     esac
   done
   [ -n "$task" ] || die "usage: aw new <task-id> [--fence-profile <name>]"
@@ -751,11 +978,17 @@ cmd_new() {
   wt="$(wt_path "$task")"; br="$(branch_of "$task")"
   [ -d "$wt" ] && die "worktree already exists: $wt"
   [ -f "$AGENTS_DIR/tasks/$task.md" ] || die "no task file: .agents/tasks/$task.md"
+  # The task file's declaration is intent, the flag is consent. A declaration
+  # alone never opts a task in: the file is written by whoever wrote the task.
   decl="$(task_profile "$task")"
+  if [ -n "$decl" ] && [ -z "$prof" ]; then
+    die "aw new: .agents/tasks/$task.md declares 'Fence-profile: $decl', which releases
+fenced paths into this worktree. Confirm it on the command line:
+  aw new $task --fence-profile $decl"
+  fi
   if [ -n "$prof" ] && [ -n "$decl" ] && [ "$prof" != "$decl" ]; then
     die "aw new: --fence-profile '$prof' contradicts 'Fence-profile: $decl' in .agents/tasks/$task.md — fix one"
   fi
-  [ -n "$prof" ] || prof="$decl"
   if [ -n "$prof" ]; then
     fence_profile_activate "$prof"                 # dies on an unknown profile
     # Checked BEFORE the worktree exists: a released path must never land on
@@ -764,28 +997,41 @@ cmd_new() {
     echo "aw: fence profile '$prof' — released into this worktree: $FENCE_RELEASED" >&2
   fi
   mkdir -p "$(dirname "$wt")"
+  NEW_WT="$wt"; NEW_BR="$br"
+  trap 'new_abort' EXIT
+  trap 'new_abort; exit 130' INT TERM
+  # --no-checkout first: the branch config is written while the tree is still
+  # empty, so an interrupt can never leave released content without a record.
+  git worktree add --no-checkout -b "$br" "$wt" HEAD >&2
+  git config "branch.$br.loombase" "$(git rev-parse HEAD)"
+  [ -n "$prof" ] && git config "branch.$br.fenceprofile" "$prof"
   if has_fence; then
-    # --no-checkout first, so fenced content never lands on disk here at all.
-    git worktree add --no-checkout -b "$br" "$wt" HEAD >&2
     fence_apply "$wt"
     git -C "$wt" checkout >&2
     fence_verify "$wt"
   else
-    git worktree add -b "$br" "$wt" HEAD >&2
+    git -C "$wt" checkout >&2
   fi
-  git config "branch.$br.loombase" "$(git rev-parse HEAD)"
-  [ -n "$prof" ] && git config "branch.$br.fenceprofile" "$prof"
+  NEW_WT=""; NEW_BR=""
+  trap - EXIT INT TERM
   echo "$wt"
 }
 
 cmd_run() {
-  local task="${1:?usage: aw run <task-id>}"
+  scan_fence_flag "$@"
+  local task="${FLAG_ARGS[0]:?usage: aw run <task-id> [--fence-profile <name>]}"
   local wt br attempt=1 gate_note="" title fnote pnote
+  local -a newargs=()
   wt="$(wt_path "$task")"; br="$(branch_of "$task")"
-  resolve_profile "$task"
+  require_fence_flag "$task" run
   profile_provider_guard implementer      # no-op without a profile
-  [ -d "$wt" ] || wt="$(cmd_new "$task")"
-  fence_enforce "$wt"        # the worktree may predate the fence, or a widening
+  if [ ! -d "$wt" ]; then
+    [ -n "$FLAG_PROFILE" ] && newargs=(--fence-profile "$FLAG_PROFILE")
+    wt="$(cmd_new "$task" ${newargs[0]+"${newargs[@]}"})"
+  fi
+  # The tree decides, not the record: re-apply and verify, and refuse outright
+  # if what is on disk and what the operator asserted do not line up.
+  fence_reconcile "$wt" "$FENCE_PROFILE"
   title="$(head -1 "$AGENTS_DIR/tasks/$task.md" | sed 's/^#[[:space:]]*//')"
   load_fence; fnote="$(fence_note)"; pnote="$(profile_note)"
 
@@ -820,12 +1066,17 @@ $(tail -40 "$wt/.agents/reviews/$task-gate.log" 2>/dev/null)"
 }
 
 cmd_check() {
-  local task="${1:?usage: aw check <task-id>}"
+  scan_fence_flag "$@"
+  local task="${FLAG_ARGS[0]:?usage: aw check <task-id> [--fence-profile <name>]}"
   local wt base review log pnote=""
   wt="$(wt_path "$task")"
   [ -d "$wt" ] || die "no worktree for $task"
-  resolve_profile "$task"
+  require_fence_flag "$task" check
   profile_provider_guard reviewer         # no-op without a profile
+  # BEFORE the patch is written: the patch carries the content of every path in
+  # the diff, so a tree the operator has not vouched for must stop the command
+  # here, not one line later.
+  fence_reconcile "$wt" "$FENCE_PROFILE"
   base="$(base_of "$task")"
   ( cd "$wt" && git diff "$base" HEAD > ".agents/reviews/$task.patch" )
   review="$wt/.agents/reviews/$task-review.md"
@@ -852,9 +1103,12 @@ and end with a final line 'VERDICT: APPROVE' or 'VERDICT: REVISE — <reason>'.$
 # The REVISE text is appended to the task file INSIDE the worktree: the copy
 # the implementer reads, and never your tree.
 cmd_loop() {
-  local task="${1:?usage: aw loop <task-id>}"
+  scan_fence_flag "$@"
+  local task="${FLAG_ARGS[0]:?usage: aw loop <task-id> [--fence-profile <name>]}"
   local rounds="${LOOM_LOOP_ROUNDS:-2}"
   local wt review verdict tfile i=1
+  local -a passthru=()
+  [ -n "$FLAG_PROFILE" ] && passthru=(--fence-profile "$FLAG_PROFILE")
   wt="$(wt_path "$task")"
 
   # cmd_run is reached through `||` below, which switches set -e off for its
@@ -864,13 +1118,14 @@ cmd_loop() {
   [ -f "$AGENTS_DIR/tasks/$task.md" ] || die "no task file: .agents/tasks/$task.md"
   # Both roles run against this worktree, auto-fix rounds included, so both
   # chains are checked once here — before anything is created or called.
-  resolve_profile "$task"
+  require_fence_flag "$task" loop
   profile_provider_guard implementer reviewer
-  [ -d "$wt" ] || cmd_new "$task" > /dev/null
+  [ -d "$wt" ] || cmd_new "$task" ${passthru[0]+"${passthru[@]}"} > /dev/null
+  fence_reconcile "$wt" "$FENCE_PROFILE"
 
   implement() { # one implementer pass, with cmd_run's exit codes named
     local rc=0
-    cmd_run "$task" || rc=$?
+    cmd_run "$task" ${passthru[0]+"${passthru[@]}"} || rc=$?
     case "$rc" in
       0) return 0 ;;
       2) die "aw loop: implementer reported blocked — read $(relpath "$wt/.agents/reviews/$task-blocked.md")" ;;
@@ -883,7 +1138,7 @@ cmd_loop() {
   tfile="$wt/.agents/tasks/$task.md"
   while [ "$i" -le "$rounds" ]; do
     echo "aw: [loop] review round $i/$rounds"
-    cmd_check "$task"
+    cmd_check "$task" ${passthru[0]+"${passthru[@]}"}
     verdict="$(grep '^VERDICT:' "$review" 2>/dev/null | tail -1 || true)"
     # No verdict line at all means a truncated or derailed review, not a
     # rejection — re-implementing on it would act on nothing.
@@ -925,20 +1180,22 @@ cmd_diff() {
 cmd_land() {
   local task="" force="" mode="${LOOM_LAND:-merge}" a
   local wt br plan title
-  for a in "$@"; do
+  scan_fence_flag "$@"
+  for a in ${FLAG_ARGS[0]+"${FLAG_ARGS[@]}"}; do
     case "$a" in
       --force)      force=yes ;;
       --pr)         mode="pr" ;;
       --merge)      mode="merge" ;;
-      -*)           die "aw land: unknown flag '$a' — usage: aw land <task-id> [--pr|--merge] [--force]" ;;
+      -*)           die "aw land: unknown flag '$a' — usage: aw land <task-id> [--fence-profile <name>] [--pr|--merge] [--force]" ;;
       *)            if [ -z "$task" ]; then task="$a"; else die "aw land: unexpected argument '$a'"; fi ;;
     esac
   done
-  [ -n "$task" ] || die "usage: aw land <task-id> [--pr|--merge] [--force]"
+  [ -n "$task" ] || die "usage: aw land <task-id> [--fence-profile <name>] [--pr|--merge] [--force]"
   case "$mode" in merge|pr) ;; *) die "LOOM_LAND must be 'merge' or 'pr' (got '$mode')" ;; esac
   wt="$(wt_path "$task")"; br="$(branch_of "$task")"
   [ -d "$wt" ] || die "no worktree for $task"
-  resolve_profile "$task"   # consistency check; also names it in the output
+  require_fence_flag "$task" land
+  fence_reconcile "$wt" "$FENCE_PROFILE"
   [ -n "$FENCE_PROFILE" ] && echo "aw: fence profile '$FENCE_PROFILE' — this diff may touch $FENCE_RELEASED"
   if [ -z "$force" ]; then
     echo "aw: running gate in worktree before landing"
@@ -976,11 +1233,14 @@ cmd_rebase() { # rebase agent/<task> onto origin/main and re-point loombase
   # since as "unauthorized" changes and an auto-fix round may try to revert
   # them. This rebases and re-points the base at the REPLAYED base commit
   # (matched by patch-id), falling back to the merge-base with a warning.
-  local task="${1:?usage: aw rebase <task-id> [<upstream>]}" upstream="${2:-origin/main}"
+  scan_fence_flag "$@"
+  local task="${FLAG_ARGS[0]:?usage: aw rebase <task-id> [<upstream>] [--fence-profile <name>]}"
+  local upstream="${FLAG_ARGS[1]:-origin/main}"
   local wt br old_base old_pid new_base mb c
   wt="$(wt_path "$task")"; br="$(branch_of "$task")"
   [ -d "$wt" ] || die "no worktree for $task (aw new first)"
-  resolve_profile "$task"   # the rebase must not silently change the fence
+  require_fence_flag "$task" rebase   # a rebase must not silently change the fence
+  fence_reconcile "$wt" "$FENCE_PROFILE"
   [ -z "$(git -C "$wt" status --porcelain)" ] || die "worktree $wt is dirty — commit or stash first"
   old_base="$(git config "branch.$br.loombase" 2>/dev/null)" || die "no loombase recorded for $br"
   old_pid="$(git show "$old_base" | git patch-id --stable | cut -d' ' -f1)"
@@ -1037,7 +1297,9 @@ cmd_drop() {
   fi
 }
 
-# Each agent worktree, annotated with its fence profile when it has one.
+# Each agent worktree, annotated with the fence profile RECORDED on its branch
+# — a reminder of the flag every command for that task needs, not a claim about
+# what is on disk (the record is agent-writable; `aw run` reconciles the tree).
 cmd_ls() {
   local line br prof found=""
   while IFS= read -r line; do
@@ -1222,7 +1484,7 @@ cmd_doctor() {
             mp="$(provider_of "$m")"
             case ",$pprov," in *",$mp,"*) ;; *) bad="$bad $m" ;; esac
           done
-          [ -n "$bad" ] && note "fence profile '$pname': the $role chain at tier $TIER has non-released providers:$bad — a task on this profile needs LOOM_MODELS_$role"
+          [ -n "$bad" ] && note "fence profile '$pname': the $role chain at tier $TIER reaches providers this profile does not allow:$bad — a task on this profile needs LOOM_MODELS_$role"
         done
       done < <(zones_py profiles 2>/dev/null || true)
     else
