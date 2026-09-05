@@ -428,7 +428,36 @@ $prompt" ) < /dev/null > "$log" 2>&1 || rc=$?
     if [ -z "$perm" ]; then
       perm="$(printf '{"external_directory":{"%s/*":"allow","%s/**":"allow"}}' "$wd" "$wd")"
     fi
-    ( cd "$wd" && OPENCODE_PERMISSION="$perm" opencode run --agent "$role" --model "$model" "$prompt" ) \
+    # opencode resolves its project config from the CWD: <worktree>/opencode.json
+    # and <worktree>/.opencode/opencode.json, both tracked files an agent in
+    # that worktree can rewrite. Everything the profile's provider rule is built
+    # on lives there — `provider.<name>.options.baseURL` repoints a provider at
+    # any endpoint, and the agent definitions carry the role prompts — so an
+    # agent could answer as "deepseek" from a host of its choosing, or hand
+    # itself a different role prompt, without `aw` seeing anything change.
+    #
+    # opencode 1.x has the two knobs this needs, and BOTH are required:
+    #   OPENCODE_CONFIG=<file>            load this config explicitly, and
+    #   OPENCODE_DISABLE_PROJECT_CONFIG=1 do not load the project's own.
+    # The first alone is not a fix: it is merged BEFORE the project files, so
+    # the worktree's copy would still win key by key.
+    #
+    # The cost, stated plainly: with the project config off, opencode no longer
+    # reads the worktree's AGENTS.md/CLAUDE.md or any project-local plugin —
+    # the role prompt now comes from $ROOT/.opencode (via `{file:./prompts/…}`
+    # in the operator's config), which is the same copy the claude and codex
+    # legs already use. A caller that sets OPENCODE_CONFIG itself wins
+    # untouched, exactly like OPENCODE_PERMISSION.
+    local -a ocenv=("OPENCODE_PERMISSION=$perm")
+    if [ -n "${OPENCODE_CONFIG:-}" ]; then
+      ocenv+=("OPENCODE_CONFIG=$OPENCODE_CONFIG")
+      [ -n "${OPENCODE_DISABLE_PROJECT_CONFIG:-}" ] \
+        && ocenv+=("OPENCODE_DISABLE_PROJECT_CONFIG=$OPENCODE_DISABLE_PROJECT_CONFIG")
+    elif [ -f "$ROOT/.opencode/opencode.json" ]; then
+      ocenv+=("OPENCODE_CONFIG=$ROOT/.opencode/opencode.json"
+              "OPENCODE_DISABLE_PROJECT_CONFIG=1")
+    fi
+    ( cd "$wd" && env "${ocenv[@]}" opencode run --agent "$role" --model "$model" "$prompt" ) \
       < /dev/null > "$log" 2>&1 || rc=$?
   fi
   cat "$log"
