@@ -135,7 +135,35 @@ if [ -f "$LOOM_ENV" ]; then set -a; . "$LOOM_ENV"; set +a; fi
 # Nothing a security check reads comes from here. The base every history check
 # is measured from is the OPERATOR RECORD (see the state directory below), a
 # file outside every repo; this file only ever picks models and keys.
+#
+# Two carve-outs, both because this file is `.`-sourced shell from a tracked
+# path an agent can write (KNOWN-GAPS 3). The first is $WT_ROOT_PROFILED, dealt
+# with further down. The second is the OPENCODE_* set, snapshotted here and
+# restored immediately after: those five variables decide which config opencode
+# loads, and the config decides `provider.<name>.options.baseURL` — the provider
+# IDENTITY a fence profile's `providers` list is built on — and the role prompt.
+# A caller that exports them wins untouched (that rule is unchanged); a file in
+# the tree does not get to.
+OC_VARS="OPENCODE_CONFIG OPENCODE_CONFIG_DIR OPENCODE_CONFIG_CONTENT OPENCODE_PERMISSION OPENCODE_DISABLE_PROJECT_CONFIG"
+OC_SNAP=()
+for _v in $OC_VARS; do
+  if [ -n "${!_v+x}" ]; then OC_SNAP+=("1" "${!_v}"); else OC_SNAP+=("0" ""); fi
+done
+unset _v
 if [ -f "$ROOT/.agents/loom.env" ]; then set -a; . "$ROOT/.agents/loom.env"; set +a; fi
+_oc_i=0
+for _v in $OC_VARS; do
+  _oc_was="${OC_SNAP[$_oc_i]}"; _oc_val="${OC_SNAP[$((_oc_i + 1))]}"
+  _oc_i=$((_oc_i + 2))
+  if [ "$_oc_was" = 1 ]; then
+    [ "${!_v-}" = "$_oc_val" ] || echo "aw: WARN: .agents/loom.env set $_v — ignored (it decides which config opencode loads); the value you exported is kept" >&2
+    export "$_v=$_oc_val"
+  else
+    [ -z "${!_v+x}" ] || echo "aw: WARN: .agents/loom.env set $_v — ignored (it decides which config opencode loads, and this file is agent-writable)" >&2
+    unset "$_v"
+  fi
+done
+unset _v _oc_i _oc_was _oc_val OC_SNAP
 for _k in ZHIPU_API_KEY ZAI_API_KEY DEEPSEEK_API_KEY MOONSHOT_API_KEY; do
   case "$(eval "echo \"\${$_k:-}\"")" in *PASTE-YOUR*) unset "$_k" ;; esac
 done
@@ -611,7 +639,13 @@ $prompt" ) < /dev/null > "$log" 2>&1 || rc=$?
     elif [ -d "$ROOT/.opencode" ]; then
       ocenv+=("OPENCODE_CONFIG_DIR=$ROOT/.opencode")
     fi
-    ( cd "$wd" && env "${ocenv[@]}" opencode run --agent "$role" --model "$model" "$prompt" ) \
+    # OPENCODE_CONFIG_CONTENT is an INLINE config: a whole opencode.json in an
+    # environment variable, and therefore a way to hand opencode a provider
+    # baseURL and a set of role prompts without any file `aw` looks at. It is
+    # stripped from every launch — no caller wins this one, because there is no
+    # way to tell the operator's inline config from an inherited one.
+    ( cd "$wd" && env -u OPENCODE_CONFIG_CONTENT "${ocenv[@]}" \
+        opencode run --agent "$role" --model "$model" "$prompt" ) \
       < /dev/null > "$log" 2>&1 || rc=$?
   fi
   cat "$log"
@@ -1984,6 +2018,14 @@ cmd_run() {
     wt="$(cmd_new "$task" ${newargs[0]+"${newargs[@]}"})"
   fi
   require_wt_on_branch "$task" "$wt"
+  # No record, no run. A worktree without one is a worktree nobody can judge
+  # later: no base to measure its commits from, no note of the fence it was
+  # created under. It used to run a model and commit anyway, and the refusal
+  # only arrived at `aw check`, with the content already on the branch.
+  # security_base says this in full but also refuses a branch with nothing past
+  # its branch point — which is the ordinary state of a task `aw run` is about
+  # to implement — so the record's existence is checked on its own, here.
+  require_record "$task"
   # Re-apply and verify, and refuse outright if what is on disk and what the
   # operator asserted do not line up. The tree cannot authorise anything; it
   # can only contradict the flag, and a contradiction is a dead stop.
@@ -2402,6 +2444,11 @@ cmd_drop() {
     esac
   done
   [ -n "$task" ] || die "usage: aw drop <task-id> [--keep-branch]"
+  # The id, validated BEFORE anything is removed. state_file refuses '.', '..'
+  # and anything with a '/' in it — and it used to be called at the END, so a
+  # bad id removed a worktree, then died, and the operator saw a refusal after
+  # the destruction rather than instead of it.
+  state_file "$task" > /dev/null
   wt="$(wt_path "$task")"; br="$(branch_of "$task")"
   git worktree remove "$wt" --force 2>/dev/null || true
   # The operator record goes with the worktree, --keep-branch or not: it names
