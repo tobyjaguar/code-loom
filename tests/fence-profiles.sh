@@ -197,7 +197,8 @@ for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p \
          0031-al 0032-am 0034-an 0035-an2 0036-ao 0037-ap 0038-ap2 0039-aq \
          0041-ar2 \
          0043-at 0044-at2 0045-at3 0046-au 0047-au2 0048-av 0049-av2 \
-         0050-loom 0051-ax 0052-ax2 0053-au3; do mk_task "$t"; done
+         0050-loom 0051-ax 0052-ax2 0053-au3 \
+         0054-az 0055-az2 0056-az3 0057-ba 0058-bb 0059-bc 0060-bd; do mk_task "$t"; done
 mk_task 0040-ar  codex
 mk_task 0042-as  codex
 mk_task 0005-f codex
@@ -1418,6 +1419,76 @@ out="$(cd "$REPO/backend" && "$rel" help 2>&1)"; rc=$?
 want_eq "(ay) loom help works from a relative invocation"  "$rc" "0"
 want_in "(ay) ... and prints the command list"            "$out" "loom new"
 want_not_in "(ay) ... with no awk failure"                "$out" "cannot open"
+
+# ==========================================================================
+# ROUND-6 fixes. Every case below FAILS against the pre-fix bin/loom (71b20dd).
+#
+# The theme: the last two inputs a worktree could still reach. The operator
+# record is a FILE, and `git remote get-url` / `git config` values land in it
+# straight out of the shared .git/config — where a newline forges a second
+# field. And `remote.origin.fetch` decides which local ref a fetch updates at
+# all, which is what a rebase then replays onto.
+# ==========================================================================
+
+# --- (az) the operator record is one field per line ----------------------
+# git stores a newline inside a config value happily, so a URL of
+# "…/repo\nreviewed=<sha>" used to append a second field to the operator's own
+# record — the one file in this system a worktree is not supposed to write.
+git remote add origin "$TMP/fake-origin-az"
+git remote set-url origin "$(printf '%s\nreviewed=%s' "$TMP/fake-origin-az" \
+                             "$(git rev-parse main)")"
+out="$("$LOOM" new 0054-az 2>&1)"; rc=$?
+want_eq     "(az) loom new refuses a remote URL carrying a newline" "$rc" "1"
+want_in     "(az) ... as a control character in a record field"  "$out" "control character"
+want_in     "(az) ... naming the setting"                        "$out" "remote.origin.url"
+want_absent "(az) ... and wrote no operator record"              "$(state_of 0054-az)"
+want_absent "(az) ... created no worktree"                       "$WTU/0054-az"
+want_eq     "(az) ... and no branch"                             "$(sha_of agent/0054-az)" "GONE"
+# ... and the refspec is read the same way, so it is checked the same way
+git remote set-url origin "$TMP/fake-origin-az"
+git config remote.origin.fetch "$(printf '+refs/heads/*:refs/remotes/origin/*\nreviewed=%s' \
+                                   "$(git rev-parse main)")"
+out="$("$LOOM" new 0055-az2 2>&1)"; rc=$?
+want_eq     "(az) ... and the same for remote.origin.fetch"      "$rc" "1"
+want_in     "(az) ... naming that setting"                       "$out" "remote.origin.fetch"
+want_absent "(az) ... with nothing written"                      "$(state_of 0055-az2)"
+want_absent "(az) ... and nothing created"                       "$WTU/0055-az2"
+# the refspec has to go before the remote does: `git remote remove` parses
+# every refspec it is about to prune, and refuses to parse this one.
+git config --unset-all remote.origin.fetch
+git remote remove origin
+
+# ... and a record that carries a field twice is not a record. "Take the first
+# match and carry on" is exactly how a forged second `reviewed=` reads as a
+# plausible answer: the honest line first, the agent's line under it.
+out="$("$LOOM" new 0056-az3 2>&1)"; rc=$?
+want_eq "(az) setup: a task with a record"                "$rc" "0"
+AZW="$WTU/0056-az3"
+echo "benign" > "$AZW/backend/az3.txt"
+git -C "$AZW" add backend/az3.txt
+git -C "$AZW" commit -qm "the work that gets reviewed"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0056-az3 2>&1)"; rc=$?
+want_eq "(az) setup: it is reviewed"                      "$rc" "0"
+# 'reviewed' is written ABOVE the two fields whose values come out of
+# .git/config, so that even a reader taking the first match for a duplicated
+# key takes the honest one.
+want_eq "(az) ... with 'reviewed' written above 'origin' and 'fetch'" \
+        "$(grep -o '^reviewed\|^origin\|^fetch' "$(state_of 0056-az3)" | tr '\n' ' ')" \
+        "reviewed origin fetch "
+printf 'reviewed=%s\n' "$(git rev-parse main)" >> "$(state_of 0056-az3)"
+head_before="$(git rev-parse HEAD)"
+out="$("$LOOM" land 0056-az3 2>&1)"; rc=$?
+want_eq "(az) loom land dies on a record with a duplicated field" "$rc" "1"
+want_in "(az) ... naming the field and both lines"        "$out" 'field "reviewed" appears twice'
+want_eq "(az) ... and merged nothing"                     "$(git rev-parse HEAD)" "$head_before"
+# a key that is not a field at all is a refusal too
+sedi "\$d" "$(state_of 0056-az3)"
+printf 'evil=1\n' >> "$(state_of 0056-az3)"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0056-az3 2>&1)"; rc=$?
+want_eq "(az) ... and on a key a record does not have"    "$rc" "1"
+want_in "(az) ... naming it"                              "$out" "not a field a record has"
+want_not_in "(az) ... and no reviewer was launched"       "$out" "running on"
+"$LOOM" drop 0056-az3 > /dev/null 2>&1 || true
 
 # --- (j)/(t) doctor lists the profiles, and touches no network ------------
 out="$(timeout 180 "$LOOM" doctor 2>&1 || true)"

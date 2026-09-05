@@ -63,7 +63,8 @@
 #   ${XDG_CONFIG_HOME:-~/.config}/loom/repos/<sha256 of the repo's real path>/
 #       repo                       the repo path, so the directory is readable
 #       tasks/<task>               base=<commit> profile=<name> branch=<br>
-#                                  created=<iso> origin=<url> reviewed=<sha>
+#                                  created=<iso> reviewed=<sha> origin=<url>
+#                                  fetch=<remote.origin.fetch>
 #
 # `loom new` writes it, `loom rebase` re-points its base, `loom check` stamps the tip
 # it had reviewed, `loom drop` deletes it, and every security check (and `loom ls`)
@@ -234,45 +235,161 @@ state_file() { # state_file <task>  -> the path of that task's record
   printf '%s\n' "$STATE_DIR/tasks/$1"
 }
 
+# --- the record's shape, and both sides of it -------------------------------
+# A record is one field per line, `<key>=<value>`, and both halves are checked
+# on the way in AND on the way out. The reason is `origin=` and `fetch=`: their
+# values come from `.git/config` via `git remote get-url` / `git config`, which
+# every linked worktree can write, and git stores a newline inside a config
+# value perfectly happily. A URL of
+#
+#   https://example.invalid/x
+#   reviewed=<the tip the agent wants landed>
+#
+# is therefore a way to write a SECOND field into the operator's own record —
+# the one file in this system that is not supposed to be writable from a
+# worktree. state_put refuses the value; state_read refuses the file.
+#
+# STATE_KEYS is the allowlist. STATE_ORDER is the order fields are WRITTEN in,
+# and it is not the same list by accident: `reviewed` deliberately precedes the
+# two config-derived fields, so that even a reader which took the first match
+# for a duplicated key would take the honest one.
+STATE_KEYS="base profile branch created origin fetch reviewed"
+STATE_ORDER="base profile branch created reviewed origin fetch"
+
 # One field of a task's record, or "". A missing record is "" here on purpose:
 # the callers that must refuse it say so themselves, with their own message.
+#
+# A record that is not one `loom` wrote is NOT "": a duplicated field, an
+# unknown key or a line with no '=' is a dead stop. "Take the first match and
+# carry on" is exactly how a forged second `reviewed=` would have been read as
+# a plausible record with a plausible answer.
 state_read() { # state_read <task> <key>
-  local f; f="$(state_file "$1")"
+  local f out rc=0
+  f="$(state_file "$1")"
   [ -f "$f" ] || return 0
-  sed -n "s/^$2=//p" "$f" | head -1
+  # awk, not sed: the whole file has to be judged before any line of it is
+  # believed, and the complaint comes back on stdout so the refusal below is
+  # the shell's rather than a message from a subprocess nobody reads.
+  out="$(awk -v want="$2" -v keys=" $STATE_KEYS " '
+      { p = index($0, "=")
+        if (p < 2) {
+          printf "line %d is not <key>=<value>: %s", NR, $0; bad = 1; exit 2 }
+        k = substr($0, 1, p - 1)
+        if (index(keys, " " k " ") == 0) {
+          printf "line %d names \"%s\", which is not a field a record has", NR, k
+          bad = 1; exit 2 }
+        if (k in seen) {
+          printf "field \"%s\" appears twice (lines %d and %d)", k, seen[k], NR
+          bad = 1; exit 2 }
+        seen[k] = NR
+        if (k == want) v = substr($0, p + 1) }
+      END { if (!bad) printf "%s", v }
+    ' "$f")" || rc=$?
+  [ "$rc" -eq 0 ] || die "the operator record for task $1 is not one loom wrote: $out
+  $f
+One field per line, each field once. A record loom cannot read as one fact per
+field is not a record it will guess at — a forged duplicate is the whole reason
+this is checked. Start clean:
+  loom drop $1 && loom new $1"
+  printf '%s\n' "$out"
 }
 
-# The only writer. `loom new` calls it with a fresh timestamp; `loom rebase` calls
-# it with the recorded one, because a re-point is not a new task.
+# The record's shape, asserted in the CURRENT shell. state_read dies on a
+# malformed record too, but nearly every caller reads it inside `$(…)`, where a
+# die exits the subshell and hands back "" — which reads as "no record". Every
+# command that names a task asks this first, as a plain statement, so that the
+# refusal is the command's own.
+require_sane_record() { # require_sane_record <task>
+  state_read "$1" base > /dev/null
+}
+
+# A record field is ONE line. Checked before `loom new` creates anything, and
+# again in state_put for every writer.
+require_one_line() { # require_one_line <what> <value>
+  case "$2" in
+    *[[:cntrl:]]*) ;;
+    *) return 0 ;;
+  esac
+  die "$1 contains a control character:
+  $(printf '%s' "$2" | cat -v | sed 's/^/  /' | head -4)
+The operator record is one field per line, so a value carrying a newline is a
+way to write a field loom did not — and this one comes out of .git/config, which
+every linked worktree can write. Put it back to a single line first:
+  git config --get-regexp '^remote\.origin\.'"
+}
+
+# The value state_put was given for one key, or "". First match wins, which is
+# what lets state_update put its overrides in front of the current record.
+state_arg() { # state_arg <key> <key>=<value>...
+  local want="$1" a
+  shift
+  for a in "$@"; do
+    case "$a" in "$want="*) printf '%s' "${a#"$want"=}"; return 0 ;; esac
+  done
+  return 0
+}
+
+# The only writer, and the only validator of what goes in. Arguments are
+# `<key>=<value>`, in any order: threading seven positional fields through three
+# call sites is how a field gets silently dropped, and a key that is not a field
+# is now a refusal rather than a seventh positional argument nobody notices.
 #
-# Two fields beyond the base and the profile, and both exist to pin something
-# an agent could otherwise move under the operator:
+# The fields beyond the base and the profile all exist to pin something an agent
+# could otherwise move under the operator:
 #
 #   origin=<url>    `remote.origin.url` as it was at `loom new`. `loom rebase` and
 #                   `loom land --pr` refuse when the current URL differs: the
 #                   remote config is in the shared .git, so one `git remote
 #                   set-url` inside a worktree re-aims the fetch a rebase
 #                   replays onto, and the push a --pr landing performs.
+#   fetch=<spec>    `remote.origin.fetch`, the refspec that decides which local
+#                   ref a plain `git fetch origin` updates. Same shared config,
+#                   same treatment: pointed at `refs/remotes/decoy/*` it leaves
+#                   a forged `refs/remotes/origin/main` standing through a
+#                   fetch that looks like it worked.
 #   reviewed=<sha>  the branch tip `loom check` last handed to a reviewer.
 #                   `loom land` refuses a tip that is not this one.
-state_put() { # state_put <task> <base> <profile> <branch> <created> <origin> <reviewed>
-  local task="$1" f tmp
+state_put() { # state_put <task> <key>=<value>...
+  local task="$1" f tmp a k v kk ok
+  shift
   f="$(state_file "$task")"
+  for a in "$@"; do
+    case "$a" in
+      *=*) ;;
+      *) die "internal error: state_put argument '$a' is not <key>=<value>" ;;
+    esac
+    k="${a%%=*}"; v="${a#*=}"
+    ok=""
+    for kk in $STATE_KEYS; do [ "$k" = "$kk" ] && ok=yes; done
+    [ -n "$ok" ] || die "refusing to write the operator record for $task: '$k' is not one
+of the fields a record has ($STATE_KEYS)."
+    require_one_line "the '$k' field of task $task's operator record" "$v"
+  done
   ( umask 077; mkdir -p "$STATE_DIR/tasks" ) \
     || die "cannot create the operator state directory $STATE_DIR/tasks"
   chmod 700 "$STATE_DIR" "$STATE_DIR/tasks" 2>/dev/null || true
   ( umask 077; printf '%s\n' "$STATE_MAIN_ROOT" > "$STATE_DIR/repo" ) || true
   tmp="$f.tmp.$$"
-  ( umask 077
-    { printf 'base=%s\n'     "$2"
-      printf 'profile=%s\n'  "$3"
-      printf 'branch=%s\n'   "$4"
-      printf 'created=%s\n'  "$5"
-      printf 'origin=%s\n'   "${6:-}"
-      printf 'reviewed=%s\n' "${7:-}"
-    } > "$tmp" ) || die "cannot write the operator record $f"
+  ( umask 077; : > "$tmp" ) || die "cannot write the operator record $f"
+  for k in $STATE_ORDER; do
+    printf '%s=%s\n' "$k" "$(state_arg "$k" "$@")" >> "$tmp" \
+      || die "cannot write the operator record $f"
+  done
   chmod 600 "$tmp" 2>/dev/null || true
   mv "$tmp" "$f" || die "cannot write the operator record $f"
+}
+
+# Re-write a record, keeping every field it already has except the ones named
+# here. `loom check` (which stamps `reviewed`) and `loom rebase` (which
+# re-points `base` and clears `reviewed`) are its only callers.
+state_update() { # state_update <task> <key>=<value>...
+  local task="$1" k
+  shift
+  local -a args=("$@")            # the overrides go FIRST: first match wins
+  for k in $STATE_KEYS; do
+    args+=("$k=$(state_read "$task" "$k")")
+  done
+  state_put "$task" "${args[@]}"
 }
 
 # `remote.origin.url` as git answers it NOW, or "" when there is no origin.
@@ -280,20 +397,41 @@ state_put() { # state_put <task> <base> <profile> <branch> <created> <origin> <r
 # against the recorded value is what refuses.
 origin_url() { git remote get-url origin 2>/dev/null || true; }
 
+# `remote.origin.fetch` as git answers it NOW: every value, joined by a space,
+# or "" when there is no origin. Multi-valued config is ordinary (a second
+# refspec for tags, say), and the values are read NUL-delimited so that a
+# newline INSIDE one is preserved into the joined string rather than flattened
+# into the join — require_one_line is what has to see it.
+origin_fetch() {
+  local v out=""
+  while IFS= read -r -d '' v; do out="${out:+$out }$v"; done \
+    < <(git config --get-all --null remote.origin.fetch 2>/dev/null || true)
+  printf '%s' "$out"
+}
+
 # The origin a task was created against must still be the origin it lands
-# against. Called by `loom rebase` (before the fetch it would replay onto) and by
-# `loom land --pr` (before the push).
+# against — the URL AND the refspec. Called by `loom rebase` (before the fetch it
+# would replay onto) and by `loom land --pr` (before the push).
 require_recorded_origin() { # require_recorded_origin <task> <command-name>
-  local task="$1" cmd="$2" rec now
+  local task="$1" cmd="$2" rec now what="'remote.origin.url'"
   rec="$(state_read "$task" origin)"
   now="$(origin_url)"
-  [ "$rec" = "$now" ] && return 0
+  if [ "$rec" = "$now" ]; then
+    what="'remote.origin.fetch'"
+    rec="$(state_read "$task" fetch)"
+    now="$(origin_fetch)"
+    [ "$rec" = "$now" ] && return 0
+  fi
   die "the 'origin' remote is not the one task $task was created against:
-  recorded at loom new: ${rec:-(none)}
-  configured now:     ${now:-(none)}
-'remote.origin.url' lives in the shared .git/config, which every linked worktree
-can write, so loom will not $cmd against a remote it cannot vouch for. Put the URL
-back, or start clean:  loom drop $task && loom new $task"
+  $what recorded at loom new: ${rec:-(none)}
+  $what configured now:       ${now:-(none)}
+Both live in the shared .git/config, which every linked worktree can write. The
+URL re-aims the fetch a rebase replays onto and the push a --pr landing
+performs; the refspec decides which local ref a fetch updates at all, so one
+pointed at refs/remotes/decoy/* leaves a forged refs/remotes/origin/<branch>
+standing through a fetch that looks like it worked. loom will not $cmd against a
+remote it cannot vouch for. Put it back, or start clean:
+  loom drop $task && loom new $task"
 }
 
 state_rm() { rm -f "$(state_file "$1")"; }
@@ -1560,6 +1698,7 @@ cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
   # operator's --fence-profile flag on `loom new`, checked again on every later
   # command, and `loom land`'s check of the commits themselves.
   local prof present p tracked
+  require_sane_record "${branch#agent/}"
   prof="$(state_read "${branch#agent/}" profile 2>/dev/null || true)"
   if [ -n "$prof" ]; then
     fence_profile_activate "$prof"     # dies on an unknown or unreadable profile
@@ -1868,6 +2007,11 @@ scan_fence_flag() { # scan_fence_flag "$@"
 require_fence_flag() { # require_fence_flag <task> <command-name>
   local task="$1" cmd="$2" rec="" flag="$FLAG_PROFILE" br
   br="$(branch_of "$task")"
+  # The record is read half a dozen times below and downstream, almost always
+  # from inside `$(…)` — where a die exits the subshell and hands the caller ""
+  # instead. Judge its shape once, here, as a plain statement, so that a forged
+  # or malformed record refuses the COMMAND rather than reading as "no record".
+  require_sane_record "$task"
   if git show-ref --verify --quiet "refs/heads/$br"; then
     rec="$(state_read "$task" profile)"
     if [ -n "$rec" ] && [ -z "$flag" ]; then
@@ -2015,9 +2159,16 @@ fenced paths into this worktree. Confirm it on the command line:
   # `loom rebase` refuses to replay onto it without checking what came with it.
   local newbase; newbase="$(git rev-parse HEAD)" \
     || die "cannot resolve HEAD in $ROOT — there is no branch point to record"
-  # The remote as it is right now, so that a later `loom rebase` / `loom land --pr`
-  # can tell that it still is.
-  local neworigin; neworigin="$(origin_url)"
+  # The remote as it is right now — the URL AND the refspec — so that a later
+  # `loom rebase` / `loom land --pr` can tell that it still is. Both come out of
+  # .git/config, which every linked worktree can write, and a config value can
+  # carry a newline: refused HERE, before this command creates a worktree, a
+  # branch or a record, rather than only when the record is written.
+  local neworigin newfetch
+  neworigin="$(origin_url)"
+  newfetch="$(origin_fetch)"
+  require_one_line "'remote.origin.url'" "$neworigin"
+  require_one_line "'remote.origin.fetch'" "$newfetch"
   NEW_WT="$wt"
   # $NEW_BR before the add, on purpose: the add CREATES the branch and can then
   # fail on the path, and the check above observed that this branch did not
@@ -2030,8 +2181,9 @@ fenced paths into this worktree. Confirm it on the command line:
   git worktree add --no-checkout -b "$br" "$wt" "$newbase" >&2
   assert_wt_under "$wt" "$wtroot"
   NEW_STATE="$task"
-  state_put "$task" "$newbase" "$prof" "$br" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            "$neworigin" ""
+  state_put "$task" "base=$newbase" "profile=$prof" "branch=$br" \
+            "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "origin=$neworigin" "fetch=$newfetch" "reviewed="
   if has_fence; then
     fence_apply "$wt"
     git -C "$wt" checkout >&2
@@ -2156,8 +2308,7 @@ and end with a final line 'VERDICT: APPROVE' or 'VERDICT: REVISE — <reason>'.$
   # What was reviewed, recorded: `loom land` refuses a tip that is not this one,
   # so a commit added after the reviewer read the patch cannot ride the review
   # into the merge.
-  state_put "$task" "$base" "$(state_read "$task" profile)" "$(branch_of "$task")" \
-            "$(state_read "$task" created)" "$(state_read "$task" origin)" "$PINNED_TIP"
+  state_update "$task" "base=$base" "branch=$(branch_of "$task")" "reviewed=$PINNED_TIP"
   echo "loom: review saved to $(relpath "$review")"
   echo "loom: reviewed tip $(git rev-parse --short "$PINNED_TIP") — loom land refuses anything else"
 }
@@ -2505,8 +2656,7 @@ or throw the task away:  loom drop $task"
   # `reviewed` is deliberately cleared: the branch has been rewritten, so the
   # sha a reviewer read no longer exists on it. `loom land` will ask for a fresh
   # `loom check`, which is the honest answer.
-  state_put "$task" "$new_base" "$(state_read "$task" profile)" "$br" \
-            "$(state_read "$task" created)" "$(state_read "$task" origin)" ""
+  state_update "$task" "base=$new_base" "branch=$br" "reviewed="
   echo "loom: $br rebased onto $upstream; base $(git rev-parse --short "$old_base") -> $(git rev-parse --short "$new_base")"
 }
 
