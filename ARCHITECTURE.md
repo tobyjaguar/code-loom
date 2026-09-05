@@ -541,8 +541,11 @@ Semantics:
   silently allowed to match nothing), a missing or empty list, a
   `[fence_profiles]` that is not a table — each one dies, in every mode, before
   any answer is given.
-  `AW_FENCE_PROFILE` from the environment is ignored and cleared at startup: a
-  profile is something an operator types, not something a variable carries.
+  `LOOM_FENCE_PROFILE` from the environment is ignored and cleared at startup —
+  and so is `AW_FENCE_PROFILE`, the name it had before the dispatcher was
+  renamed, because a shell that still exports the old one is exactly the shell
+  this rule exists for. A profile is something an operator types, not something
+  a variable carries.
 
 The caveats of § 5 all still apply, caveat 1 above all: the object store is
 shared, so a profile scopes **exposure**, not exfiltration. What it buys is
