@@ -459,6 +459,14 @@ run_role() { # run_role <role> <workdir> <prompt> [<logfile>]
     # and returned 429, and DeepSeek saw core/. So: any workdir under either
     # worktree root is re-checked against the tree, and the chain of THIS role
     # against the profile the operator asserted, before every single launch.
+    #
+    # Be exact about what that catches: fenced PATHS that came back, whether
+    # attempt 1 re-materialised them (sparse-checkout, `git checkout <ref> --`)
+    # or simply wrote them. It does NOT catch content COPIED to a path the
+    # fence does not name — `git show HEAD:core/lib.rs > backend/notes.txt` is
+    # invisible here, and always will be: that is the exfiltration class, and
+    # the answer to it is a separate repository, not a check (ARCHITECTURE.md
+    # § 5, caveat 1).
     if in_task_worktree "$wd"; then
       fence_reconcile "$wd" "$FENCE_PROFILE"
       profile_provider_guard "$role"
@@ -985,7 +993,7 @@ fence_enforce() { # fence_enforce <worktree>
 #   present  = fenced paths (the FULL [fence]) actually in the worktree
 #   asserted = the profile the OPERATOR named on this command line ("" = none)
 #
-# Five rules:
+# Four rules, and there is no fifth:
 #   1. present, and a profile is asserted that releases every one of them:
 #      re-apply that profile's effective fence, verify, run. (The caller has
 #      already checked the chain of the role about to run.)
@@ -996,13 +1004,20 @@ fence_enforce() { # fence_enforce <worktree>
 #      That tree was not built under the profile, and a profile may not be
 #      introduced after `aw new` — that is how a forged branch record would
 #      otherwise cash out.
-#   4. present, nothing asserted: die, unless the branch record names a profile
-#      that would have released exactly these paths, in which case re-fence to
-#      the FULL fence and say so loudly.
+#   4. present, nothing asserted: DIE. Unconditionally.
+#      This rule used to have an arm: if the branch record named a profile
+#      that would have released exactly these paths, `aw` re-fenced to the
+#      full fence, printed three warnings and ran. That arm read the
+#      agent-writable record and let it change what the command did — one
+#      `git config` plus one `git sparse-checkout disable` and the refusal
+#      became a warning. It is gone, so the record can now only ever refuse.
+#      An unprofiled tree holding fenced paths is a dead stop; `aw drop` is
+#      the fix.
 #   5. nothing present, nothing asserted: the ordinary path — apply and verify
-#      the full fence, as `aw run` has always done.
+#      the full fence, as `aw run` has always done. (Not a rule about a
+#      release; the ordinary case.)
 fence_reconcile() { # fence_reconcile <worktree> <asserted-profile-or-empty>
-  local wt="$1" asserted="${2:-}" present p stray="" br rprof cover=yes
+  local wt="$1" asserted="${2:-}" present p stray=""
   [ -d "$wt" ] || return 0
   present="$(zones_py fence-present-full "$wt")" \
     || die "cannot tell which fenced paths are present in $wt — refusing to guess"
@@ -1038,28 +1053,16 @@ It was not created under that profile, and a profile cannot be introduced after
   # the flag does not), so reaching here means either a fence that was widened
   # under an existing worktree — which dies, `aw drop` is the fix — or a caller
   # that skipped require_fence_flag, which is what run_role's second call is
-  # here to catch. The one tolerated case prints three warning lines first.
+  # here to catch. Either way it is a dead stop: the branch record is not
+  # consulted, because a record that could turn this refusal into a warning
+  # would be a record that authorises, and it is agent-writable.
   if [ -n "$present" ]; then
-    br="$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
-    rprof=""
-    [ -n "$br" ] && rprof="$(git config "branch.$br.fenceprofile" 2>/dev/null || true)"
-    if [ -n "$rprof" ]; then
-      while IFS= read -r p; do
-        [ -n "$p" ] || continue
-        profile_releases "$rprof" "$p" || cover=""
-      done <<< "$present"
-    else
-      cover=""
-    fi
-    [ -n "$cover" ] || die "fenced paths are present in $wt and no fence profile is \
+    die "fenced paths are present in $wt and no fence profile is \
 asserted for this command:
 $(printf '%s\n' "$present" | sed 's/^/  /')
 Refusing to run a model here. Either name the profile these paths belong to
 (--fence-profile <name>, which must also be the profile the worktree was
 created under), or start clean:  aw drop <task-id>"
-    echo "aw: WARNING: $wt holds paths released by the recorded profile '$rprof', but" >&2
-    echo "aw: WARNING: no --fence-profile was given — re-applying the FULL fence and" >&2
-    echo "aw: WARNING: running at it. Pass --fence-profile $rprof if that was not what you meant." >&2
   fi
   fence_enforce "$wt"
 }
