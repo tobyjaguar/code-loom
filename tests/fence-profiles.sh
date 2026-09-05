@@ -62,6 +62,11 @@ cat > "$TMP/stubs/codex" << 'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$@" >> "${LOOM_TEST_TMP:?}/called-codex.log"
 echo "stub codex done"
+# Opt-in, for the cases that need `loom loop` to reach a verdict rather than
+# die on a review with no VERDICT line. Off everywhere else, so no other case
+# changes shape.
+[ -n "${LOOM_TEST_VERDICT:-}" ] && echo "VERDICT: $LOOM_TEST_VERDICT"
+exit 0
 STUB
 cat > "$TMP/stubs/opencode" << 'STUB'
 #!/usr/bin/env bash
@@ -199,7 +204,7 @@ for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p \
          0041-ar2 \
          0043-at 0044-at2 0045-at3 0046-au 0047-au2 0048-av 0049-av2 \
          0050-loom 0051-ax 0052-ax2 0053-au3 \
-         0054-az 0055-az2 0056-az3 0057-ba 0058-bb 0059-bc 0060-bd 0061-ba2; do mk_task "$t"; done
+         0054-az 0055-az2 0056-az3 0057-ba 0058-bb 0059-bc 0060-bd 0061-ba2 0062-bf; do mk_task "$t"; done
 mk_task 0040-ar  codex
 mk_task 0042-as  codex
 mk_task 0005-f codex
@@ -1611,6 +1616,122 @@ want_eq "(bb) land refuses the branch on the hand check"  "$rc" "1"
 want_in "(bb) ... naming the file"                        "$out" ".opencode/opencode.json"
 want_in "(bb) ... as a hand-zone path"                    "$out" "commits touch hand-zone paths"
 want_eq "(bb) ... and nothing was merged into your checkout" "$(git rev-parse HEAD)" "$head_before"
+
+# --- (bc) loom loop works on a fresh task ---------------------------------
+# The pre-implement check was security_base, which ALSO refuses a branch with
+# nothing past its branch point — the ordinary state of the task `loom loop`
+# exists to implement. So `loom loop <new-task>` died on "nothing to
+# review/land" before the implementer ever ran. The record's existence is what
+# has to hold there; the history check belongs inside the loop, where there is
+# a history.
+claude_before="$(wc -l < "$TMP/called-claude.log" 2>/dev/null || echo 0)"
+out="$(LOOM_TEST_VERDICT=APPROVE LOOM_MODELS_implementer="claude-sub" \
+       LOOM_MODELS_reviewer="codex-sub" "$LOOM" loop 0059-bc 2>&1)"; rc=$?
+want_eq     "(bc) loom loop on a fresh task succeeds"     "$rc" "0"
+want_not_in "(bc) ... not 'nothing to review'"            "$out" "nothing to review/land"
+want_ne     "(bc) ... the implementer really ran"         \
+            "$(wc -l < "$TMP/called-claude.log" 2>/dev/null || echo 0)" "$claude_before"
+want_in     "(bc) ... and the gate went green"            "$out" "gate green"
+want_in     "(bc) ... and a review round followed it"     "$out" "[loop] review round 1"
+want_in     "(bc) ... ending in the reviewer's verdict"   "$out" "APPROVE after 1 round(s)"
+want_file   "(bc) ... with the review on disk"            "$WTU/0059-bc/.agents/reviews/0059-bc-review.md"
+
+# --- (bd) a landed loom.env cannot re-aim git itself ----------------------
+# `.agents/loom.env` is `.`-sourced as shell under `set -a`, so a single
+# `GIT_DIR=` line there exports it into every git subprocess loom runs: the
+# `git rev-parse HEAD` that becomes the recorded base, the `git worktree add`,
+# the merge. It is cleared once both env files have been read.
+git init -q "$TMP/decoy-bd"
+(
+  cd "$TMP/decoy-bd" || exit 1
+  git symbolic-ref HEAD refs/heads/main
+  git config user.email test@example.invalid
+  git config user.name  "fence test"
+  echo "not your repo" > decoy.txt
+  git add -A
+  git commit -qm "the decoy's own history"
+)
+bd_real="$(git rev-parse HEAD)"
+bd_decoy="$(git -C "$TMP/decoy-bd" rev-parse HEAD)"
+want_ne "(bd) setup: the decoy has a history of its own" "$bd_decoy" "$bd_real"
+printf 'GIT_DIR=%s\n' "$TMP/decoy-bd/.git" > .agents/loom.env
+out="$("$LOOM" new 0060-bd 2>&1)"; rc=$?
+rm -f .agents/loom.env
+want_eq     "(bd) loom new still cuts from the real repo"  "$rc" "0"
+want_eq     "(bd) ... and records the REAL checkout's HEAD" "$(state_field 0060-bd base)" "$bd_real"
+want_ne     "(bd) ... never the decoy's"                    "$(state_field 0060-bd base)" "$bd_decoy"
+want_file   "(bd) ... and the worktree is a worktree of the real repo" "$WTU/0060-bd/backend/main.go"
+want_absent "(bd) ... not of the decoy"                     "$WTU/0060-bd/decoy.txt"
+
+# --- (be) a directory that is not a checkout is a refusal, not "nothing" ---
+# A submodule's git dir lives at <superproject>/.git/modules/<name>, so
+# `--git-common-dir` from inside one made $ROOT `<superproject>/.git/modules`:
+# no .agents, no zones, every path "assist", every guard green.
+git -c protocol.file.allow=always submodule add -q "$TMP/decoy-bd" sub 2>/dev/null
+if [ -e "$REPO/sub/.git" ]; then
+  out="$(cd "$REPO/sub" && "$LOOM" zone core/x 2>&1)"; rc=$?
+  want_eq     "(be) loom refuses to run inside a submodule"  "$rc" "1"
+  want_in     "(be) ... naming the .git directory it landed in" "$out" ".git"
+  want_not_in "(be) ... rather than answering 'assist'"      "$out" "→ assist"
+  git rm -q -f sub
+  git submodule deinit -q -f sub 2>/dev/null || true
+  rm -rf "$REPO/.git/modules/sub" "$REPO/sub"
+  git commit -qm "drop the submodule" 2>/dev/null || git reset -q --hard
+else
+  bad "(be) setup: could not add a submodule to the test repo"
+fi
+# ... and a checkout with no .agents/ at all is the same refusal.
+mkdir -p "$TMP/bare-repo"
+(
+  cd "$TMP/bare-repo" || exit 1
+  git init -q .
+  git config user.email test@example.invalid
+  git config user.name  "fence test"
+  echo hi > f.txt
+  git add -A
+  git commit -qm init
+)
+out="$(cd "$TMP/bare-repo" && "$LOOM" zone f.txt 2>&1)"; rc=$?
+want_eq     "(be) a repo with no .agents/ is refused too"  "$rc" "1"
+want_in     "(be) ... saying what is missing"              "$out" "no .agents directory"
+want_not_in "(be) ... rather than answering 'assist'"      "$out" "→ assist"
+
+# --- (bf) landing deletes the branch only if it is still what was merged ---
+# `loom land` merges $PINNED_TIP — the reviewed sha — and then deleted the
+# branch by NAME. The ref lives in the shared .git, so between the
+# reviewed-tip check and that deletion it can say something else: whatever else
+# is on it has never been reviewed, and `git branch -d` on a merged ref would
+# throw it away without a word (or, unmerged, abort the command after the merge
+# had already happened).
+out="$("$LOOM" new 0062-bf 2>&1)"; rc=$?
+want_eq "(bf) setup: an unprofiled worktree"              "$rc" "0"
+BFW="$WTU/0062-bf"
+echo "benign" > "$BFW/backend/bf.txt"
+git -C "$BFW" add backend/bf.txt
+git -C "$BFW" commit -qm "the work that gets reviewed"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0062-bf 2>&1)"; rc=$?
+want_eq "(bf) setup: it is reviewed"                      "$rc" "0"
+bf_tip="$(git rev-parse agent/0062-bf)"
+bf_moved="$(git rev-parse main)"
+# The operator's gate runs between the reviewed-tip check and the merge, and
+# the branch ref is one `git update-ref` from anywhere while it does.
+cp .agents/gate.sh "$TMP/gate.bf"
+cat > .agents/gate.sh << GATE
+#!/usr/bin/env bash
+git update-ref refs/heads/agent/0062-bf $bf_moved
+exit 0
+GATE
+chmod +x .agents/gate.sh
+head_before="$(git rev-parse HEAD)"
+out="$("$LOOM" land 0062-bf 2>&1)"; rc=$?
+cp "$TMP/gate.bf" .agents/gate.sh
+want_eq "(bf) the merge of the reviewed sha still succeeds" "$rc" "0"
+want_ne "(bf) ... the merge really happened"              "$(git rev-parse HEAD)" "$head_before"
+want_eq "(bf) ... and it carried the REVIEWED sha"        "$(git rev-parse HEAD^2)" "$bf_tip"
+want_ne "(bf) ... the branch that moved is NOT deleted"   "$(sha_of agent/0062-bf)" "GONE"
+want_in "(bf) ... and loom says why it kept it"           "$out" "moved after the review"
+want_in "(bf) ... naming both shas"                       "$out" "$bf_tip"
+git branch -D agent/0062-bf > /dev/null 2>&1 || true
 
 # --- (j)/(t) doctor lists the profiles, and touches no network ------------
 out="$(timeout 180 "$LOOM" doctor 2>&1 || true)"

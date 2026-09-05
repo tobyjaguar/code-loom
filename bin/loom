@@ -180,6 +180,17 @@ for _v in $OC_VARS; do
   fi
 done
 unset _v _oc_i _oc_was _oc_val OC_SNAP
+# git's own environment, cleared once BOTH env files have been sourced. Every
+# one of these re-aims a git subprocess at a different repository, index or
+# object store — GIT_DIR and GIT_WORK_TREE obviously, GIT_INDEX_FILE and
+# GIT_OBJECT_DIRECTORY* more quietly — and `.agents/loom.env` is `.`-sourced as
+# shell from a tracked path an agent can write (KNOWN-GAPS 3), under `set -a`,
+# so one line in a landed loom.env would point every check, every worktree add
+# and every merge at a repo of its choosing. $ROOT and $INVOKED_ROOT were
+# resolved before that file was read; from here on nothing in the environment
+# moves them.
+unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+      GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_CEILING_DIRECTORIES
 for _k in ZHIPU_API_KEY ZAI_API_KEY DEEPSEEK_API_KEY MOONSHOT_API_KEY; do
   case "$(eval "echo \"\${$_k:-}\"")" in *PASTE-YOUR*) unset "$_k" ;; esac
 done
@@ -191,6 +202,34 @@ fi
 
 die()  { echo "loom: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Two ways for $ROOT to be a directory loom must not treat as a checkout, both
+# of which used to end in "nothing is fenced, nothing is hand, carry on" rather
+# than a refusal.
+#
+# A SUBMODULE has its git dir at <superproject>/.git/modules/<name>, so
+# `git rev-parse --git-common-dir` from inside one answers that path and $ROOT
+# becomes <superproject>/.git/modules — a directory with no .agents, no zones
+# and no relationship to the operator record, where every path resolves to
+# "assist" and `loom guard` exits 0. Run loom in the superproject.
+case "$ROOT" in
+  */.git|*/.git/*)
+    die "the main checkout resolves to
+  $ROOT
+which is inside a '.git' directory — the shape a git SUBMODULE has (its git dir
+lives at <superproject>/.git/modules/<name>). loom's zones, its fence and its
+operator record are keyed to a CHECKOUT, and a module directory has none of
+them: every path there resolves to 'assist' and every guard passes. Run loom
+from the superproject." ;;
+esac
+# And a repo with no .agents/ at all has no policy to apply. Silence there is
+# indistinguishable from "everything is permitted", so say it instead.
+[ -d "$AGENTS_DIR" ] || die "no .agents directory in the main checkout
+  $ROOT
+That is where the zones, the fence and the gate live, so without it loom would
+fence nothing, guard nothing and gate nothing — which is not a default it will
+pick for you. Create it (README § Setup), or run loom from the repo that has
+one."
 
 # --------------------------------------------------- operator task state
 # One file per task, OUTSIDE every repository and outside the shared `.git`.
@@ -2328,7 +2367,7 @@ cmd_loop() {
   scan_fence_flag "$@"
   local task="${FLAG_ARGS[0]:?usage: loom loop <task-id> [--fence-profile <name>]}"
   local rounds="${LOOM_LOOP_ROUNDS:-2}"
-  local wt review verdict tfile base i=1
+  local wt review verdict tfile base i=1     # $base is set per round, below
   local -a passthru=()
   [ -n "$FLAG_PROFILE" ] && passthru=(--fence-profile "$FLAG_PROFILE")
   wt="$(wt_path "$task")"
@@ -2346,9 +2385,15 @@ cmd_loop() {
   [ -d "$wt" ] || cmd_new "$task" ${passthru[0]+"${passthru[@]}"} > /dev/null
   require_wt_on_branch "$task" "$wt"
   fence_reconcile "$wt" "$FENCE_PROFILE"
-  pin_branch_tip "$task"
-  base="$(security_base "$task")"
-  fence_reconcile_history "$task" "$base" "$FENCE_PROFILE"
+  # require_record, NOT security_base. security_base also refuses a branch with
+  # nothing past its branch point — which is the ordinary state of the fresh
+  # task `loom loop` exists to implement, so `loom loop <new-task>` died on
+  # "nothing to review/land" before the implementer ever ran. What must hold
+  # before a model runs is the RECORD (the same rule `loom run` applies): no
+  # base to judge this branch's commits against, no run. The history check
+  # stays where there is a history to check — inside the loop, before each
+  # review, below.
+  require_record "$task"
 
   implement() { # one implementer pass, with cmd_run's exit codes named
     local rc=0
@@ -2518,7 +2563,27 @@ Landing would publish commits nobody read. Re-run the review, then land:
   # the ref is one `git update-ref` from saying something else.
   git merge --no-ff "$PINNED_TIP" -m "land($task)"
   git worktree remove "$wt" --force
-  git branch -d "$br"
+  # The merge is done and it carried $PINNED_TIP — the reviewed sha. The branch
+  # is a NAME, and the ref lives in the shared .git, so it may say something
+  # else by now. Delete it only when it still points at what was merged;
+  # otherwise leave it standing and say so, because whatever else is on it has
+  # never been reviewed and would be gone for good. (`git branch -d` would
+  # refuse an unmerged branch, which under `set -e` aborts the command AFTER
+  # the merge — no checkbox, no message, and the same branch left behind
+  # anyway. The guard is the point; -D is what it guards.)
+  local now_tip
+  now_tip="$(git rev-parse --verify --quiet "$(branch_ref "$task")^{commit}" 2>/dev/null || true)"
+  if [ "$now_tip" = "$PINNED_TIP" ]; then
+    git branch -D "$br"
+  else
+    echo "loom: $br moved after the review — it is NOT deleted." >&2
+    echo "loom:   merged (the reviewed tip): $PINNED_TIP" >&2
+    echo "loom:   $br is now:                ${now_tip:-(gone)}" >&2
+    echo "loom: the merge above is the reviewed work and it is done. Read what else" >&2
+    echo "loom: is on the branch before throwing it away:" >&2
+    echo "loom:   git log --oneline $PINNED_TIP..$br" >&2
+    echo "loom:   git branch -D $br" >&2
+  fi
   plan="$(grep -rl -- "$task" "$AGENTS_DIR/plans" 2>/dev/null | head -1 || true)"
   [ -n "$plan" ] && sedi "s/- \[ \] $task/- [x] $task/" "$plan"
   echo "loom: landed $task"
