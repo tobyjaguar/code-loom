@@ -774,6 +774,12 @@ It was not created under that profile, and a profile cannot be introduced after
     return 0
   fi
 
+  # Nothing asserted, and the tree holds fenced paths. Every top-level command
+  # has already refused this (require_fence_flag dies when a record exists and
+  # the flag does not), so reaching here means either a fence that was widened
+  # under an existing worktree — which dies, `aw drop` is the fix — or a caller
+  # that skipped require_fence_flag, which is what run_role's second call is
+  # here to catch. The one tolerated case prints three warning lines first.
   if [ -n "$present" ]; then
     br="$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
     rprof=""
@@ -842,8 +848,10 @@ cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
       [ -n "$p" ] || continue
       is_released "$p" && continue
       echo "pre-commit: BLOCKED — this branch records fence profile '$prof', but the" >&2
-      echo "worktree holds fenced path '$p', which that profile does not release." >&2
+      echo "tree here holds fenced path '$p', which that profile does not release." >&2
       echo "The record does not match the tree; refusing to widen the guard on it." >&2
+      echo "(If this is your own checkout with an agent branch checked out, it holds" >&2
+      echo "every fenced path by design — commit from the agent worktree instead.)" >&2
       exit 1
     done <<< "$present"
     if [ -z "$present" ] && [ -n "$(zones_py profile-tracked "$ROOT")" ]; then
