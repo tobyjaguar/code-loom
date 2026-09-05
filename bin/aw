@@ -16,6 +16,13 @@
 #   aw land  0007-c --pr             gate, push agent/0007-c, print PR next steps
 #   aw drop  0007-c [--keep-branch]  discard worktree (and branch, unless kept)
 #   aw rebase 0007-c                 rebase the branch onto origin/main; re-point its diff base
+#   aw ls                            list active agent worktrees
+#   aw gate                          run the gate here
+#   aw zone  <path>                  which zone a path belongs to
+#   aw tier  lean|standard|deep      print export line for the model tier
+#   aw doctor                        verify binaries, keys, and MODEL IDS
+#   aw guard                         pre-commit zone check (used by the hook)
+#   aw install-hooks                 install the hand-zone commit guard
 #
 #   --fence-profile <name>           REQUIRED on new, run, check, loop, rebase
 #                                    and land for a task under a fence profile,
@@ -25,13 +32,6 @@
 #                                    profile allows. The branch record only
 #                                    checks your flag; it never replaces it.
 #                                    (README § Fence profiles)
-#   aw ls                            list active agent worktrees
-#   aw gate                          run the gate here
-#   aw zone  <path>                  which zone a path belongs to
-#   aw tier  lean|standard|deep      print export line for the model tier
-#   aw doctor                        verify binaries, keys, and MODEL IDS
-#   aw guard                         pre-commit zone check (used by the hook)
-#   aw install-hooks                 install the hand-zone commit guard
 #
 # Env:
 #   LOOM_TIER=lean|standard|deep   model tier            (default standard)
