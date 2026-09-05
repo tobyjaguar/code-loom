@@ -104,6 +104,10 @@ unset ZHIPU_API_KEY ZAI_API_KEY DEEPSEEK_API_KEY MOONSHOT_API_KEY \
 mkdir -p "$REPO"/{core,ios,backend,docs/audits}/ "$REPO"/.agents/{tasks,plans,reviews} "$REPO"/.opencode/prompts
 cd "$REPO" || exit 1
 git init -q .
+# The trunk is `main` on purpose: $LOOM_BASE_REF (the ref every SECURITY BASE
+# is measured from) defaults to origin/main, else main, and this repo has no
+# remote. `git init -b main` needs git >= 2.28; this works everywhere.
+git symbolic-ref HEAD refs/heads/main
 git config user.email test@example.invalid
 git config user.name  "fence test"
 echo "fn secret() {}"      > core/lib.rs

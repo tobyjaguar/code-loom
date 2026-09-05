@@ -80,7 +80,21 @@ LOOM_ENV="${LOOM_ENV:-$HOME/.config/loom/env}"
 if [ -f "$LOOM_ENV" ]; then set -a; . "$LOOM_ENV"; set +a; fi
 # Project-scoped model chains and keys, checked into or ignored by the project
 # as it prefers. Sourced second, so a project overrides the global file.
+#
+# One variable is exempt. $LOOM_BASE_REF names the ref the SECURITY BASE is
+# measured from (see security_base below), and .agents/loom.env is an in-repo
+# file an agent may edit — a loom.env that pointed it at the branch's own tip
+# would collapse every history check to an empty diff. It is snapshotted here
+# and restored afterwards, loudly.
+LOOM_BASE_REF_OPERATOR="${LOOM_BASE_REF:-}"
 if [ -f "$ROOT/.agents/loom.env" ]; then set -a; . "$ROOT/.agents/loom.env"; set +a; fi
+if [ "${LOOM_BASE_REF:-}" != "$LOOM_BASE_REF_OPERATOR" ]; then
+  echo "aw: WARNING: .agents/loom.env sets LOOM_BASE_REF='${LOOM_BASE_REF:-}' — ignored." >&2
+  echo "aw: WARNING: The base every history check is measured from is operator-side only." >&2
+  echo "aw: WARNING: Set it in your environment or $LOOM_ENV, never in the repo." >&2
+  LOOM_BASE_REF="$LOOM_BASE_REF_OPERATOR"
+fi
+unset LOOM_BASE_REF_OPERATOR
 for _k in ZHIPU_API_KEY ZAI_API_KEY DEEPSEEK_API_KEY MOONSHOT_API_KEY; do
   case "$(eval "echo \"\${$_k:-}\"")" in *PASTE-YOUR*) unset "$_k" ;; esac
 done
@@ -204,6 +218,22 @@ root_of_wt() { # root_of_wt <worktree-path>
     *) die "internal error: $1 is under neither worktree root" ;;
   esac
 }
+
+# ------------------------------------------------------------ the base ref
+# ONE name, resolved once, for the ref every security base is measured from.
+# It is operator-side by construction: the environment, or the key file outside
+# every repo. .agents/loom.env is explicitly not allowed to set it (see the
+# snapshot above), because that file lives in the tree an agent writes.
+#
+# Default: origin/main when the remote-tracking ref exists, else main. A repo
+# whose trunk is called something else sets LOOM_BASE_REF itself.
+if [ -z "${LOOM_BASE_REF:-}" ]; then
+  if git rev-parse --verify --quiet "origin/main^{commit}" >/dev/null 2>&1; then
+    LOOM_BASE_REF="origin/main"
+  else
+    LOOM_BASE_REF="main"
+  fi
+fi
 
 # Portable in-place sed (BSD sed on macOS needs -i '').
 sedi() {
@@ -1044,24 +1074,45 @@ created under), or start clean:  aw drop <task-id>"
 # to the operator: aw check (before the patch is written), aw loop (each
 # round), aw diff, aw land (before merge and before push) and aw rebase.
 #
-# Base is the branch's loombase, the same commit the reviewer's diff uses.
+# Base is the SECURITY base (see security_base): merge-base($LOOM_BASE_REF,
+# <branch>), computed operator-side in $ROOT. Never the loombase — that is
+# branch config, which anything running in the worktree can rewrite, and a
+# base an agent chose is a fence check an agent chose.
+#
+# Every way of not knowing is a DEATH, never an empty answer. An unresolvable
+# base used to `return 0` with no paths, which reads downstream as "this
+# branch's commits touch nothing fenced" — fail-open, on exactly the input an
+# agent controls.
 HIST_PATHS=()
 history_paths() { # history_paths <dir> <base> <rev>  -> fills $HIST_PATHS
   local d="$1" base="$2" rev="${3:-HEAD}" p
   HIST_PATHS=()
-  [ -n "$base" ] || return 0
-  git -C "$d" rev-parse --verify --quiet "$base^{commit}" >/dev/null 2>&1 || return 0
-  git -C "$d" rev-parse --verify --quiet "$rev^{commit}"  >/dev/null 2>&1 || return 0
+  [ -n "$base" ] || die "internal error: history_paths called with no base"
+  git -C "$d" rev-parse --verify --quiet "$base^{commit}" >/dev/null 2>&1 \
+    || die "the base commit '$base' does not resolve in $d, so aw cannot tell what this
+branch's commits touch. Refusing to guess — a base that does not resolve is not
+an empty diff."
+  git -C "$d" rev-parse --verify --quiet "$rev^{commit}"  >/dev/null 2>&1 \
+    || die "'$rev' does not resolve in $d — refusing to guess what it touches"
   # -z: a path with a space or a quote in it must not turn into two paths.
   # --no-renames: a rename must be judged on BOTH sides, and with rename
   # detection off git reports it as a delete plus an add, which is exactly
   # that. The --diff-filter=A pass adds nothing new after --no-renames; it is
   # there so the answer does not depend on that equivalence holding.
+  # A NUL-delimited stream cannot survive a command substitution, and the exit
+  # status of a process substitution cannot be read — so it goes through a
+  # file, and a git that fails is a refusal rather than an empty path list.
+  local out; out="$(mktemp "${TMPDIR:-/tmp}/aw-hist.XXXXXX")"
+  if ! { git -C "$d" diff -z --no-renames --name-only "$base" "$rev" \
+      && git -C "$d" diff -z --no-renames --name-only --diff-filter=A "$base" "$rev"
+       } > "$out" 2>/dev/null; then
+    rm -f "$out"
+    die "git diff $base..$rev failed in $d — refusing to guess what those commits touch"
+  fi
   while IFS= read -r -d '' p; do
     [ -n "$p" ] && HIST_PATHS+=("$p")
-  done < <( { git -C "$d" diff -z --no-renames --name-only "$base" "$rev"
-              git -C "$d" diff -z --no-renames --name-only --diff-filter=A "$base" "$rev"
-            } 2>/dev/null )
+  done < "$out"
+  rm -f "$out"
   return 0
 }
 
@@ -1238,7 +1289,75 @@ require_worktree() { # require_worktree <task>
 }
 
 branch_of() { echo "agent/$1"; }
-base_of()   { git config "branch.$(branch_of "$1").loombase" 2>/dev/null || git rev-parse HEAD; }
+
+# --- two bases, and only one of them is trusted ----------------------------
+# `branch.agent/<task>.loombase` lives in the SHARED .git/config, so anything
+# running inside the worktree can rewrite it with one `git config`. Pointed at
+# the branch's own tip it makes `git diff <base> HEAD` empty; pointed at a
+# sha that does not resolve it used to make the history checks answer "no
+# paths" and pass. Either way an agent chose what the fence check looked at.
+#
+# So there are two bases now:
+#
+#   security_base <br>   computed HERE, in $ROOT, from refs the operator
+#                        controls: merge-base($LOOM_BASE_REF, <br>). This is
+#                        the base every fence/hand history check uses. Nothing
+#                        an agent can write takes part in it.
+#   review_base <task>   the loombase, kept only because it is the nicer diff
+#                        to READ (it hides the plan/task commit the branch
+#                        rides on). It is clamped: it must be an ancestor of
+#                        the branch AND an ancestor of (or equal to) the
+#                        security base. Anything else and the security base is
+#                        used for the review diff too, loudly — an agent must
+#                        not be able to shrink what the reviewer sees.
+loombase_of() { # loombase_of <task>  -> the recorded loombase, or "" (never fails)
+  git config "branch.$(branch_of "$1").loombase" 2>/dev/null || true
+}
+
+security_base() { # security_base <branch>  -> merge-base commit, or dies
+  local br="$1" mb
+  git rev-parse --verify --quiet "$LOOM_BASE_REF^{commit}" >/dev/null 2>&1 \
+    || die "the base ref '$LOOM_BASE_REF' does not resolve in $ROOT.
+Every fence and hand history check is measured from merge-base($LOOM_BASE_REF, <branch>),
+so without it aw cannot tell what a branch's commits touch — and will not guess.
+Fetch it, or name the trunk yourself:  LOOM_BASE_REF=<ref> aw ..."
+  git rev-parse --verify --quiet "$br^{commit}" >/dev/null 2>&1 \
+    || die "branch '$br' does not resolve in $ROOT — refusing to guess its base"
+  mb="$(git merge-base "$LOOM_BASE_REF" "$br" 2>/dev/null)" || mb=""
+  [ -n "$mb" ] || die "'$br' and '$LOOM_BASE_REF' have no common ancestor, so there is no
+base to judge this branch's commits against. That is not a branch this repo's
+trunk produced — inspect it, do not land it."
+  printf '%s\n' "$mb"
+}
+
+review_base() { # review_base <task> <security-base>  -> commit to diff from
+  local task="$1" sec="$2" br lb
+  br="$(branch_of "$task")"
+  lb="$(loombase_of "$task")"
+  [ -n "$lb" ] || { printf '%s\n' "$sec"; return 0; }
+  if ! lb="$(git rev-parse --verify --quiet "$lb^{commit}" 2>/dev/null)"; then
+    echo "aw: WARNING: branch.$br.loombase does not resolve — using the security base" >&2
+    echo "aw: WARNING: $(git rev-parse --short "$sec") for the review diff instead." >&2
+    printf '%s\n' "$sec"; return 0
+  fi
+  if ! git merge-base --is-ancestor "$lb" "$br" 2>/dev/null; then
+    echo "aw: WARNING: branch.$br.loombase ($(git rev-parse --short "$lb")) is not an" >&2
+    echo "aw: WARNING: ancestor of $br — using the security base for the review diff." >&2
+    printf '%s\n' "$sec"; return 0
+  fi
+  if ! git merge-base --is-ancestor "$lb" "$sec" 2>/dev/null; then
+    # Forward of the merge-base: the review diff would start AFTER commits this
+    # branch added. That is what an agent does to hide one, and also what
+    # `aw rebase` does legitimately when it re-points at a replayed base — so
+    # it is a loud fallback, not a refusal.
+    echo "aw: WARNING: branch.$br.loombase ($(git rev-parse --short "$lb")) is ahead of the" >&2
+    echo "aw: WARNING: security base $(git rev-parse --short "$sec") — it would hide commits from" >&2
+    echo "aw: WARNING: the review diff. Using the security base instead. (After 'aw rebase'" >&2
+    echo "aw: WARNING: this is expected: the replayed plan/task commit is in the diff again.)" >&2
+    printf '%s\n' "$sec"; return 0
+  fi
+  printf '%s\n' "$lb"
+}
 
 # --- where a task's fence profile comes from -------------------------------
 # From the operator, on the command line, every single time. `--fence-profile
@@ -1533,7 +1652,7 @@ $(tail -40 "$wt/.agents/reviews/$task-gate.log" 2>/dev/null)"
 cmd_check() {
   scan_fence_flag "$@"
   local task="${FLAG_ARGS[0]:?usage: aw check <task-id> [--fence-profile <name>]}"
-  local wt base review log pnote=""
+  local wt base rbase review log pnote=""
   require_fence_flag "$task" check
   wt="$(require_worktree "$task")"
   profile_provider_guard reviewer         # no-op without a profile
@@ -1542,9 +1661,12 @@ cmd_check() {
   # here, not one line later — and so must a HISTORY the operator has not
   # vouched for, which a re-fenced worktree no longer shows.
   fence_reconcile "$wt" "$FENCE_PROFILE"
-  base="$(base_of "$task")"
+  base="$(security_base "$(branch_of "$task")")"
   fence_reconcile_history "$wt" "$base" "$FENCE_PROFILE"
-  ( cd "$wt" && git diff "$base" HEAD > ".agents/reviews/$task.patch" )
+  # The history is judged from the security base; the patch is written from the
+  # (clamped) loombase, which is only ever the nicer diff to read.
+  rbase="$(review_base "$task" "$base")"
+  ( cd "$wt" && git diff "$rbase" HEAD > ".agents/reviews/$task.patch" )
   review="$wt/.agents/reviews/$task-review.md"
   log="$(mktemp "${TMPDIR:-/tmp}/aw-review.XXXXXX")"
   # Without this the scope check reads a released path as an "unauthorized
@@ -1589,7 +1711,7 @@ cmd_loop() {
   refuse_cross_root "$task"
   [ -d "$wt" ] || cmd_new "$task" ${passthru[0]+"${passthru[@]}"} > /dev/null
   fence_reconcile "$wt" "$FENCE_PROFILE"
-  base="$(base_of "$task")"
+  base="$(security_base "$(branch_of "$task")")"
   fence_reconcile_history "$wt" "$base" "$FENCE_PROFILE"
 
   implement() { # one implementer pass, with cmd_run's exit codes named
@@ -1608,7 +1730,10 @@ cmd_loop() {
   while [ "$i" -le "$rounds" ]; do
     echo "aw: [loop] review round $i/$rounds"
     # Each round: the implementer has just committed, so re-judge the history
-    # before it is turned into a patch and handed to the reviewer.
+    # before it is turned into a patch and handed to the reviewer. The base is
+    # re-derived, not reused: the branch tip moved, and the security base is a
+    # merge-base against it.
+    base="$(security_base "$(branch_of "$task")")"
     fence_reconcile_history "$wt" "$base" "$FENCE_PROFILE"
     cmd_check "$task" ${passthru[0]+"${passthru[@]}"}
     verdict="$(grep '^VERDICT:' "$review" 2>/dev/null | tail -1 || true)"
@@ -1644,19 +1769,24 @@ cmd_loop() {
 cmd_diff() {
   scan_fence_flag "$@"
   local task="${FLAG_ARGS[0]:?usage: aw diff <task-id> [--fence-profile <name>]}"
-  local wt base patch
+  local wt base rbase patch
   require_fence_flag "$task" diff
   wt="$(require_worktree "$task")"
-  base="$(base_of "$task")"
+  # Same order as `aw check`, for the same reason: the patch this writes carries
+  # the content of every path in it, so the tree AND the history are judged
+  # before a byte of it is written.
+  fence_reconcile "$wt" "$FENCE_PROFILE"
+  base="$(security_base "$(branch_of "$task")")"
   fence_reconcile_history "$wt" "$base" "$FENCE_PROFILE"
+  rbase="$(review_base "$task" "$base")"
   patch="$wt/.agents/reviews/$task.patch"
-  ( cd "$wt" && git diff "$base" HEAD > "$patch" )
+  ( cd "$wt" && git diff "$rbase" HEAD > "$patch" )
   ${EDITOR:-vim} -R -c 'set filetype=diff' "$patch"
 }
 
 cmd_land() {
   local task="" force="" mode="${LOOM_LAND:-merge}" a
-  local wt br plan title
+  local wt br base plan title
   scan_fence_flag "$@"
   for a in ${FLAG_ARGS[0]+"${FLAG_ARGS[@]}"}; do
     case "$a" in
@@ -1676,7 +1806,7 @@ cmd_land() {
   # these commits in your tree, --pr puts them on origin. Both legs go through
   # here, and --force does not skip it (it skips the gate, not the boundary).
   # What is on disk is not the question — what the commits carry is.
-  base="$(base_of "$task")"
+  base="$(security_base "$br")"
   fence_reconcile_history "$wt" "$base" "$FENCE_PROFILE"
   hand_reconcile_history "$ROOT" "$base" "$br"
   [ -n "$FENCE_PROFILE" ] && echo "aw: fence profile '$FENCE_PROFILE' — this diff may touch $FENCE_RELEASED"
@@ -1716,6 +1846,15 @@ cmd_rebase() { # rebase agent/<task> onto origin/main and re-point loombase
   # since as "unauthorized" changes and an auto-fix round may try to revert
   # them. This rebases and re-points the base at the REPLAYED base commit
   # (matched by patch-id), falling back to the merge-base with a warning.
+  #
+  # Only the REVIEW diff follows that re-point, and only when review_base's
+  # clamp accepts it. A replayed base commit sits AHEAD of
+  # merge-base($LOOM_BASE_REF, <br>), so the clamp will warn and show the
+  # review diff from the security base instead — the replayed plan/task commit
+  # is back in the diff. That is the price of not trusting branch config: the
+  # same move an agent makes to hide a commit is the move a rebase makes to
+  # hide the plan commit, and `aw` cannot tell them apart. Nothing about the
+  # FENCE check follows it either way; that has always been the security base.
   scan_fence_flag "$@"
   local task="${FLAG_ARGS[0]:?usage: aw rebase <task-id> [<upstream>] [--fence-profile <name>]}"
   local upstream="${FLAG_ARGS[1]:-origin/main}"
@@ -1726,7 +1865,7 @@ cmd_rebase() { # rebase agent/<task> onto origin/main and re-point loombase
   # A rebase rewrites these commits onto a new base and re-points the diff
   # base, which is exactly when a fenced path buried in the history would stop
   # being visible. Judge it before, not after.
-  fence_reconcile_history "$wt" "$(base_of "$task")" "$FENCE_PROFILE"
+  fence_reconcile_history "$wt" "$(security_base "$br")" "$FENCE_PROFILE"
   [ -z "$(git -C "$wt" status --porcelain)" ] || die "worktree $wt is dirty — commit or stash first"
   old_base="$(git config "branch.$br.loombase" 2>/dev/null)" || die "no loombase recorded for $br"
   old_pid="$(git show "$old_base" | git patch-id --stable | cut -d' ' -f1)"
