@@ -31,7 +31,7 @@
 #                                    every model that runs there must be one
 #                                    the profile allows. Its worktree lives
 #                                    under a separate root ($LOOM_WORKTREES
-#                                    with "-profiled" appended). The branch
+#                                    with "-profiled" appended). The operator
 #                                    record only checks your flag; it never
 #                                    replaces it, and a missing record is a
 #                                    refusal, not something aw infers from the
@@ -48,6 +48,19 @@
 #   LOOM_WORKTREES=/path           where worktrees live
 #   LOOM_LAND=merge|pr             land by merging here, or by pushing a branch
 #                                  for review (--pr / --merge win over this)
+#   LOOM_ENV=<file>                provider keys, sourced if present
+#                                  (default ~/.config/loom/env)
+#
+# Operator task state — outside every repo and outside the shared .git, because
+# everything under .git/ (config AND refs) is writable from any linked worktree:
+#
+#   ${XDG_CONFIG_HOME:-~/.config}/loom/repos/<sha256 of the repo's real path>/
+#       repo                       the repo path, so the directory is readable
+#       tasks/<task>               base=<commit> profile=<name> branch=<br>
+#                                  created=<iso>
+#
+# `aw new` writes it, `aw rebase` re-points its base, `aw drop` deletes it, and
+# every security check (and `aw ls`) reads it. Mode 0700/0600.
 #
 # Anthropic policy: subscription only, on purpose. The architect runs through
 # the `claude` CLI (your Claude Code login). There is no ANTHROPIC_API_KEY
@@ -79,20 +92,10 @@ if [ -f "$LOOM_ENV" ]; then set -a; . "$LOOM_ENV"; set +a; fi
 # Project-scoped model chains and keys, checked into or ignored by the project
 # as it prefers. Sourced second, so a project overrides the global file.
 #
-# One variable is exempt. $LOOM_BASE_REF names the ref the SECURITY BASE is
-# measured from (see security_base below), and .agents/loom.env is an in-repo
-# file an agent may edit — a loom.env that pointed it at the branch's own tip
-# would collapse every history check to an empty diff. It is snapshotted here
-# and restored afterwards, loudly.
-LOOM_BASE_REF_OPERATOR="${LOOM_BASE_REF:-}"
+# Nothing a security check reads comes from here. The base every history check
+# is measured from is the OPERATOR RECORD (see the state directory below), a
+# file outside every repo; this file only ever picks models and keys.
 if [ -f "$ROOT/.agents/loom.env" ]; then set -a; . "$ROOT/.agents/loom.env"; set +a; fi
-if [ "${LOOM_BASE_REF:-}" != "$LOOM_BASE_REF_OPERATOR" ]; then
-  echo "aw: WARNING: .agents/loom.env sets LOOM_BASE_REF='${LOOM_BASE_REF:-}' — ignored." >&2
-  echo "aw: WARNING: The base every history check is measured from is operator-side only." >&2
-  echo "aw: WARNING: Set it in your environment or $LOOM_ENV, never in the repo." >&2
-  LOOM_BASE_REF="$LOOM_BASE_REF_OPERATOR"
-fi
-unset LOOM_BASE_REF_OPERATOR
 for _k in ZHIPU_API_KEY ZAI_API_KEY DEEPSEEK_API_KEY MOONSHOT_API_KEY; do
   case "$(eval "echo \"\${$_k:-}\"")" in *PASTE-YOUR*) unset "$_k" ;; esac
 done
@@ -104,6 +107,84 @@ fi
 
 die()  { echo "aw: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# --------------------------------------------------- operator task state
+# One file per task, OUTSIDE every repository and outside the shared `.git`.
+#
+# That location is the whole point. A linked worktree shares `.git` with the
+# main checkout, so everything under it is writable by anything running in an
+# agent's worktree: `.git/config` (which is where `branch.<br>.loombase` and
+# `branch.<br>.fenceprofile` used to live) and the refs too —
+# `refs/remotes/origin/main`, `refs/heads/main`, `refs/heads/agent/*` are one
+# `git update-ref` away from whatever the agent wants them to say. None of it
+# can carry a security input. The operator's record can, because `aw new`
+# writes it and nothing in a worktree has a reason to touch it.
+#
+#   ${XDG_CONFIG_HOME:-$HOME/.config}/loom/repos/<key>/repo        <- the path
+#   ${XDG_CONFIG_HOME:-$HOME/.config}/loom/repos/<key>/tasks/<task>
+#
+# <key> is the sha256 of the MAIN checkout's real path (a linked worktree
+# resolves to the same key, which is what lets the pre-commit guard read the
+# record), and the `repo` file records that path so a human can tell the
+# directories apart. Dir 0700, files 0600.
+#
+# Be exact about what this is worth: it is OPERATOR INTEGRITY, not
+# tamper-proofing. An unsandboxed agent can write $HOME — the capability
+# KNOWN-GAPS 3 already concedes — and this file is in it. What it removes is
+# the whole class of "a worktree rewrites the input to its own security check
+# with one git command", which is a different and much cheaper attack.
+# The MAIN checkout, never this worktree: in a linked worktree $ROOT is the
+# worktree, and the record belongs to the repository. --git-common-dir answers
+# `.git` in the main checkout (we are cd'd to $ROOT) and the absolute path of
+# the main .git in a linked one, so both resolve to the same directory — which
+# is what lets the pre-commit guard, running inside an agent worktree, read the
+# same record `aw new` wrote.
+STATE_COMMON="$(git rev-parse --git-common-dir 2>/dev/null)" \
+  || die "cannot resolve this repository's git directory"
+[ -n "$STATE_COMMON" ] || die "cannot resolve this repository's git directory"
+STATE_MAIN_ROOT="$(cd "$(dirname "$STATE_COMMON")" 2>/dev/null && pwd -P)" \
+  || die "cannot resolve this repository's main checkout — refusing to guess where the operator record lives"
+STATE_KEY="$(printf '%s' "$STATE_MAIN_ROOT" | python3 -c 'import hashlib,sys; sys.stdout.write(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')" \
+  || die "cannot compute the operator state key for $STATE_MAIN_ROOT"
+[ -n "$STATE_KEY" ] || die "cannot compute the operator state key for $STATE_MAIN_ROOT"
+STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/loom/repos/$STATE_KEY"
+
+state_file() { # state_file <task>  -> the path of that task's record
+  case "$1" in
+    ""|.|..|*/*) die "'$1' is not a usable task id (no '/', '.' or '..')" ;;
+  esac
+  printf '%s\n' "$STATE_DIR/tasks/$1"
+}
+
+# One field of a task's record, or "". A missing record is "" here on purpose:
+# the callers that must refuse it say so themselves, with their own message.
+state_read() { # state_read <task> <key>
+  local f; f="$(state_file "$1")"
+  [ -f "$f" ] || return 0
+  sed -n "s/^$2=//p" "$f" | head -1
+}
+
+# The only writer. `aw new` calls it with a fresh timestamp; `aw rebase` calls
+# it with the recorded one, because a re-point is not a new task.
+state_put() { # state_put <task> <base> <profile> <branch> <created>
+  local task="$1" f tmp
+  f="$(state_file "$task")"
+  ( umask 077; mkdir -p "$STATE_DIR/tasks" ) \
+    || die "cannot create the operator state directory $STATE_DIR/tasks"
+  chmod 700 "$STATE_DIR" "$STATE_DIR/tasks" 2>/dev/null || true
+  ( umask 077; printf '%s\n' "$STATE_MAIN_ROOT" > "$STATE_DIR/repo" ) || true
+  tmp="$f.tmp.$$"
+  ( umask 077
+    { printf 'base=%s\n'    "$2"
+      printf 'profile=%s\n' "$3"
+      printf 'branch=%s\n'  "$4"
+      printf 'created=%s\n' "$5"
+    } > "$tmp" ) || die "cannot write the operator record $f"
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$f" || die "cannot write the operator record $f"
+}
+
+state_rm() { rm -f "$(state_file "$1")"; }
 
 # ------------------------------------------------------------ worktree roots
 # Two roots, and `aw` must be able to say where each one physically IS before
@@ -227,22 +308,6 @@ root_of_wt() { # root_of_wt <worktree-path>
     *) die "internal error: $1 is under neither worktree root" ;;
   esac
 }
-
-# ------------------------------------------------------------ the base ref
-# ONE name, resolved once, for the ref every security base is measured from.
-# It is operator-side by construction: the environment, or the key file outside
-# every repo. .agents/loom.env is explicitly not allowed to set it (see the
-# snapshot above), because that file lives in the tree an agent writes.
-#
-# Default: origin/main when the remote-tracking ref exists, else main. A repo
-# whose trunk is called something else sets LOOM_BASE_REF itself.
-if [ -z "${LOOM_BASE_REF:-}" ]; then
-  if git rev-parse --verify --quiet "origin/main^{commit}" >/dev/null 2>&1; then
-    LOOM_BASE_REF="origin/main"
-  else
-    LOOM_BASE_REF="main"
-  fi
-fi
 
 # Portable in-place sed (BSD sed on macOS needs -i '').
 sedi() {
@@ -936,11 +1001,10 @@ zone_of() { # zone_of <repo-relative-path>   (fails loudly: callers gate commits
 #
 #   1. The opt-in is a FRESH OPERATOR ACT on every command. `--fence-profile
 #      <name>` must be passed to `aw new`, `run`, `check`, `loop`, `rebase` and
-#      `land` alike. branch.agent/<task>.fenceprofile is kept, but ONLY as a
-#      consistency record — it is agent-writable state (anything running in the
-#      worktree can `git config` it), so it may refuse a command, never
-#      authorise one. A `Fence-profile:` line in the task file is documentation
-#      of intent; the flag is the consent.
+#      `land` alike. The operator record (the state file outside every repo)
+#      keeps the name `aw new` was given, but ONLY as a consistency record: it
+#      may refuse a command, never authorise one. A `Fence-profile:` line in
+#      the task file is documentation of intent; the flag is the consent.
 #   2. Enforcement is a CONSISTENCY CHECK against what is on disk and in the
 #      branch's commits — never a second signature. See fence_reconcile and
 #      fence_reconcile_history below: a tree (or a history) holding released
@@ -1009,7 +1073,7 @@ is_released() { # is_released <path>
 # second signature: an agent inside the worktree can `git sparse-checkout
 # disable`, or simply write the files, so a tree that "looks like" a profile
 # proves nothing about who asked for it. It can therefore refuse a command and
-# never authorise one — exactly like the branch record. The operator's
+# never authorise one — exactly like the operator record. The operator's
 # --fence-profile flag is the only consent in this system.
 
 # Every model that could run against a profiled worktree must belong to a
@@ -1120,10 +1184,9 @@ fence_enforce() { # fence_enforce <worktree>
 
 # ---------------------------------------------------------------- reconcile
 # THE gate between a worktree and a model. Driven by what is ON DISK — never by
-# branch.<br>.fenceprofile, which anything running in the worktree can write,
-# and not by the index either: `git show HEAD:core/lib.rs > core/copy.rs`
-# leaves the index untouched, so "present" is answered from the filesystem as
-# well as from `git ls-files` (zones_py's present_on_disk).
+# a recorded profile, and not by the index either: `git show HEAD:core/lib.rs >
+# core/copy.rs` leaves the index untouched, so "present" is answered from the
+# filesystem as well as from `git ls-files` (zones_py's present_on_disk).
 #
 #   present  = fenced paths (the FULL [fence]) actually in the worktree
 #   asserted = the profile the OPERATOR named on this command line ("" = none)
@@ -1140,14 +1203,14 @@ fence_enforce() { # fence_enforce <worktree>
 #      introduced after `aw new` — that is how a forged branch record would
 #      otherwise cash out.
 #   4. present, nothing asserted: DIE. Unconditionally.
-#      This rule used to have an arm: if the branch record named a profile
-#      that would have released exactly these paths, `aw` re-fenced to the
-#      full fence, printed three warnings and ran. That arm read the
-#      agent-writable record and let it change what the command did — one
-#      `git config` plus one `git sparse-checkout disable` and the refusal
-#      became a warning. It is gone, so the record can now only ever refuse.
-#      An unprofiled tree holding fenced paths is a dead stop; `aw drop` is
-#      the fix.
+#      This rule used to have an arm: if the record named a profile that would
+#      have released exactly these paths, `aw` re-fenced to the full fence,
+#      printed three warnings and ran. Back then the record was branch config,
+#      so that arm let a `git config` in the worktree turn a refusal into a
+#      warning. The record has moved out of the repo since, and the arm is
+#      still gone: a record only ever refuses, whoever can write it. An
+#      unprofiled tree holding fenced paths is a dead stop; `aw drop` is the
+#      fix.
 #   5. nothing present, nothing asserted: the ordinary path — apply and verify
 #      the full fence, as `aw run` has always done. (Not a rule about a
 #      release; it is the ordinary case, and it is numbered so that the count
@@ -1183,7 +1246,7 @@ This worktree was built under a different fence. Start clean:
     if [ -z "$present" ] && [ -n "$tracked" ]; then
       die "worktree $wt holds none of the paths fence profile '$asserted' releases.
 It was not created under that profile, and a profile cannot be introduced after
-'aw new' — the branch record is not evidence, the tree is. Start clean:
+'aw new'. Start clean:
   aw drop <task-id> && aw new <task-id> --fence-profile $asserted"
     fi
     fence_apply "$wt"
@@ -1196,9 +1259,9 @@ It was not created under that profile, and a profile cannot be introduced after
   # the flag does not), so reaching here means either a fence that was widened
   # under an existing worktree — which dies, `aw drop` is the fix — or a caller
   # that skipped require_fence_flag, which is what run_role's second call is
-  # here to catch. Either way it is a dead stop: the branch record is not
-  # consulted, because a record that could turn this refusal into a warning
-  # would be a record that authorises, and it is agent-writable.
+  # here to catch. Either way it is a dead stop: the record is not consulted,
+  # because a record that could turn this refusal into a warning would be a
+  # record that authorises.
   if [ -n "$present" ]; then
     die "fenced paths are present in $wt and no fence profile is \
 asserted for this command:
@@ -1220,10 +1283,15 @@ created under), or start clean:  aw drop <task-id>"
 # to the operator: aw check (before the patch is written), aw loop (each
 # round), aw diff, aw land (before merge and before push) and aw rebase.
 #
-# Base is the SECURITY base (see security_base): merge-base($LOOM_BASE_REF,
-# <branch>), computed operator-side in $ROOT. Never the loombase — that is
-# branch config, which anything running in the worktree can rewrite, and a
-# base an agent chose is a fence check an agent chose.
+# BOTH ENDS of that range come from outside the worktree, and neither is the
+# worktree's HEAD:
+#   * the base is the OPERATOR RECORD (security_base), a file outside the repo;
+#   * the endpoint is refs/heads/agent/<task>, read in $ROOT — the same ref
+#     `aw land` merges and `aw land --pr` pushes. The worktree's HEAD is not
+#     that: `git checkout --detach HEAD~1` inside the worktree leaves the
+#     fenced commit on the branch while every check measured from HEAD sees a
+#     clean history. (A worktree in that state is refused outright as well —
+#     require_wt_on_branch — because it is not a state `aw` produces.)
 #
 # Every way of not knowing is a DEATH, never an empty answer. An unresolvable
 # base used to `return 0` with no paths, which reads downstream as "this
@@ -1265,13 +1333,12 @@ an empty diff."
 # Fenced paths in the branch's commits that the asserted profile does not
 # release. With nothing asserted, "released" is empty: any fenced path in the
 # history is a violation.
-fence_reconcile_history() { # fence_reconcile_history <wt> <base> <asserted>
-  local wt="$1" base="$2" asserted="${3:-}" bad
-  [ -d "$wt" ] || return 0
+fence_reconcile_history() { # fence_reconcile_history <task> <base> <asserted>
+  local task="$1" base="$2" asserted="${3:-}" bad
   if [ -n "$asserted" ] && [ "$FENCE_PROFILE" != "$asserted" ]; then
     fence_profile_activate "$asserted"
   fi
-  history_paths "$wt" "$base" HEAD
+  history_paths "$ROOT" "$base" "$(branch_ref "$task")"
   [ "${#HIST_PATHS[@]}" -gt 0 ] || return 0
   bad="$(zones_py history-fence "${HIST_PATHS[@]}")" \
     || die "cannot tell which paths this branch's commits touch — refusing to guess"
@@ -1334,18 +1401,19 @@ cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
   #
   # This runs as a pre-commit hook, INSIDE the agent's own worktree, in the
   # agent's own context. It is a seatbelt, not a lock: `--no-verify` skips it
-  # outright. So it may read the branch record (agent-writable state) for the
-  # released set — and it checks that record against the tree first. Be plain
-  # about what that check is worth: it is a CONSISTENCY CHECK, and an agent
-  # that wants to satisfy it can. Forging the record costs one `git config`;
-  # making the tree agree costs one `git sparse-checkout disable`. The check
-  # catches a record that was forged carelessly, a stale worktree and an
-  # honest mistake — not an agent that is trying. What actually decides
-  # whether released content ever reaches a provider is the operator's
-  # --fence-profile flag on `aw new`, checked again on every later command,
-  # and `aw land`'s check of the commits themselves.
+  # outright. It reads the OPERATOR RECORD for the released set — the state
+  # file outside the repo, found through the MAIN checkout's path (a linked
+  # worktree resolves to the same state key), which the hook can reach because
+  # it runs as the same OS user. It still checks that record against the tree
+  # first. Be plain about what that check is worth: it is a CONSISTENCY CHECK,
+  # and an agent that wants to satisfy it can — making the tree agree costs one
+  # `git sparse-checkout disable`, and an unsandboxed agent can write $HOME
+  # (KNOWN-GAPS 3). It catches a stale worktree and an honest mistake. What
+  # actually decides whether released content ever reaches a provider is the
+  # operator's --fence-profile flag on `aw new`, checked again on every later
+  # command, and `aw land`'s check of the commits themselves.
   local prof present p tracked
-  prof="$(git config "branch.$branch.fenceprofile" 2>/dev/null || true)"
+  prof="$(state_read "${branch#agent/}" profile 2>/dev/null || true)"
   if [ -n "$prof" ]; then
     fence_profile_activate "$prof"     # dies on an unknown or unreadable profile
     present="$(zones_py fence-present-full "$ROOT")" || {
@@ -1354,7 +1422,7 @@ cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
     while IFS= read -r p; do
       [ -n "$p" ] || continue
       is_released "$p" && continue
-      echo "pre-commit: BLOCKED — this branch records fence profile '$prof', but the" >&2
+      echo "pre-commit: BLOCKED — this task records fence profile '$prof', but the" >&2
       echo "tree here holds fenced path '$p', which that profile does not release." >&2
       echo "The record does not match the tree; refusing to widen the guard on it." >&2
       echo "(If this is your own checkout with an agent branch checked out, it holds" >&2
@@ -1365,7 +1433,7 @@ cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
       echo "pre-commit: cannot tell which released paths this tree tracks — refusing to guess" >&2
       exit 1; }
     if [ -z "$present" ] && [ -n "$tracked" ]; then
-      echo "pre-commit: BLOCKED — this branch records fence profile '$prof', but none of" >&2
+      echo "pre-commit: BLOCKED — this task records fence profile '$prof', but none of" >&2
       echo "the paths that profile releases are in this worktree. The record was not" >&2
       echo "written by the 'aw new' that built this tree; refusing to honour it." >&2
       exit 1
@@ -1429,92 +1497,92 @@ and it cannot be dropped from a task either. Start clean:
   aw drop $task && aw new $task${FLAG_PROFILE:+ --fence-profile $FLAG_PROFILE}"
 }
 
-# The worktree for a task that must already have one. Prints its path.
+# The worktree for a task that must already have one, checked out on that
+# task's own branch. Prints its path.
 require_worktree() { # require_worktree <task>
   local task="$1" wt
   wt="$(wt_path "$task")"
   [ -d "$wt" ] || { refuse_cross_root "$task"; die "no worktree for $task"; }
+  require_wt_on_branch "$task" "$wt"
   echo "$wt"
 }
 
-branch_of() { echo "agent/$1"; }
+branch_of()  { echo "agent/$1"; }
+branch_ref() { echo "refs/heads/agent/$1"; }
 
-# --- two bases, and only one of them is trusted ----------------------------
-# `branch.agent/<task>.loombase` lives in the SHARED .git/config, so anything
-# running inside the worktree can rewrite it with one `git config`. Pointed at
-# the branch's own tip it makes `git diff <base> HEAD` empty; pointed at a
-# sha that does not resolve it used to make the history checks answer "no
-# paths" and pass. Either way an agent chose what the fence check looked at.
+# --- ONE base, and it is the operator's ------------------------------------
+# There used to be two: a "security base" derived from refs, and a "review
+# base" read from `branch.agent/<task>.loombase`. Both are gone, and for the
+# same reason — a linked worktree shares `.git`, so branch config AND refs are
+# writable from inside the agent's tree:
 #
-# So there are two bases now:
+#   * one `git config branch.<br>.loombase <tip>` made `git diff <base> HEAD`
+#     empty, and every history check answered "this branch touches nothing";
+#   * one `git update-ref refs/remotes/origin/main <tip>` (or refs/heads/main)
+#     did exactly the same to a base computed as merge-base(<trunk>, <branch>),
+#     which is why merge-base is no longer a security input either. That form
+#     also FALSE-REFUSED an honest task: an operator with unpushed commits on
+#     main had them counted as the branch's own.
 #
-#   security_base <br>   computed HERE, in $ROOT, from refs the operator
-#                        controls: merge-base($LOOM_BASE_REF, <br>). This is
-#                        the base every fence/hand history check uses. Nothing
-#                        an agent can write takes part in it.
-#   review_base <task>   the loombase, kept only because it is the nicer diff
-#                        to READ (it hides the plan/task commit the branch
-#                        rides on). It is clamped: it must be an ancestor of
-#                        the branch AND an ancestor of (or equal to) the
-#                        security base. Anything else and the security base is
-#                        used for the review diff too, loudly — an agent must
-#                        not be able to shrink what the reviewer sees.
-loombase_of() { # loombase_of <task>  -> the recorded loombase, or "" (never fails)
-  git config "branch.$(branch_of "$1").loombase" 2>/dev/null || true
+# So the base is the OPERATOR RECORD: the commit `$ROOT` was checked out at
+# when `aw new` created the task, written by `aw new`, re-pointed by `aw rebase`
+# (an operator command), and read from a file outside every repo. It is the
+# base of BOTH the security checks and the review patch — there is nothing left
+# to clamp, because there is no second, cheaper base to clamp against.
+security_base() { # security_base <task>  -> the recorded base commit, or dies
+  local task="$1" base br ref
+  br="$(branch_of "$task")"; ref="$(branch_ref "$task")"
+  base="$(state_read "$task" base)"
+  [ -n "$base" ] || die "no operator record for task $task — created before this version, or
+removed. There is no base to judge this branch's commits against, and aw will
+not derive one from anything a worktree can write. Start clean:
+  aw drop $task && aw new $task"
+  base="$(git rev-parse --verify --quiet "$base^{commit}" 2>/dev/null)" \
+    || die "the base recorded for task $task does not resolve in $ROOT.
+That commit is what every fence and hand history check is measured from, so
+without it aw cannot tell what this branch's commits touch — and will not guess.
+If the history was rewritten under it:  aw drop $task && aw new $task"
+  git rev-parse --verify --quiet "$ref^{commit}" >/dev/null 2>&1 \
+    || die "branch '$br' does not resolve in $ROOT — refusing to guess what it touches"
+  git merge-base --is-ancestor "$base" "$ref" 2>/dev/null \
+    || die "the base recorded for task $task ($(git rev-parse --short "$base")) is not an
+ancestor of $br. This branch is not the one that record was written for — it was
+rebased or reset outside 'aw rebase', or the record belongs to another task.
+Inspect it, do not land it:  git log --oneline $(git rev-parse --short "$base")..$br"
+  # Equal, or behind: there is nothing between the branch point and the branch.
+  # An empty review is not something to hand a reviewer, and an empty history
+  # check is not evidence of anything.
+  ! git merge-base --is-ancestor "$ref" "$base" 2>/dev/null \
+    || die "nothing to review/land — the branch has no commits past its branch point
+($(git rev-parse --short "$base")). Run the implementer first:  aw run $task"
+  printf '%s\n' "$base"
 }
 
-security_base() { # security_base <branch>  -> merge-base commit, or dies
-  local br="$1" mb
-  git rev-parse --verify --quiet "$LOOM_BASE_REF^{commit}" >/dev/null 2>&1 \
-    || die "the base ref '$LOOM_BASE_REF' does not resolve in $ROOT.
-Every fence and hand history check is measured from merge-base($LOOM_BASE_REF, <branch>),
-so without it aw cannot tell what a branch's commits touch — and will not guess.
-Fetch it, or name the trunk yourself:  LOOM_BASE_REF=<ref> aw ..."
-  git rev-parse --verify --quiet "$br^{commit}" >/dev/null 2>&1 \
-    || die "branch '$br' does not resolve in $ROOT — refusing to guess its base"
-  mb="$(git merge-base "$LOOM_BASE_REF" "$br" 2>/dev/null)" || mb=""
-  [ -n "$mb" ] || die "'$br' and '$LOOM_BASE_REF' have no common ancestor, so there is no
-base to judge this branch's commits against. That is not a branch this repo's
-trunk produced — inspect it, do not land it."
-  printf '%s\n' "$mb"
-}
-
-review_base() { # review_base <task> <security-base>  -> commit to diff from
-  local task="$1" sec="$2" br lb
+# A worktree `aw` produced is checked out on its own branch. A detached or
+# switched one is not, and it is not a state to reconcile: what a command reads
+# from that tree and what the branch's commits say have come apart, which is
+# the whole trick behind `git checkout --detach HEAD~1` after a fenced commit.
+require_wt_on_branch() { # require_wt_on_branch <task> <worktree>
+  local task="$1" wt="$2" br head
   br="$(branch_of "$task")"
-  lb="$(loombase_of "$task")"
-  [ -n "$lb" ] || { printf '%s\n' "$sec"; return 0; }
-  if ! lb="$(git rev-parse --verify --quiet "$lb^{commit}" 2>/dev/null)"; then
-    echo "aw: WARNING: branch.$br.loombase does not resolve — using the security base" >&2
-    echo "aw: WARNING: $(git rev-parse --short "$sec") for the review diff instead." >&2
-    printf '%s\n' "$sec"; return 0
-  fi
-  if ! git merge-base --is-ancestor "$lb" "$br" 2>/dev/null; then
-    echo "aw: WARNING: branch.$br.loombase ($(git rev-parse --short "$lb")) is not an" >&2
-    echo "aw: WARNING: ancestor of $br — using the security base for the review diff." >&2
-    printf '%s\n' "$sec"; return 0
-  fi
-  if ! git merge-base --is-ancestor "$lb" "$sec" 2>/dev/null; then
-    # Forward of the merge-base: the review diff would start AFTER commits this
-    # branch added. That is what an agent does to hide one, and also what
-    # `aw rebase` does legitimately when it re-points at a replayed base — so
-    # it is a loud fallback, not a refusal.
-    echo "aw: WARNING: branch.$br.loombase ($(git rev-parse --short "$lb")) is ahead of the" >&2
-    echo "aw: WARNING: security base $(git rev-parse --short "$sec") — it would hide commits from" >&2
-    echo "aw: WARNING: the review diff. Using the security base instead. (After 'aw rebase'" >&2
-    echo "aw: WARNING: this is expected: the replayed plan/task commit is in the diff again.)" >&2
-    printf '%s\n' "$sec"; return 0
-  fi
-  printf '%s\n' "$lb"
+  head="$(git -C "$wt" symbolic-ref -q HEAD 2>/dev/null || true)"
+  [ "$head" = "refs/heads/$br" ] || die "the worktree $wt is not on refs/heads/$br
+(HEAD there is '${head:-detached}'). aw never leaves a worktree like that, and it
+will not judge one: the tree and the branch's commits no longer describe the
+same work. Put it back:
+  git -C $wt checkout $br
+or start clean:  aw drop $task"
 }
 
 # --- where a task's fence profile comes from -------------------------------
 # From the operator, on the command line, every single time. `--fence-profile
 # <name>` is required by `aw new`, `run`, `check`, `loop`, `rebase` and `land`
-# alike. branch.agent/<task>.fenceprofile is written at `aw new` and is a
-# CONSISTENCY RECORD, not an authorisation: it can refuse a command (the flag
-# is missing, or names a different profile) but it can never supply one,
-# because anything running inside the worktree can write it.
+# alike. The `profile` field of the operator record is written at `aw new` and
+# is a CONSISTENCY RECORD, not an authorisation: it can refuse a command (the
+# flag is missing, or names a different profile) but it can never supply one.
+# `branch.agent/<task>.fenceprofile` is neither read nor written any more — it
+# lived in the shared .git/config, where anything running in the worktree could
+# write it, so it was a claim with the shape of a record.
 #
 # A `Fence-profile: <name>` line in the task file is the third form, and the
 # weakest: it documents the intent of a task, and `aw new` honours it only when
@@ -1562,8 +1630,6 @@ task_profile_nearmiss() { # task_profile_nearmiss <task>
     | grep -v -i -E '^[[:space:]]*fence-profile:' || true
 }
 
-branch_profile() { git config "branch.$(branch_of "$1").fenceprofile" 2>/dev/null || true; }
-
 # --- the flag ---------------------------------------------------------------
 # Pulled out of any command's argv, so every command spells it the same way and
 # an empty value is refused in one place.
@@ -1596,14 +1662,10 @@ require_fence_flag() { # require_fence_flag <task> <command-name>
   local task="$1" cmd="$2" rec="" flag="$FLAG_PROFILE" br
   br="$(branch_of "$task")"
   if git show-ref --verify --quiet "refs/heads/$br"; then
-    rec="$(branch_profile "$task")"
+    rec="$(state_read "$task" profile)"
     if [ -n "$rec" ] && [ -z "$flag" ]; then
-      die "the branch record says task $task was created under fence profile '$rec'.
-Records are agent-writable: anything running inside that worktree can write one
-with a single 'git config', so this is a claim, not history.
-Pass --fence-profile $rec ONLY if YOU created the task under it:
-  aw $cmd $task --fence-profile $rec
-If you did not, the record was forged — throw the task away:  aw drop $task"
+      die "this task was created under fence profile '$rec'; pass --fence-profile $rec:
+  aw $cmd $task --fence-profile $rec"
     fi
     if [ -n "$rec" ] && [ "$rec" != "$flag" ]; then
       die "--fence-profile '$flag' contradicts the record for $task ('$rec').
@@ -1616,17 +1678,15 @@ Use '$rec', or start clean:  aw drop $task && aw new $task --fence-profile $flag
       # A worktree is a directory an agent can write: `git sparse-checkout
       # disable` materialises the released paths, and so does `git checkout
       # <ref> -- core/`. The tree can only ever refuse; it can never vouch.
-      # So: no record, no run — and if the record really was yours and really
-      # was lost, restoring it is an OPERATOR act, with the same weight as the
-      # flag, not something `aw` infers from a directory listing.
-      die "task $task has no fence-profile record: branch.$br.fenceprofile is missing.
+      # So: no record, no run. Re-creating the task is the fix, and it is an
+      # OPERATOR act with the same weight as the flag — `aw` does not infer a
+      # profile from a directory listing, and it does not write a record for
+      # a task it did not create.
+      die "task $task has no fence-profile record: the operator record for it names no
+profile, or there is no record at all.
 A profile cannot be introduced after 'aw new', and a worktree that happens to
 hold the released paths is not evidence — anything running there can create
-them.
-If YOU created this task under fence profile '$flag' and the record was
-removed, restore it yourself and re-run:
-  git config branch.$br.fenceprofile $flag
-Otherwise, start clean:
+them. Start clean:
   aw drop $task && aw new $task --fence-profile $flag"
     fi
   fi
@@ -1637,30 +1697,41 @@ Otherwise, start clean:
   return 0
 }
 
-# A worktree that exists without its branch config is a worktree nobody can
-# reason about later — released paths on disk with no record of why. `aw new`
-# therefore records first and checks out second, and unwinds the whole thing if
-# anything in between fails or the operator interrupts it.
+# A worktree that exists without its operator record is a worktree nobody can
+# reason about later — released paths on disk with no record of why, and no
+# base to measure its commits from. `aw new` therefore records while the tree
+# is still empty, and unwinds the whole thing if anything fails or the operator
+# interrupts it.
 #
-# $NEW_BR is set ONLY once `git worktree add -b` has actually created the
-# branch. It used to be set before the add, so an add that failed because
-# agent/<task> already existed ran this trap and deleted the PRE-EXISTING
-# branch — the work of an `aw drop --keep-branch`, gone, with the deletion
-# silenced by >/dev/null. `aw new` now refuses an existing branch up front, and
-# what this trap deletes it says out loud.
-NEW_WT=""; NEW_BR=""
+# What this trap deletes, it says out loud, and it deletes a BRANCH only when
+# that branch exists NOW and `aw new` observed it absent before it started.
+# Both halves matter:
+#   * `git worktree add -b` creates the branch and THEN fails on the path (a
+#     symlink or a file at $wt is enough), so a run that never reached the
+#     "branch created" line could still leave an orphan behind — which then
+#     made the task id permanently unusable;
+#   * setting $NEW_BR unconditionally before the add is what once deleted a
+#     PRE-EXISTING branch (the state `aw drop --keep-branch` leaves on
+#     purpose) when the add failed because that branch was already there.
+# `aw new` refuses an existing branch up front, so anything this trap sees is
+# a branch this command made.
+NEW_WT=""; NEW_BR=""; NEW_STATE=""
 new_abort() {
-  [ -n "$NEW_WT$NEW_BR" ] || return 0
+  [ -n "$NEW_WT$NEW_BR$NEW_STATE" ] || return 0
   [ -n "$NEW_WT" ] && {
     echo "aw: aborting — removing the half-built worktree $NEW_WT" >&2
     git worktree remove --force "$NEW_WT" >/dev/null 2>&1 || true
     git worktree prune >/dev/null 2>&1 || true
   }
-  if [ -n "$NEW_BR" ]; then
+  if [ -n "$NEW_BR" ] && git show-ref --verify --quiet "refs/heads/$NEW_BR"; then
     echo "aw: aborting — deleting the branch this command created: $NEW_BR" >&2
     git branch -D "$NEW_BR" >&2 || true
   fi
-  NEW_WT=""; NEW_BR=""
+  if [ -n "$NEW_STATE" ]; then
+    echo "aw: aborting — removing the operator record this command wrote: $NEW_STATE" >&2
+    state_rm "$NEW_STATE" || true
+  fi
+  NEW_WT=""; NEW_BR=""; NEW_STATE=""
 }
 
 cmd_new() {
@@ -1686,8 +1757,9 @@ cmd_new() {
   # code set $NEW_BR before the add, so the EXIT trap deleted that branch —
   # and its commits — when the add failed. Checked before anything is created
   # or any trap is armed.
-  git show-ref --verify --quiet "refs/heads/$br" && die "branch $br already exists — \
-aw drop $task first.
+  local br_existed=""
+  if git show-ref --verify --quiet "refs/heads/$br"; then br_existed=yes; fi
+  [ -z "$br_existed" ] || die "branch $br already exists — aw drop $task first.
 (If you used 'aw drop $task --keep-branch', that branch is holding work: land it
 or delete it deliberately with 'git branch -D $br' before reusing the task id.)"
   [ -f "$AGENTS_DIR/tasks/$task.md" ] || die "no task file: .agents/tasks/$task.md"
@@ -1723,18 +1795,24 @@ fenced paths into this worktree. Confirm it on the command line:
   # The root was verified at startup; verify THIS path's parent again, here,
   # immediately before anything is created under it.
   assert_wt_parent "$wt" "$wtroot"
+  # The branch point, resolved ONCE and used for both the checkout and the
+  # record, so that "the commit this branch was cut from" is the same fact in
+  # both places rather than two lookups that could disagree.
+  local newbase; newbase="$(git rev-parse HEAD)" \
+    || die "cannot resolve HEAD in $ROOT — there is no branch point to record"
   NEW_WT="$wt"
+  # $NEW_BR before the add, on purpose: the add CREATES the branch and can then
+  # fail on the path, and the check above observed that this branch did not
+  # exist. new_abort deletes it only if it exists when the abort runs.
+  NEW_BR="$br"
   trap 'new_abort' EXIT
   trap 'new_abort; exit 130' INT TERM
-  # --no-checkout first: the branch config is written while the tree is still
+  # --no-checkout first: the operator record is written while the tree is still
   # empty, so an interrupt can never leave released content without a record.
-  git worktree add --no-checkout -b "$br" "$wt" HEAD >&2
+  git worktree add --no-checkout -b "$br" "$wt" "$newbase" >&2
   assert_wt_under "$wt" "$wtroot"
-  # Only NOW does this command own the branch, and only now may the trap delete
-  # it. Anything above this line failed without creating a branch.
-  NEW_BR="$br"
-  git config "branch.$br.loombase" "$(git rev-parse HEAD)"
-  [ -n "$prof" ] && git config "branch.$br.fenceprofile" "$prof"
+  NEW_STATE="$task"
+  state_put "$task" "$newbase" "$prof" "$br" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   if has_fence; then
     fence_apply "$wt"
     git -C "$wt" checkout >&2
@@ -1742,7 +1820,7 @@ fenced paths into this worktree. Confirm it on the command line:
   else
     git -C "$wt" checkout >&2
   fi
-  NEW_WT=""; NEW_BR=""
+  NEW_WT=""; NEW_BR=""; NEW_STATE=""
   trap - EXIT INT TERM
   echo "$wt"
 }
@@ -1761,6 +1839,7 @@ cmd_run() {
     [ -n "$FLAG_PROFILE" ] && newargs=(--fence-profile "$FLAG_PROFILE")
     wt="$(cmd_new "$task" ${newargs[0]+"${newargs[@]}"})"
   fi
+  require_wt_on_branch "$task" "$wt"
   # Re-apply and verify, and refuse outright if what is on disk and what the
   # operator asserted do not line up. The tree cannot authorise anything; it
   # can only contradict the flag, and a contradiction is a dead stop.
@@ -1801,7 +1880,7 @@ $(tail -40 "$wt/.agents/reviews/$task-gate.log" 2>/dev/null)"
 cmd_check() {
   scan_fence_flag "$@"
   local task="${FLAG_ARGS[0]:?usage: aw check <task-id> [--fence-profile <name>]}"
-  local wt base rbase review log pnote=""
+  local wt base review log pnote=""
   require_fence_flag "$task" check
   wt="$(require_worktree "$task")"
   profile_provider_guard reviewer         # no-op without a profile
@@ -1810,12 +1889,13 @@ cmd_check() {
   # here, not one line later — and so must a HISTORY the operator has not
   # vouched for, which a re-fenced worktree no longer shows.
   fence_reconcile "$wt" "$FENCE_PROFILE"
-  base="$(security_base "$(branch_of "$task")")"
-  fence_reconcile_history "$wt" "$base" "$FENCE_PROFILE"
-  # The history is judged from the security base; the patch is written from the
-  # (clamped) loombase, which is only ever the nicer diff to read.
-  rbase="$(review_base "$task" "$base")"
-  ( cd "$wt" && git diff "$rbase" HEAD > ".agents/reviews/$task.patch" )
+  base="$(security_base "$task")"
+  fence_reconcile_history "$task" "$base" "$FENCE_PROFILE"
+  # One base, one endpoint, and neither is read from the worktree: the patch
+  # handed to the reviewer is exactly the range the history check just cleared.
+  mkdir -p "$wt/.agents/reviews"
+  git -C "$ROOT" diff "$base" "$(branch_ref "$task")" > "$wt/.agents/reviews/$task.patch" \
+    || die "cannot write the review patch for $task"
   review="$wt/.agents/reviews/$task-review.md"
   log="$(mktemp "${TMPDIR:-/tmp}/aw-review.XXXXXX")"
   # Without this the scope check reads a released path as an "unauthorized
@@ -1859,9 +1939,10 @@ cmd_loop() {
   profile_provider_guard implementer reviewer
   refuse_cross_root "$task"
   [ -d "$wt" ] || cmd_new "$task" ${passthru[0]+"${passthru[@]}"} > /dev/null
+  require_wt_on_branch "$task" "$wt"
   fence_reconcile "$wt" "$FENCE_PROFILE"
-  base="$(security_base "$(branch_of "$task")")"
-  fence_reconcile_history "$wt" "$base" "$FENCE_PROFILE"
+  base="$(security_base "$task")"
+  fence_reconcile_history "$task" "$base" "$FENCE_PROFILE"
 
   implement() { # one implementer pass, with cmd_run's exit codes named
     local rc=0
@@ -1880,10 +1961,10 @@ cmd_loop() {
     echo "aw: [loop] review round $i/$rounds"
     # Each round: the implementer has just committed, so re-judge the history
     # before it is turned into a patch and handed to the reviewer. The base is
-    # re-derived, not reused: the branch tip moved, and the security base is a
-    # merge-base against it.
-    base="$(security_base "$(branch_of "$task")")"
-    fence_reconcile_history "$wt" "$base" "$FENCE_PROFILE"
+    # re-read rather than reused, so that a task re-pointed by `aw rebase` in
+    # between is measured from the base it actually has now.
+    base="$(security_base "$task")"
+    fence_reconcile_history "$task" "$base" "$FENCE_PROFILE"
     cmd_check "$task" ${passthru[0]+"${passthru[@]}"}
     verdict="$(grep '^VERDICT:' "$review" 2>/dev/null | tail -1 || true)"
     # No verdict line at all means a truncated or derailed review, not a
@@ -1918,18 +1999,19 @@ cmd_loop() {
 cmd_diff() {
   scan_fence_flag "$@"
   local task="${FLAG_ARGS[0]:?usage: aw diff <task-id> [--fence-profile <name>]}"
-  local wt base rbase patch
+  local wt base patch
   require_fence_flag "$task" diff
   wt="$(require_worktree "$task")"
   # Same order as `aw check`, for the same reason: the patch this writes carries
   # the content of every path in it, so the tree AND the history are judged
   # before a byte of it is written.
   fence_reconcile "$wt" "$FENCE_PROFILE"
-  base="$(security_base "$(branch_of "$task")")"
-  fence_reconcile_history "$wt" "$base" "$FENCE_PROFILE"
-  rbase="$(review_base "$task" "$base")"
+  base="$(security_base "$task")"
+  fence_reconcile_history "$task" "$base" "$FENCE_PROFILE"
   patch="$wt/.agents/reviews/$task.patch"
-  ( cd "$wt" && git diff "$rbase" HEAD > "$patch" )
+  mkdir -p "$wt/.agents/reviews"
+  git -C "$ROOT" diff "$base" "$(branch_ref "$task")" > "$patch" \
+    || die "cannot write the diff for $task"
   ${EDITOR:-vim} -R -c 'set filetype=diff' "$patch"
 }
 
@@ -1955,9 +2037,9 @@ cmd_land() {
   # these commits in your tree, --pr puts them on origin. Both legs go through
   # here, and --force does not skip it (it skips the gate, not the boundary).
   # What is on disk is not the question — what the commits carry is.
-  base="$(security_base "$br")"
-  fence_reconcile_history "$wt" "$base" "$FENCE_PROFILE"
-  hand_reconcile_history "$ROOT" "$base" "$br"
+  base="$(security_base "$task")"
+  fence_reconcile_history "$task" "$base" "$FENCE_PROFILE"
+  hand_reconcile_history "$ROOT" "$base" "$(branch_ref "$task")"
   [ -n "$FENCE_PROFILE" ] && echo "aw: fence profile '$FENCE_PROFILE' — this diff may touch $FENCE_RELEASED"
   if [ -z "$force" ]; then
     echo "aw: running gate in worktree before landing"
@@ -1987,23 +2069,18 @@ cmd_land() {
   echo "aw: landed $task"
 }
 
-cmd_rebase() { # rebase agent/<task> onto origin/main and re-point loombase
-  # The task's diff base (branch.<br>.loombase) is the commit the branch was
-  # cut from — typically the plan/task commit, which rides on the branch by
-  # design and must NOT read as an agent change. A plain `git rebase` leaves
-  # loombase at the OLD commit: the reviewer then sees everything main merged
-  # since as "unauthorized" changes and an auto-fix round may try to revert
-  # them. This rebases and re-points the base at the REPLAYED base commit
-  # (matched by patch-id), falling back to the merge-base with a warning.
+cmd_rebase() { # rebase agent/<task> onto origin/main and re-point its base
+  # The recorded base is the commit the branch was cut from — typically the
+  # operator's HEAD, which may carry the plan/task commit the branch rides on
+  # and which must NOT read as an agent change. A plain `git rebase` leaves the
+  # record at the OLD commit: every history check and the review patch would
+  # then be measured from a commit the branch no longer descends from, which
+  # security_base refuses outright ("not an ancestor").
   #
-  # Only the REVIEW diff follows that re-point, and only when review_base's
-  # clamp accepts it. A replayed base commit sits AHEAD of
-  # merge-base($LOOM_BASE_REF, <br>), so the clamp will warn and show the
-  # review diff from the security base instead — the replayed plan/task commit
-  # is back in the diff. That is the price of not trusting branch config: the
-  # same move an agent makes to hide a commit is the move a rebase makes to
-  # hide the plan commit, and `aw` cannot tell them apart. Nothing about the
-  # FENCE check follows it either way; that has always been the security base.
+  # So a rebase is the ONE place a recorded base moves, and it is an operator
+  # command: it replays the branch and re-points the record at the commit it
+  # replayed onto — the replayed base commit matched by patch-id, or the new
+  # merge-base. Nothing an agent runs re-points anything.
   scan_fence_flag "$@"
   local task="${FLAG_ARGS[0]:?usage: aw rebase <task-id> [<upstream>] [--fence-profile <name>]}"
   local upstream="${FLAG_ARGS[1]:-origin/main}"
@@ -2011,33 +2088,39 @@ cmd_rebase() { # rebase agent/<task> onto origin/main and re-point loombase
   require_fence_flag "$task" rebase   # a rebase must not silently change the fence
   wt="$(require_worktree "$task")"; br="$(branch_of "$task")"
   fence_reconcile "$wt" "$FENCE_PROFILE"
-  # A rebase rewrites these commits onto a new base and re-points the diff
-  # base, which is exactly when a fenced path buried in the history would stop
+  # A rebase rewrites these commits onto a new base and re-points the recorded
+  # one, which is exactly when a fenced path buried in the history would stop
   # being visible. Judge it before, not after.
-  fence_reconcile_history "$wt" "$(security_base "$br")" "$FENCE_PROFILE"
+  old_base="$(security_base "$task")"
+  fence_reconcile_history "$task" "$old_base" "$FENCE_PROFILE"
   [ -z "$(git -C "$wt" status --porcelain)" ] || die "worktree $wt is dirty — commit or stash first"
-  old_base="$(git config "branch.$br.loombase" 2>/dev/null)" || die "no loombase recorded for $br"
   old_pid="$(git show "$old_base" | git patch-id --stable | cut -d' ' -f1)"
   git fetch -q origin >&2 || true
   git -C "$wt" rebase "$upstream" >&2 || die "rebase onto $upstream failed — resolve in $wt, then re-run"
-  mb="$(git merge-base "$br" "$upstream")"
+  mb="$(git merge-base "$br" "$upstream")" \
+    || die "$br and $upstream have no common ancestor after the rebase — inspect $wt"
   new_base=""
   if git merge-base --is-ancestor "$old_base" "$upstream"; then
     # The old base already landed upstream (the plan/task commit was merged
     # by an earlier PR): nothing was replayed, the merge-base IS the base.
     new_base="$mb"
-  else
+  elif [ -n "$old_pid" ]; then
     # The old base was replayed onto the upstream: find it by patch-id.
     for c in $(git rev-list --reverse "$mb..$br"); do
       if [ "$(git show "$c" | git patch-id --stable | cut -d' ' -f1)" = "$old_pid" ]; then new_base="$c"; break; fi
     done
-    if [ -z "$new_base" ]; then
-      new_base="$mb"
-      echo "aw: replayed base not found by patch-id; loombase set to the merge-base $(git rev-parse --short "$mb") — the reviewer may now see the plan/task commit as a change" >&2
-    fi
   fi
-  git config "branch.$br.loombase" "$new_base"
-  echo "aw: $br rebased onto $upstream; loombase $(git rev-parse --short "$old_base") -> $(git rev-parse --short "$new_base")"
+  if [ -z "$new_base" ]; then
+    new_base="$mb"
+    echo "aw: replayed base not found by patch-id; base set to the merge-base $(git rev-parse --short "$mb") — the reviewer may now see the plan/task commit as a change" >&2
+  fi
+  new_base="$(git rev-parse --verify --quiet "$new_base^{commit}")" \
+    || die "the new base does not resolve — refusing to record it for $task"
+  git merge-base --is-ancestor "$new_base" "$br" \
+    || die "the new base $(git rev-parse --short "$new_base") is not an ancestor of $br — refusing to
+record a base this branch does not descend from. Inspect $wt, do not re-run."
+  state_put "$task" "$new_base" "$(state_read "$task" profile)" "$br" "$(state_read "$task" created)"
+  echo "aw: $br rebased onto $upstream; base $(git rev-parse --short "$old_base") -> $(git rev-parse --short "$new_base")"
 }
 
 cmd_drop() {
@@ -2053,6 +2136,11 @@ cmd_drop() {
   [ -n "$task" ] || die "usage: aw drop <task-id> [--keep-branch]"
   wt="$(wt_path "$task")"; br="$(branch_of "$task")"
   git worktree remove "$wt" --force 2>/dev/null || true
+  # The operator record goes with the worktree, --keep-branch or not: it names
+  # a base and a profile for a task that no longer has a tree, and the next
+  # `aw new <task>` writes a fresh one. A kept branch keeps its commits, not
+  # its record — `aw check` on it says so and points at `aw new`.
+  state_rm "$task"
   if [ -n "$keep" ]; then
     local where
     if ! git remote get-url origin >/dev/null 2>&1; then
@@ -2064,16 +2152,16 @@ cmd_drop() {
     else
       where="— NOT on origin yet: git push -u origin $br"
     fi
-    echo "aw: dropped worktree for $task — branch $br kept $where"
+    echo "aw: dropped worktree for $task and its operator record — branch $br kept $where"
   else
     git branch -D "$br" 2>/dev/null || true
-    echo "aw: dropped $task"
+    echo "aw: dropped $task (worktree, branch and operator record)"
   fi
 }
 
-# Each agent worktree, annotated with the fence profile RECORDED on its branch
+# Each agent worktree, annotated with the fence profile in its OPERATOR RECORD
 # — a reminder of the flag every command for that task needs, not a claim about
-# what is on disk (the record is agent-writable; `aw run` reconciles the tree).
+# what is on disk (`aw run` reconciles the tree; the record only ever refuses).
 cmd_ls() {
   local line br prof found=""
   while IFS= read -r line; do
@@ -2081,7 +2169,7 @@ cmd_ls() {
     found=yes
     br="$(printf '%s' "$line" | sed -n 's/.*\[\(.*\)\].*/\1/p')"
     prof=""
-    [ -n "$br" ] && prof="$(git config "branch.$br.fenceprofile" 2>/dev/null || true)"
+    case "$br" in agent/*) prof="$(state_read "${br#agent/}" profile 2>/dev/null || true)" ;; esac
     if [ -n "$prof" ]; then printf '%s  fence-profile:%s\n' "$line" "$prof"
     else                    printf '%s\n' "$line"; fi
     # Both roots: a profiled worktree is a sibling of the unprofiled root, not
