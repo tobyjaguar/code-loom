@@ -522,9 +522,11 @@ elif mode == "fence-present":  # fenced files still on disk in <worktree>
             print(p)
 elif mode == "fence-present-full":
     # The same question asked of the FULL [fence], whatever profile is active.
-    # This is what `fence_reconcile` reconciles against: the tree is the fact,
-    # and "which fenced paths are on disk here" must not be answered by the
-    # very profile whose right to be active is what we are deciding.
+    # This is what `fence_reconcile` reconciles against: "which fenced paths
+    # are on disk here" must not be answered by the very profile whose right
+    # to be active is what we are deciding. (The answer can only ever REFUSE a
+    # command — a tree is writable by whatever runs in it, so it vouches for
+    # nothing. The operator's flag is the consent.)
     fence_sanity()
     wt = args[0]
     for p in tracked_in(wt):
@@ -578,9 +580,13 @@ zone_of() { # zone_of <repo-relative-path>   (fails loudly: callers gate commits
 #      worktree can `git config` it), so it may refuse a command, never
 #      authorise one. A `Fence-profile:` line in the task file is documentation
 #      of intent; the flag is the consent.
-#   2. Enforcement is driven by what is ON DISK, never by the record. See
-#      fence_reconcile below: the tree is the fact, and a tree holding released
+#   2. Enforcement is a CONSISTENCY CHECK against what is on disk and in the
+#      branch's commits — never a second signature. See fence_reconcile and
+#      fence_reconcile_history below: a tree (or a history) holding released
 #      paths that nobody vouched for on this command line is a dead stop.
+#      Neither can ever authorise a command: a worktree is a directory the
+#      agent can write, and `git sparse-checkout disable` materialises the
+#      released paths in one command. They refuse; the flag consents.
 #
 # The active profile is NEVER taken from the environment either: an inherited
 # AW_FENCE_PROFILE would widen the fence for whoever exported it. `aw` sets it
@@ -637,21 +643,13 @@ is_released() { # is_released <path>
   profile_releases "$FENCE_PROFILE" "$1"
 }
 
-# 0 = this worktree was BUILT under <profile>: it holds at least one fenced path,
-# and every fenced path it holds is one the profile releases. This is the only
-# evidence that exists. The branch record costs one `git config` from inside the
-# worktree; the tree costs a checkout nobody but `aw new` performs.
-profile_materialised() { # profile_materialised <worktree> <profile>
-  local wt="$1" prof="$2" present p
-  [ -d "$wt" ] || return 1
-  present="$(zones_py fence-present-full "$wt")" || return 1
-  [ -n "$present" ] || return 1
-  while IFS= read -r p; do
-    [ -n "$p" ] || continue
-    profile_releases "$prof" "$p" || return 1
-  done <<< "$present"
-  return 0
-}
+# NOTE on what the tree is worth as evidence. `aw` checks the worktree against
+# the asserted profile everywhere, and that check is a CONSISTENCY CHECK, not a
+# second signature: an agent inside the worktree can `git sparse-checkout
+# disable`, or simply write the files, so a tree that "looks like" a profile
+# proves nothing about who asked for it. It can therefore refuse a command and
+# never authorise one — exactly like the branch record. The operator's
+# --fence-profile flag is the only consent in this system.
 
 # Every model that could run against a profiled worktree must belong to a
 # provider the profile names — the WHOLE chain, not just the first entry: a
@@ -872,8 +870,15 @@ cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
   # This runs as a pre-commit hook, INSIDE the agent's own worktree, in the
   # agent's own context. It is a seatbelt, not a lock: `--no-verify` skips it
   # outright. So it may read the branch record (agent-writable state) for the
-  # released set — but it corroborates that record against the tree before
-  # trusting it, because a record alone costs one `git config` to forge.
+  # released set — and it checks that record against the tree first. Be plain
+  # about what that check is worth: it is a CONSISTENCY CHECK, and an agent
+  # that wants to satisfy it can. Forging the record costs one `git config`;
+  # making the tree agree costs one `git sparse-checkout disable`. The check
+  # catches a record that was forged carelessly, a stale worktree and an
+  # honest mistake — not an agent that is trying. What actually decides
+  # whether released content ever reaches a provider is the operator's
+  # --fence-profile flag on `aw new`, checked again on every later command,
+  # and `aw land`'s check of the commits themselves.
   local prof present p
   prof="$(git config "branch.$branch.fenceprofile" 2>/dev/null || true)"
   if [ -n "$prof" ]; then
@@ -1028,40 +1033,47 @@ scan_fence_flag() { # scan_fence_flag "$@"
 # touches a task worktree. Activates the profile when the operator asserted one
 # and the record agrees.
 require_fence_flag() { # require_fence_flag <task> <command-name>
-  local task="$1" cmd="$2" rec="" flag="$FLAG_PROFILE"
-  if git show-ref --verify --quiet "refs/heads/$(branch_of "$task")"; then
+  local task="$1" cmd="$2" rec="" flag="$FLAG_PROFILE" br
+  br="$(branch_of "$task")"
+  if git show-ref --verify --quiet "refs/heads/$br"; then
     rec="$(branch_profile "$task")"
     if [ -n "$rec" ] && [ -z "$flag" ]; then
-      die "task $task was created under fence profile '$rec'.
-Pass it again — every command needs the operator's consent, not a stored one:
-  aw $cmd $task --fence-profile $rec"
+      die "the branch record says task $task was created under fence profile '$rec'.
+Records are agent-writable: anything running inside that worktree can write one
+with a single 'git config', so this is a claim, not history.
+Pass --fence-profile $rec ONLY if YOU created the task under it:
+  aw $cmd $task --fence-profile $rec
+If you did not, the record was forged — throw the task away:  aw drop $task"
     fi
     if [ -n "$rec" ] && [ "$rec" != "$flag" ]; then
       die "--fence-profile '$flag' contradicts the record for $task ('$rec').
 Use '$rec', or start clean:  aw drop $task && aw new $task --fence-profile $flag"
     fi
     if [ -z "$rec" ] && [ -n "$flag" ]; then
-      # A profile may not be INTRODUCED after `aw new`. The missing record is
-      # the first sign of that — but a missing record is not proof either way
-      # (removing one is a `git config --unset`), so the tree decides: a
-      # worktree that already holds exactly what this profile releases WAS
-      # built under it, and the record was lost. Restore it, loudly. Anything
-      # else is an introduction, and dies.
-      if profile_materialised "$(wt_path "$task")" "$flag"; then
-        echo "aw: WARNING: no fence-profile record for $task, but its worktree holds the" >&2
-        echo "aw: WARNING: paths '$flag' releases and nothing else fenced — the record was" >&2
-        echo "aw: WARNING: removed or lost. Restoring it from your flag; the tree decided." >&2
-        git config "branch.$(branch_of "$task").fenceprofile" "$flag"
-      else
-        die "task $task has no fence-profile record, and its worktree does not hold the
-paths '$flag' releases — a profile cannot be introduced after 'aw new'. Start clean:
+      # Rule 3, absolute. There used to be an escape here: if the worktree
+      # already held exactly what '$flag' releases, `aw` called that
+      # corroboration, restored the record and ran. It is not corroboration.
+      # A worktree is a directory an agent can write: `git sparse-checkout
+      # disable` materialises the released paths, and so does `git checkout
+      # <ref> -- core/`. The tree can only ever refuse; it can never vouch.
+      # So: no record, no run — and if the record really was yours and really
+      # was lost, restoring it is an OPERATOR act, with the same weight as the
+      # flag, not something `aw` infers from a directory listing.
+      die "task $task has no fence-profile record: branch.$br.fenceprofile is missing.
+A profile cannot be introduced after 'aw new', and a worktree that happens to
+hold the released paths is not evidence — anything running there can create
+them.
+If YOU created this task under fence profile '$flag' and the record was
+removed, restore it yourself and re-run:
+  git config branch.$br.fenceprofile $flag
+Otherwise, start clean:
   aw drop $task && aw new $task --fence-profile $flag"
-      fi
     fi
   fi
   # No branch yet: nothing to contradict. `aw new` (which run/loop call) applies
   # its own rules to the flag and to the task file's declaration.
   [ -n "$flag" ] && fence_profile_activate "$flag"
+  refuse_cross_root "$task"
   return 0
 }
 
@@ -1173,8 +1185,9 @@ cmd_run() {
     [ -n "$FLAG_PROFILE" ] && newargs=(--fence-profile "$FLAG_PROFILE")
     wt="$(cmd_new "$task" ${newargs[0]+"${newargs[@]}"})"
   fi
-  # The tree decides, not the record: re-apply and verify, and refuse outright
-  # if what is on disk and what the operator asserted do not line up.
+  # Re-apply and verify, and refuse outright if what is on disk and what the
+  # operator asserted do not line up. The tree cannot authorise anything; it
+  # can only contradict the flag, and a contradiction is a dead stop.
   fence_reconcile "$wt" "$FENCE_PROFILE"
   title="$(head -1 "$AGENTS_DIR/tasks/$task.md" | sed 's/^#[[:space:]]*//')"
   load_fence; fnote="$(fence_note)"; pnote="$(profile_note)"
