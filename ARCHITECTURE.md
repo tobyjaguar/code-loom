@@ -252,15 +252,25 @@ Semantics:
   which is the honest answer to "what does this repo fence?" — the release is a
   property of one task's worktree, not of a path.
 - **The opt-in is a fresh operator act, on every command.** `--fence-profile
-  <name>` is REQUIRED by `aw new`, `run`, `check`, `loop`, `rebase` and `land`
-  for any task under a profile. `aw new` also writes
-  `branch.agent/<task>.fenceprofile`, but that record is a **consistency check,
-  never an authorisation**: three rules, all fail-closed —
-  1. a record exists and the flag is absent → die, naming the flag to pass;
+  <name>` is REQUIRED by `aw new`, `run`, `check`, `loop`, `diff`, `rebase` and
+  `land` for any task under a profile. `aw new` also writes
+  `branch.agent/<task>.fenceprofile` — and is the only thing that ever writes
+  it — but that record is a **consistency check, never an authorisation**:
+  three rules, all fail-closed, and there is no fourth —
+  1. a record exists and the flag is absent → die, naming the flag to pass,
+     and saying that a record is agent-writable so the flag should be passed
+     only if the operator created the task under it;
   2. both exist and differ → die;
-  3. the flag is given and no record exists → die, unless the worktree itself
-     already holds exactly what that profile releases (in which case the record
-     was lost, and it is restored loudly).
+  3. the flag is given and no record exists → **die, always.** A profile
+     cannot be introduced after `aw new`. This rule had an exception until
+     round 2: a worktree already holding exactly what the profile releases was
+     read as corroboration, the record was restored and the command ran. That
+     rested on the claim that a materialised tree costs "a checkout nobody but
+     `aw new` performs", which is false — `git sparse-checkout disable` is one
+     command, and so is `git checkout <ref> -- core/`. A tree can refuse; it
+     can never vouch. If a record really was the operator's and was lost, the
+     operator restores it by hand (`git config branch.agent/<task>.fenceprofile
+     <name>`), which is an act with the same weight as the flag.
 
   The reason is unglamorous: **branch config is agent-writable state.** Anything
   running inside the worktree can `git config branch.agent/<task>.fenceprofile
@@ -274,17 +284,45 @@ Semantics:
   from the task file's **header block** alone, so a line inside a code fence
   (the shape `aw loop` appends when it pastes a reviewer's text back into the
   task file) is not a declaration.
-- **Enforcement is driven by the tree, not the record.** `fence_reconcile <wt>
-  <asserted>` runs before any role in `run`/`check`/`loop`/`rebase`/`land`, and
-  again inside `run_role` for any workdir under `$LOOM_WORKTREES`. It computes
-  "which fenced paths are on disk here" against the **full** `[fence]` — never
-  the effective set, which would be the profile vouching for itself — and then:
-  released paths on disk with no assertion covering them is a **dead stop**,
-  not a silent re-fence (the worktree's diff and `.agents/reviews/<task>.patch`
-  carry the content into the next model even after the files are gone); an
-  assertion whose released paths are nowhere on disk is a dead stop too,
-  because that tree was not built under the profile. In `aw check` it runs
-  before the patch is written.
+- **A profiled task's worktree lives under its own root.**
+  `${LOOM_WORKTREES}-profiled`, a sibling of the ordinary root and never a
+  child of it. Nothing that runs unprofiled is ever handed a directory that
+  *contains* released paths: not another task's role, not the shared `_scout`
+  mirror (which stays under the ordinary root at the full fence), and not
+  opencode, whose `external_directory` grant is the role's own worktree rather
+  than the worktree root. `aw ls`, `aw drop`, `aw rebase` and `run_role`'s
+  defence-in-depth check all know both roots, and a task that exists under one
+  cannot be re-created under the other.
+- **Enforcement is a consistency check against the tree AND the commits.**
+  `fence_reconcile <wt> <asserted>` runs before any role in
+  `run`/`check`/`loop`/`rebase`/`land`, and again inside `run_role` for any
+  workdir under either worktree root — **before every fallback attempt**, not
+  once before the loop: attempt 1 can relax the sparse checkout and then hit a
+  rate limit, and attempt 2 is a different provider. It computes "which fenced
+  paths are on disk here" against the **full** `[fence]` — never the effective
+  set, which would be the profile vouching for itself — and then: released
+  paths on disk with no assertion covering them is a **dead stop**, not a
+  silent re-fence (the worktree's diff and `.agents/reviews/<task>.patch` carry
+  the content into the next model even after the files are gone); an assertion
+  whose released paths are nowhere on disk is a dead stop too, because that
+  tree was not built under the profile.
+
+  The tree alone is not enough, because a tree can be re-fenced after the fact.
+  `fence_reconcile_history <wt> <base> <asserted>` therefore judges what the
+  branch's **commits** touch — `git diff --no-renames --name-only <loombase>
+  HEAD`, a rename counted on both sides — against the full `[fence]` minus the
+  asserted release, wherever history is handed to a role or to the operator:
+  `aw check` before the patch is written, each round of `aw loop`, `aw diff`,
+  `aw rebase`, and `aw land`. With nothing asserted, nothing is released, so
+  any fenced path in the history is a dead stop; with no fenced path touched it
+  is a no-op.
+- **Landing inspects what it is about to publish.** Before it merges and before
+  it pushes, `aw land` maps every path in `<loombase>..agent/<task>` through
+  `zone_of` and the asserted profile's release list: a fenced path the profile
+  does not release, or ANY `[hand]` path it does not release, refuses the
+  landing by name. The guard is supposed to have stopped these, but the guard
+  runs in the agent's own context where `--no-verify` exists, so landing is
+  where it is actually caught. `--force` skips the gate, not this.
 - **Provider rule.** Before a worktree is created, and again before each role
   runs, `aw` walks the *entire* model chain of every role that will run there
   (implementer, reviewer, and the auto-fix rounds through the implementer) and
@@ -299,16 +337,30 @@ Semantics:
   is: the guard is a pre-commit hook that runs **in the agent's own context**,
   where `git commit --no-verify` exists. It is a seatbelt, not a lock. It is
   therefore allowed to read the agent-writable branch record for the released
-  set — and it corroborates that record against the tree before trusting it: a
-  record whose released paths are absent from the worktree, or a worktree
-  holding fenced paths the record's profile does not release, refuses the commit
-  rather than widening the guard. The reviewer prompt is told the same fact, so
-  a released path is not reported as an unauthorized change.
+  set — and it checks that record against the tree before trusting it: a record
+  whose released paths are absent from the worktree, or a worktree holding
+  fenced paths the record's profile does not release, refuses the commit rather
+  than widening the guard. Be plain about what that check is worth: it is a
+  **consistency check an agent that is trying can satisfy** — forging the
+  record costs one `git config`, and making the tree agree costs one `git
+  sparse-checkout disable`. It catches a careless forgery, a stale worktree and
+  an honest mistake. What actually decides whether released content reaches a
+  provider is the operator's flag on `aw new`, re-checked on every later
+  command, and `aw land`'s inspection of the commits. The reviewer prompt is
+  told the same fact, so a released path is not reported as an unauthorized
+  change.
 - **Fail-closed parsing.** Unknown profile name, unknown key in the table, a
   `release` entry that is not a `[fence]` pattern, a `release` entry another
-  still-fenced pattern covers, a `providers` entry with whitespace or a glob
-  character in it, a missing or empty list, a `[fence_profiles]` that is not a
-  table — each one dies, in every mode, before any answer is given.
+  still-fenced pattern covers *or that swallows a pattern which stays fenced*
+  (both directions: `release = ["core/**"]` with `core/wallet-sdk/**` still in
+  the fence is the same trap upside down), a `providers` entry with whitespace
+  or a glob character in it, a `providers` entry that is not a name
+  `provider_of()` can return (`claude`, `codex`, `zai`, `zai-coding-plan`,
+  `moonshotai`, `deepseek`, plus anything under `provider` in
+  `.opencode/opencode.json` — so `Claude` and `claude-sub` are refused, not
+  silently allowed to match nothing), a missing or empty list, a
+  `[fence_profiles]` that is not a table — each one dies, in every mode, before
+  any answer is given.
   `AW_FENCE_PROFILE` from the environment is ignored and cleared at startup: a
   profile is something an operator types, not something a variable carries.
 

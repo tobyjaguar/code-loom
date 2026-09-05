@@ -25,7 +25,8 @@ Insert directly after the existing `[fence]` table, before `[hand]`:
 # Moonshot never may. Nothing changes for a task that does not opt in.
 #
 # A task opts in with `aw new <task> --fence-profile codex`, and EVERY later
-# command for that task repeats the flag (run, check, loop, rebase, land). `aw`
+# command for that task repeats the flag (run, check, loop, diff, rebase,
+# land). `aw`
 # then:
 #   * builds the worktree fenced by [fence] MINUS `release` — so core/**,
 #     docs/audits/** and docs/safety-assessment/** are present, ios/** and
@@ -33,20 +34,34 @@ Insert directly after the existing `[fence]` table, before `[hand]`:
 #   * DIES before creating that worktree if any model in any chain that would
 #     run there (implementer, reviewer, and aw loop's auto-fix rounds —
 #     fallbacks included) is not one of `providers`;
-#   * checks, before each later command, that what is ON DISK in that worktree
-#     matches the profile you named — a released tree with no flag, or a flag
-#     whose paths are not there, is refused, not quietly re-fenced;
+#   * puts that worktree under a SEPARATE root (your $LOOM_WORKTREES with
+#     "-profiled" appended), so nothing unprofiled is ever pointed at a
+#     directory holding released paths;
+#   * checks, before each later command and before every fallback attempt, that
+#     what is ON DISK in that worktree matches the profile you named — a
+#     released tree with no flag, or a flag whose paths are not there, is
+#     refused, not quietly re-fenced;
+#   * checks what the branch's COMMITS touch as well, since a worktree can be
+#     re-fenced after the fact — aw check/diff/loop/rebase/land all refuse a
+#     history carrying a fenced path the profile does not release, and aw land
+#     additionally refuses any [hand] path it does not release;
 #   * lets the pre-commit guard accept commits to the released paths on that
 #     branch, while still blocking the rest of [hand] (zones.toml, the control
-#     plane, backend/migrations/**, ...);
+#     plane, backend/migrations/**, ...) — as a SEATBELT: the guard runs in the
+#     agent's own context, where `git commit --no-verify` exists, which is why
+#     `aw land` re-checks the commits themselves;
 #   * tells the reviewer the released paths are authorised for the task, so
 #     they do not come back as "unauthorized hand/fence changes".
 #
 # The branch record (branch.agent/<task>.fenceprofile) is a consistency check
 # only. It is agent-writable — anything running in the worktree can `git config`
-# it — so it can refuse a command and never authorise one. A `Fence-profile:`
-# line in a task file is likewise honoured only when the same name is ALSO on
-# the `aw new` command line: the file states intent, your flag is the consent.
+# it — so it can refuse a command and never authorise one; and a MISSING record
+# is a refusal too, with no escape (a worktree that happens to hold the released
+# paths is not evidence: `git sparse-checkout disable` is one command). If a
+# record was really yours and was lost, you restore it by hand. A
+# `Fence-profile:` line in a task file is likewise honoured only when the same
+# name is ALSO on the `aw new` command line: the file states intent, your flag
+# is the consent.
 #
 # `release` entries must match [fence].paths verbatim, and must not be covered
 # by another pattern that stays fenced — `aw` refuses anything else rather than
@@ -125,7 +140,7 @@ Under the existing zones section (the `**fence**` bullet):
   task file states the intent, but the flag is what consents to it) to get
   `core/**`, `docs/audits/**` and `docs/safety-assessment/**` back in its
   worktree. `ios/**` and `spike/**` stay fenced. **Every later command for that
-  task repeats the flag** — `aw run|check|loop|rebase|land <task>
+  task repeats the flag** — `aw run|check|loop|diff|rebase|land <task>
   --fence-profile codex` — and both model chains must be pinned to providers
   the profile allows, per command. Only `claude-sub` and `codex-sub` may run
   against such a task: `aw` refuses to create the worktree otherwise, refuses
@@ -155,9 +170,14 @@ aw check <some-task>                            # must die: the flag is missing
 aw check <other-unprofiled-task> --fence-profile codex
                                                 # must die: a profile cannot be
                                                 # introduced after `aw new`
+
+# and the record is not a key, in either direction:
+git config --unset branch.agent/<some-task>.fenceprofile
+aw check <some-task> --fence-profile codex      # must STILL die, and tell you
+                                                # to restore the record by hand
+git config branch.agent/<some-task>.fenceprofile codex   # your act, not aw's
 ```
 
-Then read [`docs/KNOWN-GAPS.md`](KNOWN-GAPS.md) in the harness repo: it lists
-what a profile does **not** close (the guard reads the agent's own zones copy;
-`aw plan` runs the architect unfenced in your tree with third-party fallbacks;
-`.agents/loom.env` is sourced as shell). None of them is fixed by this snippet.
+Then read [`docs/KNOWN-GAPS.md`](KNOWN-GAPS.md) in the harness repo, in full:
+it is the list of what a profile does **not** close, and it is kept current
+there rather than summarised here. None of it is fixed by this snippet.

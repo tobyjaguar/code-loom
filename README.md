@@ -289,26 +289,49 @@ never covered by a profile: its mirror is shared by every task, so it always
 runs at the full fence.
 
 **You pass the flag every time.** `--fence-profile <name>` is required by
-`aw new`, `run`, `check`, `loop`, `rebase` and `land` for a task under a
-profile:
+`aw new`, `run`, `check`, `loop`, `diff`, `rebase` and `land` for a task under
+a profile:
 
 ```sh
 aw new   0007-c --fence-profile codex
 aw run   0007-c --fence-profile codex
 aw check 0007-c --fence-profile codex
+aw diff  0007-c --fence-profile codex
 aw land  0007-c --fence-profile codex
 ```
 
+**A profiled task's worktree lives under its own root.** `$LOOM_WORKTREES` with
+`-profiled` appended — a *sibling* of the ordinary root, never a child of it.
+Nothing that runs unprofiled is ever pointed at a directory that contains
+released paths, and that includes the shared `_scout` mirror (which stays under
+the ordinary root and always carries the full fence) and opencode's
+`external_directory` grant, which is now the role's own worktree rather than
+the whole root. `aw ls` and `aw drop` know both roots. A task that already
+exists under one root cannot be re-created under the other: a profile is not
+something you add to, or remove from, a task that exists.
+
 `aw new` also records it (`git config branch.agent/<task>.fenceprofile`, the
 same pattern as the diff base), and `aw ls` shows it — but that record is a
-**consistency check, not an authorisation**. It can refuse a command three
-ways, and grant nothing:
+**consistency check, not an authorisation**. `aw new` is the only thing that
+ever writes it. It can refuse a command in three ways, it grants nothing, and
+these three rules are the whole of it — there is no fourth case and no
+exception:
 
-| situation | result |
-|---|---|
-| record exists, flag missing | dies, naming the flag to pass |
-| record and flag differ | dies |
-| flag given, no record | dies — a profile cannot be introduced after `aw new` |
+| the flag you passed | the branch record | result |
+|---|---|---|
+| absent | absent | ordinary unprofiled task; nothing to check |
+| absent | `codex` | **dies**, naming the flag to pass — and warning you that a record is agent-writable, so pass it only if *you* created the task under it |
+| `audit` | `codex` | **dies**: the flag contradicts the record |
+| `codex` | `codex` | the profile is active for this command |
+| `codex` | absent | **dies**: a profile cannot be introduced after `aw new`. If the record really was yours and was lost, restore it *yourself* — `git config branch.agent/<task>.fenceprofile codex` — and re-run; otherwise `aw drop` |
+
+That last row used to have an escape: if the worktree already held exactly what
+the profile releases, `aw` called that corroboration, restored the record and
+ran. It is gone. A worktree is a directory the agent can write — `git
+sparse-checkout disable` materialises the released paths in one command — so a
+tree that "looks like" a profile is not evidence that anyone asked for it.
+Restoring a lost record is now an operator act, with the same weight as the
+flag.
 
 The reason is worth stating plainly: **branch config is agent-writable state.**
 Branch config lives in the shared `.git/config`, so anything running in the
@@ -329,13 +352,25 @@ Only the task file's header block is read, so a `Fence-profile:` line inside a
 code block — the shape `aw loop` appends when it pastes a reviewer's text back
 into the task file — is not a declaration.
 
-**Enforcement comes off the disk, not off the record.** Before any role runs,
-`aw` asks the worktree which fenced paths are actually in it (against the whole
-`[fence]`, never the released subset) and refuses anything that does not line
-up: released paths present that your flag does not account for, or a flag whose
-released paths are nowhere on disk — a tree that was never built under that
-profile. It refuses rather than quietly re-fencing, because by then the tree's
-own diff and `.agents/reviews/<task>.patch` carry the content anyway.
+**Enforcement comes off the disk and out of the commits, not off the record.**
+Before any role runs — and before *every* fallback attempt, because attempt 1
+can widen the tree and then hit a rate limit — `aw` asks the worktree which
+fenced paths are actually in it (against the whole `[fence]`, never the
+released subset) and refuses anything that does not line up: released paths
+present that your flag does not account for, or a flag whose released paths are
+nowhere on disk — a tree that was never built under that profile. It refuses
+rather than quietly re-fencing, because by then the tree's own diff and
+`.agents/reviews/<task>.patch` carry the content anyway.
+
+The tree is only half the question, because a tree can be re-fenced after the
+fact: materialise `core/**`, commit it, put the sparse rules back, and the
+worktree looks clean while the *history* still carries it into every diff,
+patch file and merge. So the branch's commits are judged too — every path in
+`git diff <loombase> HEAD`, mapped through the full `[fence]` — wherever
+history is handed onward: `aw check` (before the patch is written), each round
+of `aw loop`, `aw diff`, `aw rebase`, and `aw land` before it merges or pushes.
+`aw land` additionally refuses any `[hand]` path in those commits that the
+profile does not release; `--force` skips the gate, not this.
 
 **The commit guard follows the profile — as a seatbelt.** Fenced paths are
 conventionally listed under `[hand]` too (that is what blocks a *commit* to
@@ -344,9 +379,15 @@ patterns and still blocks everything else in `[hand]` — `.agents/zones.toml`,
 migrations, whatever your repo lists. It reads the branch record for that, and
 corroborates it against the tree first (a record whose released paths are not
 in the worktree refuses the commit). It is a pre-commit hook running in the
-agent's own context, where `--no-verify` exists: a seatbelt, not a lock. The
-reviewer is told the same thing, so a released path does not come back as an
-"unauthorized hand/fence change" REVISE.
+agent's own context, where `--no-verify` exists: a seatbelt, not a lock. Be
+plain about the corroboration, too — it is a **consistency check an agent that
+is trying can satisfy**: forging the record costs one `git config`, and making
+the tree agree costs one `git sparse-checkout disable`. It catches a careless
+forgery, a stale worktree and an honest mistake, and that is all it claims. The
+thing that actually decides whether released content reaches a provider is your
+`--fence-profile` flag, re-checked on every command, plus `aw land`'s
+inspection of the commits. The reviewer is told the same thing, so a released
+path does not come back as an "unauthorized hand/fence change" REVISE.
 
 **If Codex refuses the task, run the same profile on Anthropic.** Codex has
 declined security-remediation prompts; the profile allows both providers
@@ -362,9 +403,11 @@ determined agent can still reach a fenced blob through git plumbing
 (`ARCHITECTURE.md` § 5, caveat 1). A profile only changes which files an agent
 finds in front of it, and which providers are allowed to be that agent. If your
 threat model includes a model actively working around the rule, you need a
-separate repository, not a profile. Four gaps in the surrounding machinery that
+separate repository, not a profile. The gaps in the surrounding machinery that
 a profile does **not** close are written down in
 [`docs/KNOWN-GAPS.md`](docs/KNOWN-GAPS.md) — read it before you rely on this.
+One of them (opencode's directory grant) is *widened* by profiles, and is the
+reason a profiled worktree gets its own root.
 
 `aw doctor` lists every profile, what it releases, to whom, and warns when a
 role's default chain reaches a provider the profile does not allow.
