@@ -267,19 +267,29 @@ before.
 fixes landed here. If you never write a `[fence_profiles]` table, this is the
 part of the branch that still changes your runs:
 
-- **The security base.** Every check of what a branch's *commits* touch is
-  measured from `merge-base($LOOM_BASE_REF, agent/<task>)`, computed in your
-  checkout — not from `branch.agent/<task>.loombase`, which lives in the shared
-  `.git/config` and which anything running in the worktree can rewrite.
-  `$LOOM_BASE_REF` is `origin/main` if it exists, else `main`; set it yourself
-  for a differently-named trunk. It is operator-side: `.agents/loom.env` may
-  not set it (that file is in the tree an agent writes), and a value there is
-  ignored with a warning. The loombase survives only as the *review* diff, and
-  only when it is an ancestor of the branch and of the security base —
-  otherwise the review diff falls back to the security base, loudly, because an
-  agent must not be able to shrink what the reviewer sees. A base that does not
-  resolve, or a branch with no common ancestor, is a refusal and never an empty
-  answer.
+- **The base is an operator record, outside every repo.** Every check of what a
+  branch's *commits* touch is measured from the commit your checkout was on
+  when `aw new` created the task, stored in
+  `${XDG_CONFIG_HOME:-~/.config}/loom/repos/<sha256 of the repo path>/tasks/<task>`
+  (mode 0700/0600, with a `repo` file beside it naming the checkout). Nothing
+  inside the repository takes part: a linked worktree shares `.git` with your
+  checkout, so `branch.<br>.loombase` (one `git config`) and the refs
+  themselves (`refs/remotes/origin/main`, `refs/heads/main` — one
+  `git update-ref`) are all writable from inside an agent's tree, and each of
+  them could collapse the range a fence check looked at to nothing. That also
+  fixes a false refusal in the other direction: your own unpushed commits on
+  `main` used to count as the branch's.
+  `aw new` writes the record, `aw rebase` re-points it (the one command that
+  moves a base, and it is yours), `aw drop` deletes it, and every check reads
+  it. A missing record, a base that does not resolve, a base that is not an
+  ancestor of the branch, and a branch with nothing past its branch point are
+  each a refusal with their own message — never an empty answer.
+  `$LOOM_BASE_REF` is gone with the merge-base it named.
+- **The history endpoint is the branch ref**, `refs/heads/agent/<task>` read in
+  your checkout, and never the worktree's `HEAD`: `git checkout --detach
+  HEAD~1` after a fenced commit left the tree looking clean while the branch
+  still carried the commit into the merge. A worktree whose `HEAD` is not its
+  own branch is refused outright — it is not a state `aw` produces.
 - **The worktree roots are verified.** Both are normalised (a trailing `/` or
   `/.` in `$LOOM_WORKTREES` is stripped before `-profiled` is appended),
   resolved with `pwd -P` and refused if the resolved path is not where the name
@@ -298,14 +308,24 @@ part of the branch that still changes your runs:
   `agent/<task>` already existed deleted that branch and its commits.
 - **A fence that was widened under an existing worktree is refused**, not
   quietly re-applied — the worktree's own diff carries the content regardless.
-  There is no "the branch record says this would have been fine" arm any more.
+  There is no "the record says this would have been fine" arm any more.
 - **The history is refused in `check`, `diff`, `loop`, `rebase` and `land`**
   when the branch's commits touch a fenced path, and `land` refuses a `[hand]`
   path in those commits too. `--force` skips the gate, not this.
 - **opencode's grant narrowed** from the whole worktree root to the role's own
-  worktree, and opencode now reads *your* `.opencode/opencode.json` with the
-  project's own config disabled — the worktree copy is a file the agent can
-  rewrite, and it carries provider endpoints and role prompts.
+  worktree, and opencode now reads *your* `.opencode/opencode.json`
+  (`OPENCODE_CONFIG`/`OPENCODE_CONFIG_DIR`) with
+  `OPENCODE_DISABLE_PROJECT_CONFIG=1` — the worktree copy is a file the agent
+  can rewrite, and it carries provider endpoints and role prompts. **The
+  disable is unconditional**, including in a repo that has no
+  `.opencode/opencode.json` of its own — which is exactly the repo where the
+  worktree's copy would otherwise be the only config there is. **The cost,
+  plainly:** opencode no longer reads the worktree's `AGENTS.md`/`CLAUDE.md`,
+  its `.opencode/` directory, or any project-local plugin. Role prompts come
+  from `$ROOT/.opencode/prompts/` via `{file:./prompts/…}` in your config —
+  the same copy the `claude` and `codex` legs already used — so if a repo's
+  opencode roles depended on `AGENTS.md` reaching the model, that content has
+  to move into the role prompt.
 - Independent of all of it: implementer-class roles on `claude-sub` and
   `codex-sub` get a write-capable sandbox (see "Codex as an implementer"
   below), and `aw doctor` prints the parse error when `zones.toml` is
@@ -355,34 +375,37 @@ the whole root. `aw ls` and `aw drop` know both roots. A task that already
 exists under one root cannot be re-created under the other: a profile is not
 something you add to, or remove from, a task that exists.
 
-`aw new` also records it (`git config branch.agent/<task>.fenceprofile`, the
-same pattern as the diff base), and `aw ls` shows it — but that record is a
-**consistency check, not an authorisation**. `aw new` is the only thing that
-ever writes it. It can refuse a command in three ways, it grants nothing, and
-these three rules are the whole of it — there is no fourth case and no
-exception:
+`aw new` also records it — in the operator record, the same file that holds the
+task's base — and `aw ls` shows it. That record is a **consistency check, not
+an authorisation**. `aw new` is the only thing that ever writes it. It can
+refuse a command in three ways, it grants nothing, and these three rules are
+the whole of it — there is no fourth case and no exception:
 
-| the flag you passed | the branch record | result |
+| the flag you passed | the record | result |
 |---|---|---|
 | absent | absent | ordinary unprofiled task; nothing to check |
-| absent | `codex` | **dies**, naming the flag to pass — and warning you that a record is agent-writable, so pass it only if *you* created the task under it |
+| absent | `codex` | **dies**: this task was created under `codex`, so pass `--fence-profile codex` |
 | `audit` | `codex` | **dies**: the flag contradicts the record |
 | `codex` | `codex` | the profile is active for this command |
-| `codex` | absent | **dies**: a profile cannot be introduced after `aw new`. If the record really was yours and was lost, restore it *yourself* — `git config branch.agent/<task>.fenceprofile codex` — and re-run; otherwise `aw drop` |
+| `codex` | absent | **dies**: a profile cannot be introduced after `aw new` — `aw drop <task> && aw new <task> --fence-profile codex` |
 
 That last row used to have an escape: if the worktree already held exactly what
 the profile releases, `aw` called that corroboration, restored the record and
 ran. It is gone. A worktree is a directory the agent can write — `git
 sparse-checkout disable` materialises the released paths in one command — so a
 tree that "looks like" a profile is not evidence that anyone asked for it.
-Restoring a lost record is now an operator act, with the same weight as the
-flag.
+Re-creating the task is now an operator act, with the same weight as the flag.
 
-The reason is worth stating plainly: **branch config is agent-writable state.**
-Branch config lives in the shared `.git/config`, so anything running in the
-worktree can `git config branch.agent/<task>.fenceprofile codex` and, under a
-design that read the profile back from there, widen its own fence for the next
-`aw run`. Your flag is the consent; the record only checks it.
+`branch.agent/<task>.fenceprofile` is neither read nor written any more, and
+the reason is worth stating plainly: **branch config is agent-writable state.**
+It lives in the shared `.git/config`, so anything running in the worktree could
+`git config branch.agent/<task>.fenceprofile codex` and, under a design that
+read the profile back from there, widen its own fence for the next `aw run`.
+The record moved to a file outside every repository. That is
+**operator integrity, not tamper-proofing** — an unsandboxed agent can write
+`$HOME`, which `docs/KNOWN-GAPS.md` § 3 already concedes — but it does remove
+the class of "one git command inside the worktree rewrites the input to its own
+security check". Your flag is the consent; the record only checks it.
 
 A `Fence-profile: <name>` line in the task file is a third form, and the
 weakest — it *documents* the intent of a task (an architect agent may have
@@ -417,30 +440,30 @@ of `aw loop`, `aw diff`, `aw rebase`, and `aw land` before it merges or pushes.
 `aw land` additionally refuses any `[hand]` path in those commits that the
 profile does not release; `--force` skips the gate, not this.
 
-The *security base* is `merge-base($LOOM_BASE_REF, agent/<task>)`, computed in
-your checkout, and it is deliberately not the branch's `loombase`: branch
-config is agent-writable state (that is the same sentence as three paragraphs
-up, and it cost a whole class of bypass — a loombase pointed at the branch's
-own tip makes every one of those diffs empty). The loombase is still what the
-*review* patch is cut from, because it hides the plan/task commit the branch
-rides on, but only while it stays an ancestor of the branch and of the security
-base. Past either, the review patch is cut from the security base instead, with
-a warning. `aw rebase` trips that clamp by design when it re-points at a
-replayed base: the plan commit is back in the review diff, and there is no way
-for `aw` to tell that re-point apart from an agent hiding a commit.
+The *base* is the operator record described above, and the *endpoint* is
+`refs/heads/agent/<task>` read in your checkout. Neither comes from the
+worktree, and neither comes from anything in `.git` — that is the same sentence
+as three paragraphs up, and it cost a whole class of bypass (a `loombase`
+pointed at the branch's own tip, or an `origin/main` moved there with `git
+update-ref`, makes every one of those diffs empty; a detached worktree hides
+the last commit from every check measured off `HEAD`). There is no second,
+"nicer to read" base any more: the review patch is cut from the same range the
+history check just cleared, `base..refs/heads/agent/<task>`. `aw rebase` is the
+only command that moves a recorded base, and it is one of yours.
 
 **The commit guard follows the profile — as a seatbelt.** Fenced paths are
 conventionally listed under `[hand]` too (that is what blocks a *commit* to
 them); under a profile the guard accepts commits to exactly the released
 patterns and still blocks everything else in `[hand]` — `.agents/zones.toml`,
-migrations, whatever your repo lists. It reads the branch record for that, and
-corroborates it against the tree first (a record whose released paths are not
-in the worktree refuses the commit). It is a pre-commit hook running in the
-agent's own context, where `--no-verify` exists: a seatbelt, not a lock. Be
-plain about the corroboration, too — it is a **consistency check an agent that
-is trying can satisfy**: forging the record costs one `git config`, and making
-the tree agree costs one `git sparse-checkout disable`. It catches a careless
-forgery, a stale worktree and an honest mistake, and that is all it claims. The
+migrations, whatever your repo lists. It reads the operator record for that
+(the hook runs as you, so it can), and corroborates it against the tree first
+(a record whose released paths are not in the worktree refuses the commit). It
+is a pre-commit hook running in the agent's own context, where `--no-verify`
+exists: a seatbelt, not a lock. Be plain about the corroboration, too — it is a
+**consistency check an agent that is trying can satisfy**: making the tree
+agree costs one `git sparse-checkout disable`, and an unsandboxed agent can
+write `$HOME`. It catches a stale worktree and an honest mistake, and that is
+all it claims. The
 thing that actually decides whether released content reaches a provider is your
 `--fence-profile` flag, re-checked on every command, plus `aw land`'s
 inspection of the commits. The reviewer is told the same thing, so a released

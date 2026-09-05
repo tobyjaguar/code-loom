@@ -53,15 +53,17 @@ Insert directly after the existing `[fence]` table, before `[hand]`:
 #   * tells the reviewer the released paths are authorised for the task, so
 #     they do not come back as "unauthorized hand/fence changes".
 #
-# The branch record (branch.agent/<task>.fenceprofile) is a consistency check
-# only. It is agent-writable — anything running in the worktree can `git config`
-# it — so it can refuse a command and never authorise one; and a MISSING record
-# is a refusal too, with no escape (a worktree that happens to hold the released
+# The record of which profile a task was created under is a consistency check
+# only: it can refuse a command and never authorise one, and a MISSING record is
+# a refusal too, with no escape (a worktree that happens to hold the released
 # paths is not evidence: `git sparse-checkout disable` is one command). If a
-# record was really yours and was lost, you restore it by hand. A
-# `Fence-profile:` line in a task file is likewise honoured only when the same
-# name is ALSO on the `aw new` command line: the file states intent, your flag
-# is the consent.
+# record was really yours and was lost, you re-create the task. It lives in the
+# OPERATOR RECORD, outside every repo and outside the shared .git —
+# ${XDG_CONFIG_HOME:-~/.config}/loom/repos/<sha256 of the repo path>/tasks/<task>
+# — because everything under .git/ (branch config AND refs) is writable from any
+# linked worktree. A `Fence-profile:` line in a task file is likewise honoured
+# only when the same name is ALSO on the `aw new` command line: the file states
+# intent, your flag is the consent.
 #
 # `release` entries must match [fence].paths verbatim, and must not be covered
 # by another pattern that stays fenced — `aw` refuses anything else rather than
@@ -172,29 +174,42 @@ aw check <other-unprofiled-task> --fence-profile codex
                                                 # introduced after `aw new`
 
 # and the record is not a key, in either direction:
-git config --unset branch.agent/<some-task>.fenceprofile
-aw check <some-task> --fence-profile codex      # must STILL die, and tell you
-                                                # to restore the record by hand
-git config branch.agent/<some-task>.fenceprofile codex   # your act, not aw's
+rm "${XDG_CONFIG_HOME:-$HOME/.config}/loom/repos/"*"/tasks/<some-task>"
+aw check <some-task> --fence-profile codex      # must STILL die, telling you to
+                                                # aw drop && aw new the task
 ```
+
+The record is a file you own, not a git object: `aw new` writes it, `aw rebase`
+re-points its `base`, `aw drop` deletes it (with or without `--keep-branch`),
+and `aw ls` shows the profile it names. A task created by an older `aw` has no
+record, so `aw check|diff|loop|rebase|land` on it refuses with "no operator
+record for task X" — `aw drop X && aw new X` is the fix, and there is no
+migration to run beyond that.
 
 ## 5. One thing to check that is not about profiles
 
-Every check of what a branch's **commits** touch is measured from
-`merge-base($LOOM_BASE_REF, agent/<task>)`, and `$LOOM_BASE_REF` defaults to
-`origin/main` if that ref exists, else `main`. `graduated-wallet` is on `main`
-with an `origin`, so the default is right and there is nothing to set. A repo
-whose trunk is called something else gets a hard refusal on `aw
-check|diff|loop|rebase|land` until it sets `LOOM_BASE_REF` — in the
-environment or in `~/.config/loom/env`, **never** in `.agents/loom.env`, which
-is a file in the tree an agent writes and which `aw` ignores for this one
-variable (loudly). It is measured this way, and not from the branch's recorded
-diff base, because that base lives in the shared `.git/config`: anything
-running in the worktree could point it at the branch's own tip and empty every
-one of those checks.
+Every check of what a branch's **commits** touch is measured from the commit
+your checkout was on when `aw new` created the task, recorded in the operator
+record above. There is nothing to configure: no trunk to name, no
+`LOOM_BASE_REF` (it is gone), and no dependence on `origin/main` being fetched
+or up to date. Two consequences worth knowing before you rely on it:
+
+* **Your own unpushed commits on `main` are not the task's.** The previous
+  design measured from `merge-base(origin/main, agent/<task>)` and counted
+  everything `main` had that `origin/main` did not as the branch's own work —
+  a fenced path you committed yourself refused an agent task that never touched
+  it.
+* **A base is never derived from anything in `.git`.** Branch config and refs
+  are both writable from inside a linked worktree (`git config
+  branch.<br>.loombase <tip>`, `git update-ref refs/remotes/origin/main <tip>`),
+  and either one emptied every check. So is the worktree's `HEAD`: the history
+  endpoint is `refs/heads/agent/<task>`, read in your checkout, and a worktree
+  that is not on its own branch is refused.
 
 ```sh
-git rev-parse --verify origin/main   # must resolve, or set LOOM_BASE_REF
+# the record for a task, if you ever want to read one:
+cat "${XDG_CONFIG_HOME:-$HOME/.config}/loom/repos/"*"/tasks/<some-task>"
+#   base=<commit>  profile=<name>  branch=agent/<task>  created=<iso>
 ```
 
 Then read [`docs/KNOWN-GAPS.md`](KNOWN-GAPS.md) in the harness repo, in full:

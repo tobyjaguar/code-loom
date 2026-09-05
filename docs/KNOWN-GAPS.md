@@ -22,9 +22,9 @@ drift; the quoted text is the durable handle, so grep for it.
 
 ## 1. `aw guard` reads the agent's own copy of `zones.toml`
 
-**Where.** `bin/aw:59` (`ROOT="$(git rev-parse --show-toplevel …)"`) and
-`bin/aw:65` (`AGENTS_DIR="$ROOT/.agents"`); the reader is `cmd_guard`,
-`bin/aw:1303`. `cmd_guard` runs as a pre-commit hook inside
+**Where.** `bin/aw:72` (`ROOT="$(git rev-parse --show-toplevel …)"`) and
+`bin/aw:78` (`AGENTS_DIR="$ROOT/.agents"`); the reader is `cmd_guard`,
+`bin/aw:1395`. `cmd_guard` runs as a pre-commit hook inside
 the agent's worktree, so `$ROOT` is that worktree and every zone lookup reads
 `<worktree>/.agents/zones.toml` — a file the agent can edit.
 
@@ -44,7 +44,7 @@ branch would be judged by main's copy, which is arguably the point.
 
 ## 2. `aw plan` runs the architect unfenced, in your own tree
 
-**Where.** `bin/aw:2085`, in `cmd_plan` (`bin/aw:2066`):
+**Where.** `bin/aw:2201`, in `cmd_plan` (`bin/aw:2182`):
 `run_role architect "$ROOT" "$prompt"` (and the
 interactive leg, `claude --append-system-prompt … "$prompt"`, likewise in
 `$ROOT`). The architect's chain at every tier ends in cheap third-party
@@ -66,7 +66,7 @@ say so out loud.
 
 ## 3. `.agents/loom.env` is sourced as shell
 
-**Where.** `bin/aw:88`:
+**Where.** `bin/aw:98`:
 
 ```sh
 if [ -f "$ROOT/.agents/loom.env" ]; then set -a; . "$ROOT/.agents/loom.env"; set +a; fi
@@ -81,20 +81,30 @@ present in every agent worktree.
 it is a tracked file (so the change shows up in the diff you review), and an
 agent that can write files in your checkout has other options.
 
-**Two variables are already carved out of it**, because for those the file is
-not merely a risk, it is a bypass:
+**One variable is carved out of it**, because for that one the file is not
+merely a risk, it is a bypass:
 
-- `LOOM_BASE_REF` — the ref every security base is measured from. Snapshotted
-  before the file is sourced and restored after, with a warning naming the
-  value that was ignored. A `loom.env` that set it to the branch's own tip
-  would make every history check answer "this branch touches nothing".
 - `WT_ROOT_PROFILED` — where a profiled worktree's released paths land. It is
   derived from the normalised `$LOOM_WORKTREES` and a preset that differs is a
   refusal; `loom.env` may still set `LOOM_WORKTREES` itself, which moves both
   roots together and keeps them siblings.
 
-Neither carve-out fixes the gap. Anything else in that file still runs as
-shell, in your environment.
+There used to be a second, `LOOM_BASE_REF`: the ref the security base was
+measured from, snapshotted before the file was sourced and restored after. That
+variable no longer exists. The base every history check uses is the **operator
+record** (`${XDG_CONFIG_HOME:-$HOME/.config}/loom/repos/<key>/tasks/<task>`),
+written by `aw new`, which no file in the repository takes part in.
+
+**This gap is the residual the operator record concedes.** That directory is in
+`$HOME`, and the capability this gap describes — an agent that can write files
+in your checkout, and a file in your checkout that runs as shell in your
+environment — reaches `$HOME` too. The state directory is therefore **operator
+integrity, not tamper-proofing**: it removes the class of "one `git config` or
+`git update-ref` inside the worktree rewrites the input to its own security
+check", which was a much cheaper attack than this one. It does not claim more.
+
+The carve-out does not fix the gap either. Anything else in that file still
+runs as shell, in your environment.
 
 **Suggested fix.** Parse it instead of sourcing it: read `KEY=VALUE` lines,
 reject anything else, and `export` the pairs. Losing shell syntax there costs
@@ -109,7 +119,7 @@ that one form or the README changes with it.
 used to read "granted for the whole worktree root". It is not that any more;
 what is left is a confirmation.
 
-**Where.** `bin/aw:438`, in `run_headless` (`bin/aw:351`), the opencode leg:
+**Where.** `bin/aw:503`, in `run_headless` (`bin/aw:416`), the opencode leg:
 
 ```sh
 perm="$(printf '{"external_directory":{"%s/*":"allow","%s/**":"allow"}}' "$wd" "$wd")"
@@ -175,13 +185,22 @@ needed (verified against the installed 1.18 binary, whose config loader merges
 the worktree's copy winning key by key):
 
 ```sh
-OPENCODE_CONFIG=$ROOT/.opencode/opencode.json
+OPENCODE_CONFIG=$ROOT/.opencode/opencode.json     # (and OPENCODE_CONFIG_DIR)
 OPENCODE_DISABLE_PROJECT_CONFIG=1
 ```
 
-`run_headless`'s opencode leg (`bin/aw:466`) sets both when the operator's copy
-exists. A caller that sets `OPENCODE_CONFIG` itself wins untouched, the same
-rule `OPENCODE_PERMISSION` already had.
+`run_headless`'s opencode leg (`bin/aw:534`) sets the **disable
+unconditionally**, on every opencode invocation — implementer, reviewer, scout
+and architect alike — and names the operator's config only when one exists.
+That is a round-4 correction: the disable used to be conditional on
+`$ROOT/.opencode/opencode.json` existing, which had it exactly backwards. A
+repo with no operator config is the repo where the worktree's own
+`opencode.json` is the ONLY config, i.e. the one place where an agent-written
+project config would have been read in full. A caller that sets
+`OPENCODE_CONFIG`/`OPENCODE_CONFIG_DIR` itself wins untouched, the same rule
+`OPENCODE_PERMISSION` already had; the disable is the one thing no caller turns
+off. `tests/fence-profiles.sh` (ao) asserts both variables on all four legs and
+asserts the disable in a repo with no operator config at all.
 
 **The cost.** With the project config off, opencode no longer reads the
 worktree's `AGENTS.md`/`CLAUDE.md`, the worktree's `.opencode/` directory, or a
@@ -189,7 +208,11 @@ project-local plugin. Role prompts now come from `$ROOT/.opencode/prompts/`
 (via `{file:./prompts/…}` in the operator's config) — which is the copy the
 `claude` and `codex` legs already used, so this makes the three legs agree
 rather than diverge. If a repo's opencode roles depended on `AGENTS.md`
-reaching the model, that content has to move into the role prompt.
+reaching the model, that content has to move into the role prompt. Since the
+disable is unconditional, a repo with **no** `$ROOT/.opencode/opencode.json`
+pays that cost with nothing to replace it: opencode there runs on its own
+global config, and `--agent <role>` falls back to opencode's default agent. A
+repo that wants role definitions must keep them in the operator's copy.
 
 **The residual.** `$ROOT/.opencode/opencode.json` is a file in *your* checkout.
 Nothing an agent runs touches your checkout — except `aw plan`'s architect,

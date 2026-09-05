@@ -180,7 +180,7 @@ tree directly, is redirected to a persistent detached mirror at
 The implementer and scout prompts say the paths are absent by policy, so a
 confused agent asks instead of digging.
 
-**What this is and is not.** Four caveats, all of them load-bearing:
+**What this is and is not.** Five caveats, all of them load-bearing:
 
 1. **The object store is shared.** A worktree is a checkout, not a clone;
    `.git` still holds every fenced blob, and `git show`, `git cat-file` or
@@ -263,30 +263,29 @@ Semantics:
   property of one task's worktree, not of a path.
 - **The opt-in is a fresh operator act, on every command.** `--fence-profile
   <name>` is REQUIRED by `aw new`, `run`, `check`, `loop`, `diff`, `rebase` and
-  `land` for any task under a profile. `aw new` also writes
-  `branch.agent/<task>.fenceprofile` — and is the only thing that ever writes
-  it — but that record is a **consistency check, never an authorisation**:
-  three rules, all fail-closed, and there is no fourth —
-  1. a record exists and the flag is absent → die, naming the flag to pass,
-     and saying that a record is agent-writable so the flag should be passed
-     only if the operator created the task under it;
+  `land` for any task under a profile. `aw new` also writes the profile into
+  the **operator record** (below) — and is the only thing that ever writes it —
+  but that record is a **consistency check, never an authorisation**: three
+  rules, all fail-closed, and there is no fourth —
+  1. a record exists and the flag is absent → die, naming the flag to pass:
+     "this task was created under fence profile X; pass --fence-profile X";
   2. both exist and differ → die;
-  3. the flag is given and no record exists → **die, always.** A profile
-     cannot be introduced after `aw new`. This rule had an exception until
-     round 2: a worktree already holding exactly what the profile releases was
-     read as corroboration, the record was restored and the command ran. That
-     rested on the claim that a materialised tree costs "a checkout nobody but
-     `aw new` performs", which is false — `git sparse-checkout disable` is one
-     command, and so is `git checkout <ref> -- core/`. A tree can refuse; it
-     can never vouch. If a record really was the operator's and was lost, the
-     operator restores it by hand (`git config branch.agent/<task>.fenceprofile
-     <name>`), which is an act with the same weight as the flag.
+  3. the flag is given and no record exists → **die, always**, with the
+     recreate instruction (`aw drop <task> && aw new <task> --fence-profile
+     <name>`). A profile cannot be introduced after `aw new`. This rule had an
+     exception until round 2: a worktree already holding exactly what the
+     profile releases was read as corroboration, the record was restored and
+     the command ran. That rested on the claim that a materialised tree costs
+     "a checkout nobody but `aw new` performs", which is false — `git
+     sparse-checkout disable` is one command, and so is `git checkout <ref> --
+     core/`. A tree can refuse; it can never vouch.
 
-  The reason is unglamorous: **branch config is agent-writable state.** Anything
-  running inside the worktree can `git config branch.agent/<task>.fenceprofile
+  `branch.agent/<task>.fenceprofile` is neither read nor written any more, and
+  the reason is unglamorous: **branch config is agent-writable state.** Anything
+  running inside the worktree could `git config branch.agent/<task>.fenceprofile
   codex`, because branch config lives in the shared `.git/config`. A design that
-  read the profile from that record let an agent widen its own fence and have
-  the next `aw run` honour it. It can now only refuse a command.
+  read the profile from there let an agent widen its own fence and have the next
+  `aw run` honour it.
 
   A `Fence-profile: <name>` line in the task file is a third, weakest form: it
   documents intent — an architect agent may have written it — and `aw new`
@@ -325,12 +324,18 @@ Semantics:
   and it carries `provider.<name>.options.baseURL` — the provider identity the
   whole `providers` rule is built on — as well as the agent definitions that
   supply the role prompt. Every opencode invocation therefore runs with
-  `OPENCODE_CONFIG=$ROOT/.opencode/opencode.json` **and**
-  `OPENCODE_DISABLE_PROJECT_CONFIG=1`: the first alone is merged *before* the
-  project files, so the worktree copy would still win key by key. The cost is
-  that opencode no longer reads the worktree's `AGENTS.md`/`CLAUDE.md` or a
-  project-local plugin; the role prompt now comes from `$ROOT/.opencode`, which
-  is the copy the `claude` and `codex` legs already used.
+  `OPENCODE_DISABLE_PROJECT_CONFIG=1`, **unconditionally**, plus
+  `OPENCODE_CONFIG`/`OPENCODE_CONFIG_DIR` pointing at the operator's copy when
+  one exists: the config variables alone are not a fix (they are merged
+  *before* the project files, so the worktree copy would still win key by key),
+  and making the disable conditional on the operator having a config was
+  backwards — a repo with no `$ROOT/.opencode/opencode.json` is exactly the
+  repo where the worktree's copy is the only config there is. A caller that
+  sets `OPENCODE_CONFIG`/`OPENCODE_CONFIG_DIR` wins untouched; the disable is
+  the one thing no caller turns off. The cost is that opencode no longer reads
+  the worktree's `AGENTS.md`/`CLAUDE.md` or a project-local plugin; the role
+  prompt now comes from `$ROOT/.opencode`, which is the copy the `claude` and
+  `codex` legs already used.
 - **Enforcement is a consistency check against the tree AND the commits.**
   `fence_reconcile <wt> <asserted>` runs before any role in
   `run`/`check`/`loop`/`rebase`/`land`, and again inside `run_role` for any
@@ -356,28 +361,47 @@ Semantics:
   `aw rebase`, and `aw land`. With nothing asserted, nothing is released, so
   any fenced path in the history is a dead stop; with no fenced path touched it
   is a no-op.
-- **Two bases, and only one of them is trusted.** `<base>` above is the
-  **security base**: `security_base <br>` = `merge-base($LOOM_BASE_REF, <br>)`,
-  computed in `$ROOT` from refs the operator controls. `$LOOM_BASE_REF` is one
-  name, resolved once (`origin/main` if it exists, else `main`), and it is
-  operator-side by construction — `.agents/loom.env` may not set it, because
-  that file lives in the tree an agent writes and is `.`-sourced; a value there
-  is restored to the operator's and warned about. This replaced
-  `branch.agent/<task>.loombase`, which is branch config in the shared
-  `.git/config`: one `git config` set it to the branch's own tip and every
-  history diff above went empty, and one unresolvable sha made `history_paths`
-  answer "no paths" — a fail-open on exactly the input an agent controls. Not
-  knowing a base is now a refusal in every direction: unresolvable base,
-  unresolvable rev, failed diff, no common ancestor.
+- **One base, and it is the operator's — kept outside the repo.** `<base>`
+  above is `security_base <task>`: the commit `$ROOT` was checked out at when
+  `aw new` created the task, read from the **operator record**
 
-  The loombase survives as the **review base** only — the patch `aw check` and
-  `aw diff` write, where hiding the plan/task commit is a courtesy to the
-  reader — and it is clamped: it must be an ancestor of the branch, and equal
-  to or an ancestor of the security base. Otherwise the review patch is cut
-  from the security base too, loudly, because an agent must not be able to
-  shrink what the reviewer sees. `aw rebase`'s re-point onto a replayed base
-  sits ahead of the merge-base and therefore trips the clamp by design; `aw`
-  cannot distinguish it from a commit being hidden, and says so.
+  ```
+  ${XDG_CONFIG_HOME:-$HOME/.config}/loom/repos/<sha256 of the main checkout's
+      real path>/repo                 <- that path, for humans
+      .../tasks/<task>                <- base=<commit> profile=<name>
+                                         branch=agent/<task> created=<iso>
+  ```
+
+  written 0700/0600, by `aw new` alone; re-pointed by `aw rebase` (an operator
+  command, and the only thing that moves a base); deleted by `aw drop`, with or
+  without `--keep-branch`; read by every security check, by `cmd_guard` (which
+  runs as the same OS user, and finds the same directory from a linked worktree
+  because the key is the **main** checkout's path via `git rev-parse
+  --git-common-dir`) and by `aw ls`.
+
+  The location is the point. Everything under `.git/` is writable from any
+  linked worktree — config *and* refs — so none of it can carry a security
+  input. `branch.agent/<task>.loombase` was one `git config` away from the
+  branch's own tip, which emptied every history diff above, and an unresolvable
+  sha made `history_paths` answer "no paths"; `merge-base($LOOM_BASE_REF, <br>)`
+  replaced it and was one `git update-ref refs/remotes/origin/main <tip>` away
+  from the same collapse — while *also* false-refusing an honest task whenever
+  the operator had unpushed commits on `main`. `$LOOM_BASE_REF` is gone with it.
+  Not knowing a base is a refusal in every direction: no record, unresolvable
+  base, a base that is not an ancestor of the branch, a branch with nothing past
+  its branch point ("nothing to review/land"), unresolvable rev, failed diff.
+
+  There is no second base. The review patch `aw check` and `aw diff` write is
+  cut from the same range the history check just cleared, so there is nothing
+  left to clamp — and nothing for an agent to shrink.
+- **The endpoint is the branch ref, never the worktree's HEAD.**
+  `fence_reconcile_history` and the review-patch cut both read
+  `refs/heads/agent/<task>` in `$ROOT` — the ref `aw land` merges and `aw land
+  --pr` pushes. Measuring from the worktree's `HEAD` meant `git checkout
+  --detach HEAD~1` after a fenced commit left every check looking at a clean
+  history while the branch still carried the commit onward. A worktree whose
+  `HEAD` is not `refs/heads/agent/<task>` (`git symbolic-ref -q HEAD`) is
+  refused outright as well: it is not a state `aw` produces.
 - **Landing inspects what it is about to publish.** Before it merges and before
   it pushes, `aw land` maps every path in `<security base>..agent/<task>` through
   `zone_of` and the asserted profile's release list: a fenced path the profile
@@ -398,14 +422,16 @@ Semantics:
   patterns and keeps blocking the rest of `[hand]`. But be clear about what it
   is: the guard is a pre-commit hook that runs **in the agent's own context**,
   where `git commit --no-verify` exists. It is a seatbelt, not a lock. It is
-  therefore allowed to read the agent-writable branch record for the released
-  set — and it checks that record against the tree before trusting it: a record
-  whose released paths are absent from the worktree, or a worktree holding
-  fenced paths the record's profile does not release, refuses the commit rather
-  than widening the guard. Be plain about what that check is worth: it is a
-  **consistency check an agent that is trying can satisfy** — forging the
-  record costs one `git config`, and making the tree agree costs one `git
-  sparse-checkout disable`. It catches a careless forgery, a stale worktree and
+  therefore allowed to read the operator record for the released set — it runs
+  as the same OS user, and resolves the same state directory from inside the
+  worktree — and it checks that record against the tree before trusting it: a
+  record whose released paths are absent from the worktree, or a worktree
+  holding fenced paths the record's profile does not release, refuses the
+  commit rather than widening the guard. Be plain about what that check is
+  worth: it is a **consistency check an agent that is trying can satisfy** —
+  making the tree agree costs one `git sparse-checkout disable`, and an
+  unsandboxed agent can write `$HOME` (KNOWN-GAPS 3), so the state directory is
+  **operator integrity, not tamper-proofing**. It catches a stale worktree and
   an honest mistake. What actually decides whether released content reaches a
   provider is the operator's flag on `aw new`, re-checked on every later
   command, and `aw land`'s inspection of the commits. The reviewer prompt is
