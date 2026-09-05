@@ -29,6 +29,9 @@ want_not_in() { # want_not_in <label> <haystack> <needle>
 }
 want_file()   { if [ -e "$2" ]; then ok "$1"; else bad "$1 — missing: $2"; fi; }
 want_absent() { if [ -e "$2" ]; then bad "$1 — present but should not be: $2"; else ok "$1"; fi; }
+want_fail()   { if [ "$2" -ne 0 ]; then ok "$1"; else bad "$1 — the command exited 0"; fi; }
+sedi() { if sed --version >/dev/null 2>&1; then sed -i -e "$1" "$2"; else sed -i '' -e "$1" "$2"; fi; }
+want_ne()     { if [ "$2" != "$3" ]; then ok "$1"; else bad "$1 — both are '$2'"; fi; }
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/aw-fence-profiles.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
@@ -73,6 +76,8 @@ printf 'OPENCODE_CONFIG=%s\n' "${OPENCODE_CONFIG:-(unset)}" \
   >> "${AW_TEST_TMP:?}/called-opencode.log"
 printf 'OPENCODE_DISABLE_PROJECT_CONFIG=%s\n' "${OPENCODE_DISABLE_PROJECT_CONFIG:-(unset)}" \
   >> "${AW_TEST_TMP:?}/called-opencode.log"
+printf 'OPENCODE_CONFIG_DIR=%s\n' "${OPENCODE_CONFIG_DIR:-(unset)}" \
+  >> "${AW_TEST_TMP:?}/called-opencode.log"
 echo "stub opencode done"
 STUB
 cat > "$TMP/stubs/curl" << 'STUB'
@@ -103,6 +108,10 @@ WTP="$TMP/wt-profiled"        # profiled worktree root
 export LOOM_ENV="$TMP/empty.env"          # never source the developer's real keys
 export CODEX_HOME="$TMP/codex"
 export XDG_CACHE_HOME="$TMP/cache"
+# The operator task state lives under $XDG_CONFIG_HOME, so it is redirected
+# into the sandbox: a test run must never write to the developer's real
+# ~/.config/loom, and must never read a record from it either.
+export XDG_CONFIG_HOME="$TMP/config"
 export LOOM_TIER=standard
 unset ZHIPU_API_KEY ZAI_API_KEY DEEPSEEK_API_KEY MOONSHOT_API_KEY \
       CODEX_API_KEY OPENAI_API_KEY LOOM_SKIP AW_FENCE_PROFILE 2>/dev/null || true
@@ -110,10 +119,18 @@ unset ZHIPU_API_KEY ZAI_API_KEY DEEPSEEK_API_KEY MOONSHOT_API_KEY \
 # ------------------------------------------------------------ target repo
 mkdir -p "$REPO"/{core,ios,backend,docs/audits}/ "$REPO"/.agents/{tasks,plans,reviews} "$REPO"/.opencode/prompts
 cd "$REPO" || exit 1
+# Where `aw` keeps the OPERATOR RECORD for this repo: outside every repository
+# and outside the shared .git, keyed by the sha256 of the main checkout's real
+# path. Tests read it exactly the way `aw` does, so a change of layout shows up
+# here rather than silently passing.
+REPO_REAL="$(pwd -P)"
+STATE="$XDG_CONFIG_HOME/loom/repos/$(printf '%s' "$REPO_REAL" | python3 -c 'import hashlib,sys; sys.stdout.write(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
+state_of()    { printf '%s\n' "$STATE/tasks/$1"; }
+state_field() { sed -n "s/^$2=//p" "$STATE/tasks/$1" 2>/dev/null | head -1; }
 git init -q .
-# The trunk is `main` on purpose: $LOOM_BASE_REF (the ref every SECURITY BASE
-# is measured from) defaults to origin/main, else main, and this repo has no
-# remote. `git init -b main` needs git >= 2.28; this works everywhere.
+# The trunk is `main` on purpose: the round-4 cases move `refs/heads/main` and
+# `refs/remotes/origin/main` around to prove that neither is a security input
+# any more. `git init -b main` needs git >= 2.28; this works everywhere.
 git symbolic-ref HEAD refs/heads/main
 git config user.email test@example.invalid
 git config user.name  "fence test"
@@ -172,7 +189,11 @@ mk_task() { # mk_task <id> [<profile-line>]
 }
 for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p \
          0014-u 0016-v 0017-w 0018-x 0019-y 0020-y2 0023-ae \
-         0024-ad 0025-ae2 0026-af 0027-ag 0028-ah 0029-ai 0030-aj; do mk_task "$t"; done
+         0024-ad 0025-ae2 0026-af 0027-ag 0028-ah 0029-ai 0030-aj \
+         0031-al 0032-am 0034-an 0035-an2 0036-ao 0037-ap 0038-ap2 0039-aq \
+         0041-ar2; do mk_task "$t"; done
+mk_task 0040-ar  codex
+mk_task 0042-as  codex
 mk_task 0005-f codex
 mk_task 0011-n codex
 # (o) a Fence-profile line that is NOT a declaration: it is inside a code fence,
@@ -242,8 +263,16 @@ want_eq   "(c) aw new under the profile succeeds"      "$rc" "0"
 want_file "(c) core/ is released into the worktree"    "$WTP/0003-c/core/lib.rs"
 want_file "(c) docs/audits/ is released"               "$WTP/0003-c/docs/audits/a.md"
 want_absent "(c) ios/ is still fenced"                 "$WTP/0003-c/ios/App.swift"
-want_eq   "(c) the profile is recorded on the branch"  \
-          "$(git config branch.agent/0003-c.fenceprofile)" "codex"
+want_eq   "(c) the profile is in the operator record" \
+          "$(state_field 0003-c profile)" "codex"
+want_eq   "(c) ... which lives outside the repo and outside .git" \
+          "$(state_of 0003-c)" "$STATE/tasks/0003-c"
+want_eq   "(c) ... and nothing was written to branch config" \
+          "$(git config branch.agent/0003-c.fenceprofile 2>/dev/null || true)" ""
+want_eq   "(c) ... nor a diff base" \
+          "$(git config branch.agent/0003-c.loombase 2>/dev/null || true)" ""
+want_eq   "(c) the recorded base is the operator's HEAD at aw new" \
+          "$(state_field 0003-c base)" "$(git rev-parse HEAD)"
 out="$("$AW" ls 2>&1)"
 want_in   "(c) aw ls shows the profile"                "$out" "fence-profile:codex"
 
@@ -330,8 +359,8 @@ want_absent "(e) ... under either root"                   "$WTP/0004-e"
 out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MODELS_reviewer="codex-sub" \
        "$AW" new 0005-f --fence-profile codex 2>&1)"; rc=$?
 want_eq   "(f) declaration + matching flag opts in"       "$rc" "0"
-want_eq   "(f) it is recorded on the branch"              \
-          "$(git config branch.agent/0005-f.fenceprofile)" "codex"
+want_eq   "(f) it is in the operator record"              \
+          "$(state_field 0005-f profile)" "codex"
 want_file "(f) the released path is present"              "$WTP/0005-f/core/lib.rs"
 want_absent "(f) the unreleased fenced path is not"       "$WTP/0005-f/ios/App.swift"
 # The same task, with a disallowed chain, must still die.
@@ -342,6 +371,11 @@ want_eq "(f) a later command re-checks the chain"         "$rc" "1"
 # The file states intent; only `aw new` reads it, and only with the flag. A
 # line added afterwards must neither release anything nor be honoured later.
 printf 'Fence-profile: codex\n' >> .agents/tasks/0001-a.md
+# One commit, because a branch with nothing past its branch point is refused on
+# its own terms now — see (an). This case is about the task file, not that.
+echo "benign" > "$WTU/0001-a/backend/g.txt"
+git -C "$WTU/0001-a" add backend/g.txt
+git -C "$WTU/0001-a" commit -qm "benign work"
 out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0001-a 2>&1)"; rc=$?
 want_eq "(g) a task file edited after aw new changes nothing" "$rc" "0"
 want_absent "(g) and releases nothing into the worktree"      "$WTU/0001-a/core/lib.rs"
@@ -383,7 +417,7 @@ out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MODELS_reviewer="codex-sub" \
        "$AW" new 0008-k --fence-profile codex 2>&1)"; rc=$?
 want_eq   "(k) setup: a profiled worktree exists"         "$rc" "0"
 want_file "(k) setup: it holds the released path"         "$WTP/0008-k/core/lib.rs"
-git config --unset branch.agent/0008-k.fenceprofile
+rm -f "$(state_of 0008-k)"                       # the record is lost
 out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0008-k 2>&1)"; rc=$?
 want_eq "(k) without the flag, a released tree is refused"   "$rc" "1"
 want_in "(k) ... naming the paths it found on disk"          "$out" "core/lib.rs"
@@ -393,17 +427,16 @@ want_eq "(k) with the flag and no record it STILL dies"       "$rc" "1"
 want_in "(k) ... the tree is not evidence"                    "$out" "is not evidence"
 want_not_in "(k) ... nothing is restored on the operator's behalf" "$out" "Restoring it"
 want_not_in "(k) ... and no reviewer was launched"            "$out" "running on"
-want_eq "(k) ... the record is still absent"                  \
-        "$(git config branch.agent/0008-k.fenceprofile 2>/dev/null || true)" ""
-want_in "(k) ... and it says how to restore it BY HAND"       "$out" \
-        "git config branch.agent/0008-k.fenceprofile codex"
-want_in "(k) ... or start clean"                              "$out" "aw drop 0008-k"
+want_absent "(k) ... the record is still absent"              "$(state_of 0008-k)"
+want_in "(k) ... and it says to re-create the task"           "$out" \
+        "aw drop 0008-k && aw new 0008-k --fence-profile codex"
+want_not_in "(k) ... never by hand-editing a record"          "$out" "git config"
 
 # --- (l) the record is SWAPPED to another legitimate profile --------------
 out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MODELS_reviewer="codex-sub" \
        "$AW" new 0009-l --fence-profile codex 2>&1)"; rc=$?
 want_eq "(l) setup: a codex worktree exists"              "$rc" "0"
-git config branch.agent/0009-l.fenceprofile audit
+sedi 's/^profile=.*/profile=audit/' "$(state_of 0009-l)"       # the record is swapped
 out="$(LOOM_MODELS_reviewer="claude-sub" "$AW" check 0009-l --fence-profile audit 2>&1)"; rc=$?
 want_eq "(l) the swapped profile does not release what is on disk" "$rc" "1"
 want_in "(l) ... and it names the path"                   "$out" "core/lib.rs"
@@ -411,19 +444,25 @@ out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0009-l --fence-profile codex
 want_eq "(l) the real profile now contradicts the swapped record" "$rc" "1"
 want_in "(l) ... and says so"                             "$out" "contradicts the record"
 
-# --- (m) an agent writes the branch record from inside its worktree -------
+# --- (m) an agent writes a branch record from inside its worktree --------
+# Branch config is shared .git state, so an agent can write it. It is no longer
+# read, in either direction: it cannot widen a task's fence, and it cannot
+# refuse an honest command either.
 out="$("$AW" new 0010-m 2>&1)"; rc=$?
 want_eq   "(m) setup: an UNPROFILED worktree"             "$rc" "0"
 want_absent "(m) setup: core/ is fenced out of it"        "$WTU/0010-m/core/lib.rs"
+echo "benign" > "$WTU/0010-m/backend/m.txt"
+git -C "$WTU/0010-m" add backend/m.txt
+git -C "$WTU/0010-m" commit -qm "benign work"
 git -C "$WTU/0010-m" config branch.agent/0010-m.fenceprofile codex   # the agent forges it
-out="$("$AW" run 0010-m 2>&1)"; rc=$?
-want_eq "(m) a forged record cannot authorise: no flag, no run" "$rc" "1"
-want_in "(m) ... it can only refuse"                      "$out" "--fence-profile codex"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0010-m 2>&1)"; rc=$?
+want_eq "(m) a forged branch record is not read at all"        "$rc" "0"
+want_not_in "(m) ... so it cannot demand a flag"               "$out" "--fence-profile codex"
+want_absent "(m) ... and nothing was released into the worktree" "$WTU/0010-m/core/lib.rs"
 out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MODELS_reviewer="codex-sub" \
        "$AW" run 0010-m --fence-profile codex 2>&1)"; rc=$?
 want_eq "(m) and the flag cannot introduce a profile either"   "$rc" "1"
-want_in "(m) ... the task already exists under the OTHER root" "$out" "already has a worktree at"
-want_in "(m) ... and says why that is refused"                 "$out" "cannot be introduced after"
+want_in "(m) ... no record, no run"                            "$out" "has no fence-profile record"
 want_absent "(m) nothing was released into the worktree"       "$WTU/0010-m/core/lib.rs"
 want_absent "(m) and no profiled worktree was built for it"    "$WTP/0010-m"
 
@@ -443,7 +482,7 @@ out="$("$AW" new 0012-o 2>&1)"; rc=$?
 want_eq   "(o) a fenced-off code block is ignored"        "$rc" "0"
 want_absent "(o) ... nothing was released"                "$WTU/0012-o/core/lib.rs"
 want_eq   "(o) ... and nothing was recorded"              \
-          "$(git config branch.agent/0012-o.fenceprofile 2>/dev/null || true)" ""
+          "$(state_field 0012-o profile)" ""
 
 # --- (p) .agents symlinked out of the worktree ----------------------------
 out="$("$AW" new 0013-p 2>&1)"; rc=$?
@@ -555,7 +594,6 @@ git -C "$VW" add core/lib.rs
 git -C "$VW" commit -qm "touch a fenced path"
 git -C "$VW" sparse-checkout init --no-cone                # ... and re-fences
 git -C "$VW" sparse-checkout set '/*' '!core/**' '!ios/**' '!docs/audits/**'
-git config --unset "branch.agent/0016-v.fenceprofile" 2>/dev/null || true
 want_absent "(v) setup: the tree no longer shows the fenced path" "$VW/core/lib.rs"
 rm -f "$VW/.agents/reviews/0016-v.patch"
 out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0016-v 2>&1)"; rc=$?
@@ -686,11 +724,9 @@ restore_zones
 out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MODELS_reviewer="codex-sub" \
        "$AW" run 0008-k --fence-profile codex 2>&1)"; rc=$?
 want_eq "(aa) with the record gone, aw run dies as well"  "$rc" "1"
-want_in "(aa) ... telling the operator to restore it BY HAND" "$out" \
-        "git config branch.agent/0008-k.fenceprofile codex"
-want_in "(aa) ... or to start clean"                      "$out" "aw new 0008-k --fence-profile codex"
-want_eq "(aa) ... and aw wrote no record on its own"      \
-        "$(git config branch.agent/0008-k.fenceprofile 2>/dev/null || true)" ""
+want_in "(aa) ... telling the operator to start clean"    "$out" \
+        "aw drop 0008-k && aw new 0008-k --fence-profile codex"
+want_absent "(aa) ... and aw wrote no record on its own"  "$(state_of 0008-k)"
 
 # --- (ab) a providers entry that can never be a provider_of() output -----
 cat >> .agents/zones.toml << 'TOML'
@@ -736,12 +772,12 @@ want_absent "(ac) ... and it released nothing"            "$WTU/0022-ad/core/lib
 # ==========================================================================
 
 # --- (ad) the diff base is not the agent's to choose ----------------------
-# branch.<br>.loombase lives in the SHARED .git/config, so anything running in
-# the worktree can rewrite it. Set to the branch's own HEAD it made `git diff
+# branch.<br>.loombase lived in the SHARED .git/config, so anything running in
+# the worktree could rewrite it. Set to the branch's own HEAD it made `git diff
 # <base> HEAD` empty, and every history check then answered "this branch
 # touches nothing" — `aw land` merged a fenced commit, `aw check` handed the
-# patch to a reviewer. The base is now merge-base($LOOM_BASE_REF, <branch>),
-# computed in YOUR checkout from refs you control.
+# patch to a reviewer. The base is now the OPERATOR RECORD, a file outside the
+# repo; the branch config below is not read at all, in either direction.
 taint() { # taint <task> <worktree>   materialise a fenced path, commit, re-fence
   git -C "$2" sparse-checkout disable
   echo "// smuggled by $1" >> "$2/core/lib.rs"
@@ -754,10 +790,12 @@ out="$("$AW" new 0024-ad 2>&1)"; rc=$?
 want_eq "(ad) setup: an unprofiled worktree"              "$rc" "0"
 ADW="$WTU/0024-ad"
 taint 0024-ad "$ADW"
-git config "branch.agent/0024-ad.loombase" "$(git -C "$ADW" rev-parse HEAD)"   # the agent
+git -C "$ADW" config "branch.agent/0024-ad.loombase" "$(git -C "$ADW" rev-parse HEAD)"  # the agent
 rm -f "$ADW/.agents/reviews/0024-ad.patch"
 out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0024-ad 2>&1)"; rc=$?
 want_eq "(ad) a loombase at HEAD does not empty the check" "$rc" "1"
+want_eq "(ad) ... and the recorded base is untouched by it" \
+        "$(state_field 0024-ad base)" "$(git rev-parse "agent/0024-ad~1")"
 want_in "(ad) ... the fenced path is still named"         "$out" "core/lib.rs"
 want_absent "(ad) ... and NO patch was written"           "$ADW/.agents/reviews/0024-ad.patch"
 want_not_in "(ad) ... and no reviewer was launched"       "$out" "running on"
@@ -773,7 +811,9 @@ want_eq "(ad) ... and nothing was merged"                 "$(git rev-parse HEAD)
 # --- (ae2) a loombase that does not resolve is a refusal, not an empty diff -
 # It used to be the cheapest attack in the file: `git config
 # branch.<br>.loombase 0000…` and history_paths returned 0 with no paths at
-# all, which reads downstream as "nothing fenced in this history".
+# all, which reads downstream as "nothing fenced in this history". The setting
+# is inert now — the base comes from the operator record — and the fenced path
+# is still caught, which is what this case asserts.
 out="$("$AW" new 0025-ae2 2>&1)"; rc=$?
 want_eq "(ae) setup: an unprofiled worktree"              "$rc" "0"
 AEW="$WTU/0025-ae2"
@@ -786,11 +826,11 @@ want_in "(ae) ... naming the fenced path, not a git error" "$out" "core/lib.rs"
 want_absent "(ae) ... and NO patch was written"           "$AEW/.agents/reviews/0025-ae2.patch"
 want_not_in "(ae) ... and no reviewer was launched"       "$out" "running on"
 
-# --- (af) a loombase moved FORWARD shrinks the review diff ----------------
-# The security base decides what the fence check sees; the loombase is kept
-# only because it is the nicer diff to READ. So it is clamped: ahead of the
-# security base it would hide commits from the reviewer, and the review diff
-# falls back to the security base, loudly.
+# --- (af) an agent cannot shrink the review diff --------------------------
+# The review patch used to be cut from the loombase (branch config) with a
+# clamp on top. There is no second base any more: the patch is cut from the
+# recorded base, so a `git config` that once hid a commit from the reviewer now
+# does nothing at all — and there is no clamp warning to read either.
 out="$("$AW" new 0026-af 2>&1)"; rc=$?
 want_eq "(af) setup: an unprofiled worktree"              "$rc" "0"
 AFW="$WTU/0026-af"
@@ -801,10 +841,11 @@ af_hide="$(git -C "$AFW" rev-parse HEAD)"
 echo "visible" > "$AFW/backend/af-visible.txt"
 git -C "$AFW" add backend/af-visible.txt
 git -C "$AFW" commit -qm "the commit it wants reviewed"
-git config "branch.agent/0026-af.loombase" "$af_hide"          # the agent
+git -C "$AFW" config "branch.agent/0026-af.loombase" "$af_hide"          # the agent
 out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0026-af 2>&1)"; rc=$?
 want_eq "(af) the check still succeeds"                   "$rc" "0"
-want_in "(af) ... but warns that the loombase is ahead"   "$out" "ahead of the"
+want_not_in "(af) ... with no clamp to warn about"        "$out" "ahead of the"
+want_not_in "(af) ... because branch config is not read"  "$out" "loombase"
 patch_af="$(cat "$AFW/.agents/reviews/0026-af.patch" 2>/dev/null || true)"
 want_in "(af) the review diff shows the hidden commit"    "$patch_af" "af-hidden.txt"
 want_in "(af) ... and the one it wanted reviewed"         "$patch_af" "af-visible.txt"
@@ -845,20 +886,15 @@ want_eq "(ai) loom.env cannot redirect the profiled root" "$rc" "1"
 want_in "(ai) ... because that root is DERIVED"           "$out" "DERIVED"
 want_absent "(ai) ... and nothing landed under the unprofiled root" "$TMP/wt6/nested"
 want_eq "(ai) ... and no branch was created"              "$(sha_of agent/0029-ai)" "GONE"
-# ... and the same for the base every history check is measured from: pointed
-# at the tainted branch's own tip, the merge-base would be that tip.
+# The base a history check is measured from is no longer a ref at all — it is
+# the operator record — so loom.env has nothing to point at. Asserted the only
+# way that fact can be asserted from here: a loom.env naming the tainted tip
+# changes nothing, and the fenced path is still caught.
 printf 'LOOM_BASE_REF=%s\n' "$(git -C "$WTU/0016-v" rev-parse HEAD)" > .agents/loom.env
 out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0016-v 2>&1)"; rc=$?
 rm -f .agents/loom.env
-want_eq "(ai) loom.env cannot move the security base"     "$rc" "1"
-want_in "(ai) ... it says the setting was ignored"        "$out" "LOOM_BASE_REF"
+want_eq "(ai) loom.env cannot move the base"              "$rc" "1"
 want_in "(ai) ... and the fenced path is still caught"    "$out" "core/lib.rs"
-# An operator-side base ref that does not resolve is a refusal, never an empty
-# answer: not knowing the base is not the same as knowing there is nothing.
-out="$(LOOM_BASE_REF="refs/heads/no-such-trunk" LOOM_MODELS_reviewer="codex-sub" \
-       "$AW" check 0003-c --fence-profile codex 2>&1)"; rc=$?
-want_eq "(ai) an unresolvable base ref dies"              "$rc" "1"
-want_in "(ai) ... naming it"                              "$out" "no-such-trunk"
 
 # --- (aj) an UNTRACKED file under a fenced path --------------------------
 # `git ls-files` answers the index, and `git show HEAD:core/lib.rs >
@@ -880,6 +916,273 @@ want_in "(aj) ... naming it"                              "$out" "core/copy.rs"
 want_eq "(aj) ... before the model was launched"          \
         "$(wc -l < "$TMP/called-claude.log" 2>/dev/null || echo 0)" "$claude_before"
 rm -rf "$AJW/core"
+
+# ==========================================================================
+# ROUND-4 fixes. Every case below FAILS against the pre-fix bin/aw (74118da).
+#
+# One theme: a linked worktree shares `.git` with the main checkout, so branch
+# CONFIG and REFS are both writable from inside an agent's worktree — and the
+# worktree's own HEAD is not the branch. None of the three can carry a security
+# input, so the base and the profile now live in an OPERATOR RECORD outside
+# every repo, and the history endpoint is the branch ref read in $ROOT.
+# ==========================================================================
+
+# --- (al) a detached worktree is not a state aw judges --------------------
+# `git checkout --detach HEAD~1` after a fenced commit: the tree, and every
+# check measured from the tree's HEAD, stop seeing the commit the BRANCH still
+# carries into the merge and into the review patch.
+out="$("$AW" new 0031-al 2>&1)"; rc=$?
+want_eq "(al) setup: an unprofiled worktree"              "$rc" "0"
+ALW="$WTU/0031-al"
+echo "benign" > "$ALW/backend/al.txt"
+git -C "$ALW" add backend/al.txt
+git -C "$ALW" commit -qm "benign work"
+taint 0031-al "$ALW"                       # ... and a fenced commit on top
+git -C "$ALW" checkout -q --detach HEAD~1  # the agent steps off the branch
+rm -f "$ALW/.agents/reviews/0031-al.patch"
+head_before="$(git rev-parse HEAD)"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0031-al 2>&1)"; rc=$?
+want_eq "(al) aw check refuses a detached worktree"       "$rc" "1"
+want_in "(al) ... naming the branch it is not on"         "$out" "is not on refs/heads/agent/0031-al"
+want_absent "(al) ... and NO patch was written"           "$ALW/.agents/reviews/0031-al.patch"
+want_not_in "(al) ... and no reviewer was launched"       "$out" "running on"
+out="$(EDITOR=true "$AW" diff 0031-al 2>&1)"; rc=$?
+want_eq "(al) aw diff refuses it too"                     "$rc" "1"
+want_in "(al) ... for the same reason"                    "$out" "is not on refs/heads/agent/0031-al"
+out="$("$AW" land 0031-al 2>&1)"; rc=$?
+want_eq "(al) aw land refuses it too"                     "$rc" "1"
+want_in "(al) ... for the same reason"                    "$out" "is not on refs/heads/agent/0031-al"
+want_eq "(al) ... and nothing was merged"                 "$(git rev-parse HEAD)" "$head_before"
+
+# --- (am) refs are writable from a worktree, so they are not the base -----
+# `.git/refs` is shared with the main checkout: one `git update-ref` inside the
+# agent's worktree moved origin/main (or main) to the branch's own tip, and a
+# base computed as merge-base(<trunk>, <branch>) collapsed to that tip.
+out="$("$AW" new 0032-am 2>&1)"; rc=$?
+want_eq "(am) setup: an unprofiled worktree"              "$rc" "0"
+AMW="$WTU/0032-am"
+taint 0032-am "$AMW"                                     # the fenced commit X
+am_x="$(git -C "$AMW" rev-parse HEAD)"
+echo "benign" > "$AMW/backend/am.txt"
+git -C "$AMW" add backend/am.txt
+git -C "$AMW" commit -qm "benign work on top"            # ... and a benign Y
+rm -f "$AMW/.agents/reviews/0032-am.patch"
+git -C "$AMW" update-ref refs/remotes/origin/main "$(git -C "$AMW" rev-parse HEAD)"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0032-am 2>&1)"; rc=$?
+want_eq "(am) a moved origin/main does not empty the check"  "$rc" "1"
+want_in "(am) ... the fenced path is still named"            "$out" "core/lib.rs"
+want_absent "(am) ... and NO patch was written"              "$AMW/.agents/reviews/0032-am.patch"
+want_not_in "(am) ... and no reviewer was launched"          "$out" "running on"
+# the PARTIAL move: the ref lands on the fenced commit, benign work on top
+git -C "$AMW" update-ref refs/remotes/origin/main "$am_x"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0032-am 2>&1)"; rc=$?
+want_eq "(am) nor does a partial move onto the fenced commit" "$rc" "1"
+want_in "(am) ... which is still named"                       "$out" "core/lib.rs"
+# ... and the same through refs/heads/main, restored immediately after
+am_main_before="$(git rev-parse refs/heads/main)"
+git -C "$AMW" update-ref refs/heads/main "$(git -C "$AMW" rev-parse HEAD)"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0032-am 2>&1)"; rc=$?
+git update-ref refs/heads/main "$am_main_before"
+want_eq "(am) a moved refs/heads/main does not either"        "$rc" "1"
+want_in "(am) ... and the fenced path is named"               "$out" "core/lib.rs"
+head_before="$(git rev-parse HEAD)"
+out="$("$AW" land 0032-am 2>&1)"; rc=$?
+want_eq "(am) aw land refuses the branch"                     "$rc" "1"
+want_eq "(am) ... and nothing was merged"                     "$(git rev-parse HEAD)" "$head_before"
+git update-ref -d refs/remotes/origin/main
+
+# --- (an) an empty range is not a review ---------------------------------
+out="$("$AW" new 0034-an 2>&1)"; rc=$?
+want_eq "(an) setup: a fresh worktree with no commits"    "$rc" "0"
+rm -f "$WTU/0034-an/.agents/reviews/0034-an.patch"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0034-an 2>&1)"; rc=$?
+want_eq "(an) a branch with no commits is not a silent empty review" "$rc" "1"
+want_in "(an) ... it says there is nothing to review"     "$out" "nothing to review/land"
+want_absent "(an) ... and NO patch was written"           "$WTU/0034-an/.agents/reviews/0034-an.patch"
+want_not_in "(an) ... and no reviewer was launched"       "$out" "running on"
+head_before="$(git rev-parse HEAD)"
+out="$("$AW" land 0034-an 2>&1)"; rc=$?
+want_eq "(an) aw land says the same"                      "$rc" "1"
+want_in "(an) ... in the same words"                      "$out" "nothing to review/land"
+want_eq "(an) ... and merged nothing"                     "$(git rev-parse HEAD)" "$head_before"
+# ... and a branch moved BEHIND its recorded base is refused as not-an-ancestor
+an_prev="$(git rev-parse HEAD)"
+echo "operator" > backend/an-main.txt
+git add backend/an-main.txt
+git commit -qm "an operator commit on main"
+out="$("$AW" new 0035-an2 2>&1)"; rc=$?
+want_eq "(an) setup: a task cut from the new main"        "$rc" "0"
+git -C "$WTU/0035-an2" update-ref refs/heads/agent/0035-an2 "$an_prev"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0035-an2 2>&1)"; rc=$?
+want_eq "(an) a branch that left its recorded base dies"  "$rc" "1"
+want_in "(an) ... saying the base is not an ancestor"     "$out" "is not an
+ancestor of agent/0035-an2"
+want_not_in "(an) ... and no reviewer was launched"       "$out" "running on"
+
+# --- (ao) opencode never reads the worktree's project config -------------
+# The disable is UNCONDITIONAL: a repo with no operator config of its own is
+# exactly the repo where the worktree's copy would otherwise be the only one.
+rm -f "$TMP/called-opencode.log"
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_implementer="deepseek/deepseek-v4-pro" \
+       LOOM_MAX_ATTEMPTS=1 "$AW" run 0036-ao 2>&1)"; rc=$?
+want_eq "(ao) setup: an opencode implementer runs"        "$rc" "0"
+oc="$(cat "$TMP/called-opencode.log" 2>/dev/null || true)"
+want_in "(ao) implementer: the operator's config"         "$oc" "OPENCODE_CONFIG=$REPO/.opencode/opencode.json"
+want_in "(ao) implementer: the project's config OFF"      "$oc" "OPENCODE_DISABLE_PROJECT_CONFIG=1"
+want_in "(ao) implementer: the operator's config dir"     "$oc" "OPENCODE_CONFIG_DIR=$REPO/.opencode"
+rm -f "$TMP/called-opencode.log"
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_reviewer="deepseek/deepseek-v4-flash" \
+       "$AW" check 0036-ao 2>&1)"; rc=$?
+want_eq "(ao) setup: an opencode reviewer runs"           "$rc" "0"
+oc="$(cat "$TMP/called-opencode.log" 2>/dev/null || true)"
+want_in "(ao) reviewer: the operator's config"            "$oc" "OPENCODE_CONFIG=$REPO/.opencode/opencode.json"
+want_in "(ao) reviewer: the project's config OFF"         "$oc" "OPENCODE_DISABLE_PROJECT_CONFIG=1"
+rm -f "$TMP/called-opencode.log"
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
+       "$AW" scout "where is main" 2>&1)"; rc=$?
+oc="$(cat "$TMP/called-opencode.log" 2>/dev/null || true)"
+want_in "(ao) scout: the operator's config"               "$oc" "OPENCODE_CONFIG=$REPO/.opencode/opencode.json"
+want_in "(ao) scout: the project's config OFF"            "$oc" "OPENCODE_DISABLE_PROJECT_CONFIG=1"
+rm -f "$TMP/called-opencode.log"
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_architect="deepseek/deepseek-v4-flash" \
+       "$AW" plan -p "a topic" 2>&1)"; rc=$?
+oc="$(cat "$TMP/called-opencode.log" 2>/dev/null || true)"
+want_in "(ao) architect: the operator's config"           "$oc" "OPENCODE_CONFIG=$REPO/.opencode/opencode.json"
+want_in "(ao) architect: the project's config OFF"        "$oc" "OPENCODE_DISABLE_PROJECT_CONFIG=1"
+# ... and a repo with NO operator config still turns the project's config off.
+REPO2="$TMP/repo2"
+mkdir -p "$REPO2"/.agents/tasks "$REPO2"/.agents/reviews "$REPO2"/backend
+(
+  cd "$REPO2" || exit 1
+  git init -q .
+  git symbolic-ref HEAD refs/heads/main
+  git config user.email test@example.invalid
+  git config user.name  "fence test"
+  echo "package main" > backend/main.go
+  : > .agents/reviews/.gitkeep
+  printf '#!/usr/bin/env bash\nexit 0\n' > .agents/gate.sh
+  chmod +x .agents/gate.sh
+  { echo "# 0001-ao2 — test task"; echo ""; echo "Plan: none"; echo "Zone: assist"; } \
+    > .agents/tasks/0001-ao2.md
+  git add -A
+  git commit -qm init
+)
+want_absent "(ao) setup: repo2 has no operator opencode config" "$REPO2/.opencode/opencode.json"
+rm -f "$TMP/called-opencode.log"
+out="$(cd "$REPO2" && LOOM_WORKTREES="$TMP/wt-r2" DEEPSEEK_API_KEY=stub \
+       LOOM_MODELS_implementer="deepseek/deepseek-v4-pro" LOOM_MAX_ATTEMPTS=1 \
+       "$AW" run 0001-ao2 2>&1)"; rc=$?
+want_eq "(ao) a repo with no operator config still runs"  "$rc" "0"
+oc2="$(cat "$TMP/called-opencode.log" 2>/dev/null || true)"
+want_in "(ao) ... and the project's config is STILL off"  "$oc2" "OPENCODE_DISABLE_PROJECT_CONFIG=1"
+want_in "(ao) ... with no config named"                   "$oc2" "OPENCODE_CONFIG=(unset)"
+want_in "(ao) ... and no config dir named"                "$oc2" "OPENCODE_CONFIG_DIR=(unset)"
+
+# --- (ap) a failed `aw new` leaves no orphan branch ----------------------
+# `git worktree add -b` creates the branch and THEN fails on the path, so a run
+# that never got as far as "the branch is mine" still left agent/<task> behind
+# — and the task id was then unusable forever.
+ln -s "$TMP/no-such-target" "$WTU/0037-ap"        # a path git cannot create
+out="$("$AW" new 0037-ap 2>&1)"; rc=$?
+want_fail   "(ap) aw new fails on a path it cannot create" "$rc"
+want_eq     "(ap) ... and leaves NO orphan branch"         "$(sha_of agent/0037-ap)" "GONE"
+want_absent "(ap) ... and no operator record"              "$(state_of 0037-ap)"
+rm -f "$WTU/0037-ap"
+# ... and the branch it must never delete is one it did not create.
+out="$("$AW" new 0038-ap2 2>&1)"; rc=$?
+want_eq "(ap) setup: a worktree with work on its branch"   "$rc" "0"
+echo "work" > "$WTU/0038-ap2/backend/ap2.txt"
+git -C "$WTU/0038-ap2" add backend/ap2.txt
+git -C "$WTU/0038-ap2" commit -qm "work that only exists on this branch"
+ap2_sha="$(sha_of agent/0038-ap2)"
+out="$("$AW" drop 0038-ap2 --keep-branch 2>&1)"; rc=$?
+want_eq "(ap) setup: worktree dropped, branch kept"        "$rc" "0"
+ln -s "$TMP/no-such-target" "$WTU/0038-ap2"
+out="$("$AW" new 0038-ap2 2>&1)"; rc=$?
+want_fail "(ap) aw new refuses a pre-existing branch"      "$rc"
+want_eq "(ap) ... and never deletes it"                    "$(sha_of agent/0038-ap2)" "$ap2_sha"
+rm -f "$WTU/0038-ap2"
+git branch -D agent/0038-ap2 > /dev/null 2>&1 || true
+
+# --- (aq) the operator's own unpushed commits are not the task's ---------
+# A base derived from origin/main counted an operator commit that had not been
+# pushed as part of the branch, and refused a task that never touched it.
+git update-ref refs/remotes/origin/main "$(git rev-parse HEAD)"
+echo "// the operator's own work" >> core/lib.rs
+git add core/lib.rs
+git commit -qm "operator work on a fenced path, not pushed yet"
+out="$("$AW" new 0039-aq 2>&1)"; rc=$?
+want_eq "(aq) setup: a benign task cut from that main"    "$rc" "0"
+AQW="$WTU/0039-aq"
+echo "benign" > "$AQW/backend/aq.txt"
+git -C "$AQW" add backend/aq.txt
+git -C "$AQW" commit -qm "benign work"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0039-aq 2>&1)"; rc=$?
+want_eq "(aq) the operator's fenced commit is not the task's" "$rc" "0"
+want_not_in "(aq) ... so nothing is refused"              "$out" "commits touch fenced paths"
+patch_aq="$(cat "$AQW/.agents/reviews/0039-aq.patch" 2>/dev/null || true)"
+want_in "(aq) the review patch holds the task's own work" "$patch_aq" "backend/aq.txt"
+want_not_in "(aq) ... and not the operator's"             "$patch_aq" "core/lib.rs"
+head_before="$(git rev-parse HEAD)"
+out="$("$AW" land 0039-aq 2>&1)"; rc=$?
+want_eq "(aq) ... and the task lands"                     "$rc" "0"
+want_ne "(aq) ... the merge really happened"              "$(git rev-parse HEAD)" "$head_before"
+git update-ref -d refs/remotes/origin/main
+
+# --- (ar) the profile record is the operator's file, not branch config ---
+out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MODELS_reviewer="codex-sub" \
+       "$AW" run 0040-ar --fence-profile codex 2>&1)"; rc=$?
+want_eq   "(ar) setup: a profiled task with a commit"     "$rc" "0"
+want_file "(ar) the operator record exists"               "$(state_of 0040-ar)"
+want_eq   "(ar) ... and carries the profile"              "$(state_field 0040-ar profile)" "codex"
+want_eq   "(ar) ... and the branch"                       "$(state_field 0040-ar branch)" "agent/0040-ar"
+# the agent plants a branch record. It is not read in either direction: it can
+# neither widen the fence nor refuse an honest command.
+git -C "$WTP/0040-ar" config branch.agent/0040-ar.fenceprofile audit
+out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0040-ar --fence-profile codex 2>&1)"; rc=$?
+want_eq "(ar) a planted branch record has no effect"      "$rc" "0"
+want_not_in "(ar) ... it is not read at all"              "$out" "contradicts"
+# the record itself, removed: the flag alone still cannot introduce a profile
+rm -f "$(state_of 0040-ar)"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0040-ar --fence-profile codex 2>&1)"; rc=$?
+want_eq "(ar) with the record gone the flag is refused"   "$rc" "1"
+want_in "(ar) ... with the recreate instruction"          "$out" \
+        "aw drop 0040-ar && aw new 0040-ar --fence-profile codex"
+want_not_in "(ar) ... and no git-config incantation"      "$out" "git config"
+want_not_in "(ar) ... the planted branch record is still not read" "$out" "contradicts"
+# ... and `aw drop` takes the record with it, --keep-branch or not
+out="$("$AW" new 0041-ar2 2>&1)"; rc=$?
+want_eq   "(ar) setup: an unprofiled task"                "$rc" "0"
+want_file "(ar) ... with a record"                        "$(state_of 0041-ar2)"
+out="$("$AW" drop 0041-ar2 --keep-branch 2>&1)"; rc=$?
+want_eq     "(ar) aw drop --keep-branch succeeds"         "$rc" "0"
+want_absent "(ar) ... and removes the operator record"    "$(state_of 0041-ar2)"
+want_in     "(ar) ... and says so"                        "$out" "operator record"
+git branch -D agent/0041-ar2 > /dev/null 2>&1 || true
+
+# --- (as) aw rebase re-points the recorded base --------------------------
+out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MODELS_reviewer="codex-sub" \
+       "$AW" run 0042-as --fence-profile codex 2>&1)"; rc=$?
+want_eq "(as) setup: a profiled task with a commit"       "$rc" "0"
+as_base_before="$(state_field 0042-as base)"
+echo "later" > backend/as-main.txt
+git add backend/as-main.txt
+git commit -qm "main moves on"
+out="$("$AW" rebase 0042-as main --fence-profile codex 2>&1)"; rc=$?
+want_eq "(as) aw rebase succeeds"                         "$rc" "0"
+want_in "(as) ... and says it re-pointed the base"        "$out" "rebased onto main; base"
+want_eq "(as) the recorded base is now main's tip"        "$(state_field 0042-as base)" "$(git rev-parse HEAD)"
+want_ne "(as) ... which is not where it started"          "$(state_field 0042-as base)" "$as_base_before"
+want_eq "(as) ... and the profile survived the re-point"  "$(state_field 0042-as profile)" "codex"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$AW" check 0042-as --fence-profile codex 2>&1)"; rc=$?
+want_eq "(as) a profiled task still checks afterwards"    "$rc" "0"
+patch_as="$(cat "$WTP/0042-as/.agents/reviews/0042-as.patch" 2>/dev/null || true)"
+want_in     "(as) ... the patch is the task's own work"   "$patch_as" "from-implementer.txt"
+want_not_in "(as) ... not what main merged since"         "$patch_as" "as-main.txt"
+head_before="$(git rev-parse HEAD)"
+out="$("$AW" land 0042-as --fence-profile codex 2>&1)"; rc=$?
+want_eq "(as) ... and it lands"                           "$rc" "0"
+want_ne "(as) ... the merge really happened"              "$(git rev-parse HEAD)" "$head_before"
 
 # --- (j)/(t) doctor lists the profiles, and touches no network ------------
 out="$(timeout 180 "$AW" doctor 2>&1 || true)"
