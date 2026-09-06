@@ -999,16 +999,21 @@ def include_of(rec):
         return (path, digest, None)
     return (path, digest, v)
 
-def include_programs(raw_text):
+def include_programs(esc_text):
     """program_key hits inside an included file's OWN bytes, read with git's
     own parser. `--list` shows an include as a POINTER and never the keys it
     brings, so without this a `core.hooksPath` one directive away from
-    .git/config is pinned in full and named nowhere."""
+    .git/config is pinned in full and named nowhere.
+
+    The argument is the record's value half, i.e. the bytes AS STORED, which
+    is to say escaped — one line, printable. It is unescaped here, because
+    what git has to be handed is the file git itself read; the escaped form is
+    a single line of literal backslash-n and parses as nothing."""
     hits = []
     fd, tmp = tempfile.mkstemp(prefix="loom-inc.")
     try:
         with os.fdopen(fd, "wb") as fh:
-            fh.write(raw_text.encode("utf-8", "surrogateescape"))
+            fh.write(unesc(esc_text).encode("utf-8", "surrogateescape"))
         recs = file_records(tmp)
     finally:
         try:

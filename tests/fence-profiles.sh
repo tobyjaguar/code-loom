@@ -2417,6 +2417,26 @@ want_eq     "(bn) setup: the include really is live"      "$(git config --get co
 want_in     "(bn) ... while the local listing still shows only the pointer" \
             "$(git config --local --list)" "include.path=$TMP/bn/inc.cfg"
 want_not_in "(bn) ... and names no hooksPath of its own"  "$(git config --local --list)" "hookspath"
+# ... and the keys BEHIND the pointer are named at the moment they are adopted.
+# `--list` shows an include as a pointer and never what it brings, so a
+# core.hooksPath one directive away from .git/config was pinned in full and
+# named nowhere.
+out="$("$LOOM" pin-config --accept-config 2>&1)"; rc=$?
+want_eq "(bn) pin-config re-records the closure"          "$rc" "0"
+want_in "(bn) ... naming the keys INSIDE the included file" \
+        "$out" "[include:$TMP/bn/inc.cfg] core.hookspath=$TMP/bn-hooks"
+# An include target is a config file, so a big one is either a mistake or a way
+# to bloat the sidecar and drown a refusal in it. Past 64 KiB the bytes are not
+# stored; the digest, which is what the change check runs on, still is.
+cp "$TMP/bn/inc.cfg" "$TMP/bn/inc.cfg.small"
+python3 -c 'import sys; sys.stdout.write("# " + "x"*70000 + "\n")' >> "$TMP/bn/inc.cfg"
+out="$("$LOOM" pin-config --accept-config 2>&1)"; rc=$?
+want_eq "(bn) ... an include target over the cap is still pinned" "$rc" "0"
+want_in "(bn) ... by digest and size rather than by content"      "$out" "over the 65536-byte cap"
+want_eq "(bn) ... so the sidecar does not grow with it" \
+        "$([ "$(wc -c < "$STATE/config.gitconfig")" -lt 65536 ] && echo small || echo BIG)" "small"
+mv "$TMP/bn/inc.cfg.small" "$TMP/bn/inc.cfg"
+"$LOOM" pin-config --accept-config > /dev/null 2>&1
 bn_claude_before="$(wc -l < "$TMP/called-claude.log" 2>/dev/null || echo 0)"
 out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 "$LOOM" run 0073-bn 2>&1)"; rc=$?
 want_eq     "(bn) loom run refuses an edit to the INCLUDED file" "$rc" "1"
