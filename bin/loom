@@ -489,6 +489,16 @@ STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/loom/repos/$STATE_KEY"
 state_file() { # state_file <task>  -> the path of that task's record
   case "$1" in
     ""|.|..|*/*) die "'$1' is not a usable task id (no '/', '.' or '..')" ;;
+    # A LEADING UNDERSCORE is reserved for the directories loom keeps beside
+    # the tasks under $LOOM_WORKTREES, and `_scout` is the one that exists: the
+    # shared scout mirror. `loom new _scout` would build a task worktree on top
+    # of it — same path, same branch machinery — and every later `loom scout`
+    # would then reset, clean and re-fence the task's tree from under it. The
+    # id is refused rather than special-cased, because the next such directory
+    # should not need a second refusal written for it.
+    _*) die "'$1' is not a usable task id: ids beginning with '_' are reserved for
+loom's own directories under \$LOOM_WORKTREES — '_scout' is the shared scout
+mirror, which every 'loom scout' cleans and resets. Rename the task." ;;
     # The pinned git config lives beside the record as `<task>.gitconfig`, and
     # the authoritative review artifacts as `<task>.artifacts/`, so a task
     # literally called `x.gitconfig` (or `x.artifacts`) would have its record
@@ -3933,6 +3943,14 @@ cmd_new() {
     esac
   done
   [ -n "$task" ] || die "usage: loom new <task-id> [--fence-profile <name>]"
+  # The id has to be one an operator record can be written for, and that is
+  # asked BEFORE anything is created: `state_file` is the one place that knows
+  # which ids are reserved (a leading `_`, and the sidecar suffixes), and every
+  # other caller reaches it inside a `$( )` where its refusal would come back
+  # as an empty string. Here it is a plain statement, so the die is this
+  # command's own — and it happens before the worktree, the branch and the
+  # record.
+  state_file "$task" > /dev/null
   # `loom new` RECORDS the config; there is nothing yet to accept. Silently
   # swallowing the flag here would read as "the config was re-pinned", which is
   # the one thing it must not read as.
