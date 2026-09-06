@@ -2078,9 +2078,20 @@ replaced the root itself with a symlink. Inspect it, do not re-run."
 # Captured AFTER both env files have been sourced, because .agents/loom.env is
 # exactly the place a preset would come from: it is a file in the tree an agent
 # writes, and it is `.`-sourced (KNOWN-GAPS 3).
+#
+# THE STRING is built here; the VERDICT is not. Everything below this line is
+# pure text — the default, the trailing-slash normalisation — and it cannot
+# fail. The checks that can (absolute? resolves to itself? inside the repo?
+# inside each other?) moved into `require_roots`, which the commands that
+# actually touch a root call, because at file scope they ran for EVERY command:
+# with LOOM_WORKTREES a symlink (an ordinary macOS layout), relative, or inside
+# the repo, `loom help`, `loom zone`, `loom tier`, `loom doctor` and — the one
+# that hurt — `loom guard` all died, and with the hook installed `loom guard`
+# dying means the OPERATOR'S OWN `git commit` on `main` fails. A root that
+# cannot be verified is a reason to refuse to put a worktree in it, not a
+# reason to break the commands that never go near one.
 WT_ROOT_PRESET="${WT_ROOT_PROFILED:-}"
 WT_ROOT="${LOOM_WORKTREES:-$(dirname "$ROOT")/.loom-worktrees/$(basename "$ROOT")}"
-case "$WT_ROOT" in /*) ;; *) die "LOOM_WORKTREES must be an absolute path (got '$WT_ROOT')" ;; esac
 while :; do
   case "$WT_ROOT" in
     /|"") break ;;
@@ -2089,39 +2100,60 @@ while :; do
     *)    break ;;
   esac
 done
-[ -n "$WT_ROOT" ] && [ "$WT_ROOT" != / ] \
-  || die "LOOM_WORKTREES normalises to '$WT_ROOT', which is not a usable worktree root"
-WT_ROOT="$(resolve_root "$WT_ROOT")"
+# Derived from the normalised string, so that a command which never calls
+# `require_roots` still has a defined (if unverified) value under `set -u`.
+# `require_roots` re-derives it from the RESOLVED root, which is the value
+# anything that creates or judges a worktree gets.
 WT_ROOT_PROFILED="${WT_ROOT}-profiled"
-if [ -n "$WT_ROOT_PRESET" ] && [ "$WT_ROOT_PRESET" != "$WT_ROOT_PROFILED" ]; then
-  die "WT_ROOT_PROFILED is preset to '$WT_ROOT_PRESET', but it is DERIVED from
+
+# Idempotent, and the only place the roots are pronounced fit to use. Called at
+# the top of every function that puts a worktree under a root, reads one, or
+# names one to git: wt_path, root_of_wt, assert_wt_parent, refuse_cross_root
+# and the commands themselves. NEVER called by `help`, `zone`, `tier`, `guard`,
+# `install-hooks`, `plan` or `pin-config` — none of them touches a root, and
+# `guard` runs from the operator's pre-commit hook. `doctor` calls it in a
+# subshell and REPORTS what it says as one FAIL line, because a diagnostic that
+# dies on the first bad thing it finds is not a diagnostic.
+ROOTS_OK=""
+require_roots() {
+  [ -z "$ROOTS_OK" ] || return 0
+  case "$WT_ROOT" in /*) ;; *) die "LOOM_WORKTREES must be an absolute path (got '$WT_ROOT')" ;; esac
+  [ -n "$WT_ROOT" ] && [ "$WT_ROOT" != / ] \
+    || die "LOOM_WORKTREES normalises to '$WT_ROOT', which is not a usable worktree root"
+  WT_ROOT="$(resolve_root "$WT_ROOT")"
+  WT_ROOT_PROFILED="${WT_ROOT}-profiled"
+  if [ -n "$WT_ROOT_PRESET" ] && [ "$WT_ROOT_PRESET" != "$WT_ROOT_PROFILED" ]; then
+    die "WT_ROOT_PROFILED is preset to '$WT_ROOT_PRESET', but it is DERIVED from
 LOOM_WORKTREES and must be '$WT_ROOT_PROFILED'. A profiled worktree holds paths
 the fence normally removes; where it lands is not something the environment or
 .agents/loom.env gets to redirect. Unset it, or set LOOM_WORKTREES instead."
-fi
-WT_ROOT_PROFILED="$(resolve_root "$WT_ROOT_PROFILED")"
-# Neither root may contain the other, and neither may sit inside the repo: a
-# released path under $ROOT is in YOUR checkout, and a profiled worktree under
-# $WT_ROOT is exactly what the split root exists to prevent.
-case "$WT_ROOT_PROFILED" in
-  "$WT_ROOT"|"$WT_ROOT"/*) die "the profiled worktree root $WT_ROOT_PROFILED is inside $WT_ROOT" ;;
-esac
-case "$WT_ROOT" in
-  "$WT_ROOT_PROFILED"|"$WT_ROOT_PROFILED"/*) die "the worktree root $WT_ROOT is inside $WT_ROOT_PROFILED" ;;
-esac
-for _r in "$WT_ROOT" "$WT_ROOT_PROFILED"; do
-  case "$_r" in
-    "$ROOT_REAL"|"$ROOT_REAL"/*) die "worktree root $_r is inside the repository $ROOT_REAL — \
-agent worktrees must live outside your checkout (set LOOM_WORKTREES)" ;;
+  fi
+  WT_ROOT_PROFILED="$(resolve_root "$WT_ROOT_PROFILED")"
+  # Neither root may contain the other, and neither may sit inside the repo: a
+  # released path under $ROOT is in YOUR checkout, and a profiled worktree under
+  # $WT_ROOT is exactly what the split root exists to prevent.
+  case "$WT_ROOT_PROFILED" in
+    "$WT_ROOT"|"$WT_ROOT"/*) die "the profiled worktree root $WT_ROOT_PROFILED is inside $WT_ROOT" ;;
   esac
-done
-unset _r
+  case "$WT_ROOT" in
+    "$WT_ROOT_PROFILED"|"$WT_ROOT_PROFILED"/*) die "the worktree root $WT_ROOT is inside $WT_ROOT_PROFILED" ;;
+  esac
+  local r
+  for r in "$WT_ROOT" "$WT_ROOT_PROFILED"; do
+    case "$r" in
+      "$ROOT_REAL"|"$ROOT_REAL"/*) die "worktree root $r is inside the repository $ROOT_REAL — \
+agent worktrees must live outside your checkout (set LOOM_WORKTREES)" ;;
+    esac
+  done
+  ROOTS_OK=yes
+}
 
 # Every `git worktree add` in this file is bracketed by these two. The roots
 # were verified at startup, but a directory is not a promise: the parent of the
 # path about to be created is re-resolved immediately before the add, and the
 # created worktree immediately after.
 assert_wt_parent() { # assert_wt_parent <worktree-path> <expected-root>
+  require_roots
   local wt="$1" want="$2" got
   got="$(cd "$(dirname "$wt")" 2>/dev/null && pwd -P)" \
     || die "cannot resolve $(dirname "$wt") — refusing to create a worktree there"
@@ -2230,6 +2262,7 @@ this one's. Nothing is done to it automatically:
 # Which root a given worktree path belongs to. Used to name the root an add is
 # expected to land under, without re-deriving it from the path being checked.
 root_of_wt() { # root_of_wt <worktree-path>
+  require_roots
   case "$1" in
     "$WT_ROOT_PROFILED"/*) printf '%s\n' "$WT_ROOT_PROFILED" ;;
     "$WT_ROOT"/*)          printf '%s\n' "$WT_ROOT" ;;
@@ -3713,6 +3746,7 @@ it, do not re-run."
 # Which root a command means follows the profile the OPERATOR asserted on that
 # command line — never a record.
 wt_path() { # wt_path <task>
+  require_roots
   local task="$1"
   if [ -n "${FLAG_PROFILE}${FENCE_PROFILE}" ]; then echo "$WT_ROOT_PROFILED/$task"; return 0; fi
   # No flag on this command line. Prefer an existing PROFILED worktree so that
@@ -3735,6 +3769,7 @@ wt_path_other() { # wt_path_other <task>
 }
 
 refuse_cross_root() { # refuse_cross_root <task>
+  require_roots
   local task="$1" other; other="$(wt_path_other "$task")"
   [ -d "$other" ] || return 0
   die "task $task already has a worktree at $other, built under a different fence
@@ -4231,6 +4266,7 @@ new_abort() {
 }
 
 cmd_new() {
+  require_roots
   local task="" prof="" decl a
   scan_fence_flag "$@"
   prof="$FLAG_PROFILE"
@@ -4400,6 +4436,7 @@ fenced paths into this worktree. Confirm it on the command line:
 }
 
 cmd_run() {
+  require_roots
   scan_fence_flag "$@"
   local task="${FLAG_ARGS[0]:?usage: loom run <task-id> [--fence-profile <name>]}"
   local wt br attempt=1 gate_note="" title fnote pnote rdir gatetmp gatelog gate_rc
@@ -4513,6 +4550,7 @@ $(tail -40 "$gatelog" 2>/dev/null)"
 }
 
 cmd_check() {
+  require_roots
   scan_fence_flag "$@"
   local task="${FLAG_ARGS[0]:?usage: loom check <task-id> [--fence-profile <name>]}"
   local wt base review log rdir patchtmp pnote=""
@@ -4593,6 +4631,7 @@ and end with a final line 'VERDICT: APPROVE' or 'VERDICT: REVISE — <reason>'.$
 # The REVISE text is appended to the task file INSIDE the worktree: the copy
 # the implementer reads, and never your tree.
 cmd_loop() {
+  require_roots
   scan_fence_flag "$@"
   local task="${FLAG_ARGS[0]:?usage: loom loop <task-id> [--fence-profile <name>]}"
   local rounds="${LOOM_LOOP_ROUNDS:-2}"
@@ -4724,6 +4763,7 @@ text to it, so a link both answers with, and writes into, a file somewhere else.
 # takes --fence-profile on the same terms as every other task command: the
 # history is judged before the patch is written, not after.
 cmd_diff() {
+  require_roots
   scan_fence_flag "$@"
   local task="${FLAG_ARGS[0]:?usage: loom diff <task-id> [--fence-profile <name>]}"
   local wt base patch rdir patchtmp
@@ -4782,6 +4822,7 @@ cmd_diff() {
 }
 
 cmd_land() {
+  require_roots
   local task="" force="" mode="${LOOM_LAND:-merge}" a
   local wt br base plan title
   scan_fence_flag "$@"
@@ -4969,6 +5010,7 @@ cmd_rebase() { # rebase agent/<task> onto origin/main and re-point its base
   # old_base..new_base needs the operator's word, whatever it contains; the
   # fenced and hand-zone hits are still named first, because they are the ones
   # that ought to stop a reader.
+  require_roots
   scan_fence_flag "$@"
   local task="" upstream="" accept="" a
   local wt br old_base old_pid new_base mb c dirty bad_f bad_h
@@ -5223,6 +5265,7 @@ or throw the task away:  loom drop $task"
 }
 
 cmd_drop() {
+  require_roots
   local task="" keep="" a rem=""
   local wt br
   for a in "$@"; do
@@ -5391,6 +5434,7 @@ your session. Then re-record it deliberately:
 # — a reminder of the flag every command for that task needs, not a claim about
 # what is on disk (`loom run` reconciles the tree; the record only ever refuses).
 cmd_ls() {
+  require_roots
   local line br t prof bad found=""
   while IFS= read -r line; do
     [ -n "$line" ] || continue
@@ -5526,6 +5570,7 @@ or remove the mirror entirely and let the next scout rebuild it:
 }
 
 scout_root() {
+  require_roots
   local wt="$WT_ROOT/_scout" head
   # BEFORE the mirror is touched at all, and before the `has_fence` shortcut,
   # because both legs end in a model launch. `fence_apply` -> `sparse-checkout
@@ -5677,6 +5722,19 @@ cmd_doctor() {
   fi
 
   echo "project"
+  # The worktree roots, REPORTED rather than died on. Every other command that
+  # touches a root calls `require_roots` and dies there; doctor is the machine's
+  # acceptance test, so a root it cannot verify has to be one FAIL line in a
+  # report that still finishes — and its exit code is what people script
+  # against. Run in a subshell so the `die` inside is caught, then re-run in
+  # this shell when it passed, so the resolved values are the ones printed.
+  local rootmsg
+  if rootmsg="$( require_roots 2>&1 )"; then
+    require_roots
+    pass "worktree roots: $WT_ROOT (profiled: $WT_ROOT_PROFILED)"
+  else
+    fail "worktree root: $(printf '%s' "${rootmsg#loom: }" | tr '\n' ' ')"
+  fi
   [ -x "$AGENTS_DIR/gate.sh" ] && pass ".agents/gate.sh executable" || fail ".agents/gate.sh missing or not executable"
   if [ -f "$AGENTS_DIR/zones.toml" ]; then
     local nfence orphan odd fpaths perr

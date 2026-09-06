@@ -248,7 +248,7 @@ for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p \
          0078-br 0079-br2 0080-bs 0081-bs2 0083-bs3 \
          0084-bu 0085-bu2 0086-bu3 0087-bu4 0088-bu5 0089-bu6 0090-bu7 \
          0091-bw 0093-bx 0094-by 0095-bz 0096-ca 0097-cb \
-         0098-cc; do mk_task "$t"; done
+         0098-cc 0099-cd; do mk_task "$t"; done
 mk_task 0040-ar  codex
 mk_task 0042-as  codex
 mk_task 0005-f codex
@@ -3555,6 +3555,70 @@ want_eq   "(cc) control: with the ref gone, loom check goes ahead"  "$rc" "0"
 want_file "(cc) ... and writes a review patch"                      "$CC/.agents/reviews/0098-cc.patch"
 want_in   "(cc) ... which carries the agent's edit"                 "$(cat "$CC/.agents/reviews/0098-cc.patch")" "backend/cc.txt"
 "$LOOM" drop 0098-cc > /dev/null 2>&1 || true
+
+# --- (cd) a root loom cannot verify stops the commands that USE one --------
+# The two roots used to be resolved and judged at FILE SCOPE, before dispatch,
+# so a LOOM_WORKTREES that is a symlink (an ordinary macOS layout), relative,
+# or inside the repo killed EVERY command — `loom help` included, and
+# `loom guard`, which is what the operator's own pre-commit hook runs on
+# `main`. A root that cannot be verified is a reason not to put a worktree in
+# it; it is not a reason the operator cannot commit. The verdict moved into
+# `require_roots`, called by the commands that touch a root and by nothing
+# else; `doctor` reports it as one FAIL and finishes its report.
+mkdir -p "$TMP/cd-realwt"
+ln -s "$TMP/cd-realwt" "$TMP/cd-linkwt"
+CD_LINK="$TMP/cd-linkwt"
+out="$(LOOM_WORKTREES="$CD_LINK" "$LOOM" help 2>&1)"; rc=$?
+want_eq "(cd) loom help works under a symlinked worktree root"      "$rc" "0"
+out="$(LOOM_WORKTREES="$CD_LINK" "$LOOM" zone backend/main.go 2>&1)"; rc=$?
+want_eq "(cd) ... so does loom zone"                                "$rc" "0"
+want_in "(cd) ... with its real answer"                             "$out" "assist"
+out="$(LOOM_WORKTREES="$CD_LINK" "$LOOM" tier standard 2>&1)"; rc=$?
+want_eq "(cd) ... and loom tier"                                    "$rc" "0"
+# THE hook path: `loom guard` is what the operator's pre-commit hook runs, and
+# a die here is the operator's own `git commit` on `main` failing.
+echo "operator edit" > backend/cd-operator.txt
+git add backend/cd-operator.txt
+out="$(LOOM_WORKTREES="$CD_LINK" "$LOOM" guard 2>&1)"; rc=$?
+want_eq "(cd) ... and loom guard, so the operator can still commit"  "$rc" "0"
+git reset -q HEAD backend/cd-operator.txt
+rm -f backend/cd-operator.txt
+# The commands that DO put a worktree under the root still refuse, with the
+# message the root check has always had.
+out="$(LOOM_WORKTREES="$CD_LINK" "$LOOM" new 0099-cd 2>&1)"; rc=$?
+want_fail "(cd) loom new still refuses the symlinked root"          "$rc"
+want_in   "(cd) ... with the root message"                          "$out" "not
+where its name says it is"
+want_absent "(cd) ... and creates nothing"                          "$TMP/cd-realwt/0099-cd"
+out="$(LOOM_WORKTREES="$CD_LINK" "$LOOM" ls 2>&1)"; rc=$?
+want_fail "(cd) loom ls refuses it too"                             "$rc"
+# doctor REPORTS it and finishes: one FAIL line, and the summary people script
+# against still printed.
+out="$(timeout 180 env LOOM_WORKTREES="$CD_LINK" "$LOOM" doctor 2>&1)"; rc=$?
+want_fail "(cd) loom doctor exits non-zero on a bad root"           "$rc"
+want_in   "(cd) ... with a FAIL line naming the root"               "$out" "FAIL     worktree root"
+want_in   "(cd) ... and the path itself"                            "$out" "$CD_LINK"
+want_in   "(cd) ... and its summary line, printed anyway"           "$out" "loom doctor: "
+want_in   "(cd) ... having got as far as the model IDs"             "$out" "model IDs"
+# A RELATIVE root: the same shape, a different message, and `help` lives.
+out="$(LOOM_WORKTREES="relative-wt" "$LOOM" help 2>&1)"; rc=$?
+want_eq   "(cd) loom help works under a relative worktree root"     "$rc" "0"
+out="$(LOOM_WORKTREES="relative-wt" "$LOOM" guard 2>&1)"; rc=$?
+want_eq   "(cd) ... and so does loom guard"                         "$rc" "0"
+out="$(LOOM_WORKTREES="relative-wt" "$LOOM" new 0099-cd 2>&1)"; rc=$?
+want_fail "(cd) loom new refuses a relative root"                   "$rc"
+want_in   "(cd) ... saying so"                                      "$out" "must be an absolute path"
+# ... and a root INSIDE the repository, the third shape.
+out="$(LOOM_WORKTREES="$REPO_REAL/inside-wt" "$LOOM" help 2>&1)"; rc=$?
+want_eq   "(cd) loom help works with a root inside the repo"        "$rc" "0"
+out="$(LOOM_WORKTREES="$REPO_REAL/inside-wt" "$LOOM" new 0099-cd 2>&1)"; rc=$?
+want_fail "(cd) loom new refuses a root inside the repo"            "$rc"
+want_in   "(cd) ... saying so"                                      "$out" "is inside the repository"
+# The control: with the ordinary root, the same task is created.
+out="$("$LOOM" new 0099-cd 2>&1)"; rc=$?
+want_eq   "(cd) control: the ordinary root still works"             "$rc" "0"
+want_file "(cd) ... and the worktree is there"                      "$WTU/0099-cd/backend/main.go"
+"$LOOM" drop 0099-cd > /dev/null 2>&1 || true
 
 # --- (j)/(t) doctor lists the profiles, and touches no network ------------
 out="$(timeout 180 "$LOOM" doctor 2>&1 || true)"
