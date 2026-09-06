@@ -79,10 +79,16 @@ if [ -n "${LOOM_TEST_SWAP_REVIEWS:-}" ]; then
   ln -s "$LOOM_TEST_SWAP_REVIEWS" .agents/reviews
 fi
 # ... and the same trick on the task SPEC, which is the file `loom loop`
-# appends the reviewer's REVISE text to.
+# appends the reviewer's REVISE text to. The decoy is INSIDE the worktree and
+# the link is relative on purpose: `loom run` commits whatever the implementer
+# left, and a committed link that LEAVES the tree is refused one step earlier,
+# by the branch-history check in (ch) — which would mask the thing this case is
+# about, namely that loom refuses to append through a symlink at all, wherever
+# it points.
 if [ -n "${LOOM_TEST_SWAP_TASKFILE:-}" ]; then
+  printf 'the decoy spec\n' > bu-task-decoy.md
   rm -f ".agents/tasks/$LOOM_TEST_SWAP_TASKFILE.md"
-  ln -s "${LOOM_TEST_TMP:?}/bu-task-decoy.md" ".agents/tasks/$LOOM_TEST_SWAP_TASKFILE.md"
+  ln -s "../../bu-task-decoy.md" ".agents/tasks/$LOOM_TEST_SWAP_TASKFILE.md"
 fi
 # Where loom's own scratch lands, as the launched model sees it. `.agents/loom.env`
 # is `.`-sourced shell from a tracked path an agent can write, so this is a
@@ -253,7 +259,8 @@ for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p \
          0078-br 0079-br2 0080-bs 0081-bs2 0083-bs3 \
          0084-bu 0085-bu2 0086-bu3 0087-bu4 0088-bu5 0089-bu6 0090-bu7 \
          0091-bw 0093-bx 0094-by 0095-bz 0096-ca 0097-cb \
-         0098-cc 0099-cd 0100-ce 0101-cf 0102-cf2; do mk_task "$t"; done
+         0098-cc 0099-cd 0100-ce 0101-cf 0102-cf2 \
+         0103-ch 0104-ch2 0105-ch3; do mk_task "$t"; done
 mk_task 0040-ar  codex
 mk_task 0042-as  codex
 mk_task 0005-f codex
@@ -3129,8 +3136,8 @@ want_in       "(bu) ... it is a refusal, naming the link"              "$out" "i
 "$LOOM" drop 0087-bu4 > /dev/null 2>&1 || true
 
 # `loom loop` APPENDS the reviewer's REVISE text to the task spec in the
-# worktree — the file the implementer reads next. `>>` follows a symlink.
-printf 'the decoy spec\n' > "$TMP/bu-task-decoy.md"
+# worktree — the file the implementer reads next. `>>` follows a symlink. The
+# stub plants the decoy inside the worktree (see the stub, and (ch)).
 out="$(LOOM_TEST_VERDICT="REVISE — go again" LOOM_TEST_SWAP_TASKFILE=0088-bu5 \
        LOOM_LOOP_ROUNDS=2 LOOM_MAX_ATTEMPTS=1 \
        LOOM_MODELS_implementer="claude-sub" LOOM_MODELS_reviewer="codex-sub" \
@@ -3138,7 +3145,7 @@ out="$(LOOM_TEST_VERDICT="REVISE — go again" LOOM_TEST_SWAP_TASKFILE=0088-bu5 
 want_fail "(bu) loom loop refuses to append through a symlinked task spec" "$rc"
 want_in   "(bu) ... naming it as a symlink"                        "$out" "is a SYMLINK"
 want_eq   "(bu) ... and the decoy spec is untouched" \
-          "$(cat "$TMP/bu-task-decoy.md")" "the decoy spec"
+          "$(cat "$WTU/0088-bu5/bu-task-decoy.md")" "the decoy spec"
 "$LOOM" drop 0088-bu5 > /dev/null 2>&1 || true
 
 # And the copies loom ACTS on are not in the worktree at all: the patch, the
@@ -3741,6 +3748,61 @@ want_file "(cf) ... writing the patch"                              "$CF2/.agent
 want_absent "(cf) ... and there was never a hook to do any of it"    "$cf_hook"
 "$LOOM" drop 0101-cf  > /dev/null 2>&1 || true
 "$LOOM" drop 0102-cf2 > /dev/null 2>&1 || true
+
+# --- (ch) a committed symlink that points out of the worktree --------------
+# `ln -s ../../core backend/allofit` at an ASSIST path was a legal commit:
+# check reviewed it, land merged it (`create mode 120000 backend/allofit`), and
+# every worktree loom built afterwards read `core/` straight through it. The
+# fence removes PATHS and cannot remove a doorway to one. Judged lexically —
+# absolute targets, and `..`s that climb above the tree root — because under a
+# fence the entry may not be checked out at all, so nothing is realpath'd.
+out="$("$LOOM" new 0103-ch 2>&1)"; rc=$?
+want_eq "(ch) setup: a task"                                        "$rc" "0"
+CH="$WTU/0103-ch"
+( cd "$CH" && ln -s ../../core backend/allofit && git add -A && git commit -qm "work on ch" )
+want_eq "(ch) setup: the commit really carries mode 120000" \
+        "$(git -C "$CH" ls-tree -r HEAD -- backend/allofit | cut -d' ' -f1)" "120000"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0103-ch 2>&1)"; rc=$?
+want_fail   "(ch) loom check refuses a symlink out of the worktree" "$rc"
+want_in     "(ch) ... naming the path"                              "$out" "backend/allofit"
+want_in     "(ch) ... and saying it points outside"                 "$out" "OUTSIDE"
+want_absent "(ch) ... with no review patch written"                 "$CH/.agents/reviews/0103-ch.patch"
+out="$("$LOOM" land 0103-ch 2>&1)"; rc=$?
+want_fail   "(ch) loom land refuses it too"                         "$rc"
+want_in     "(ch) ... naming the path"                              "$out" "backend/allofit"
+want_eq     "(ch) ... and merged nothing" \
+            "$(git merge-base --is-ancestor refs/heads/agent/0103-ch HEAD 2>/dev/null && echo merged || echo no)" "no"
+# The HISTORY leg on its own: drop the entry from the worktree's index, so the
+# disk scan has nothing to say, and the commit is still carrying it.
+git -C "$CH" rm -q --cached backend/allofit
+want_eq "(ch) the index no longer has the link" \
+        "$(git -C "$CH" ls-files -s -- backend/allofit)" ""
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0103-ch 2>&1)"; rc=$?
+want_fail   "(ch) loom check still refuses — the COMMITS carry it"  "$rc"
+want_in     "(ch) ... naming the path"                              "$out" "backend/allofit"
+want_in     "(ch) ... as a branch-history refusal"                  "$out" "this branch's commits carry symlinks"
+git -C "$CH" reset -q --hard
+"$LOOM" drop 0103-ch > /dev/null 2>&1 || true
+# An ABSOLUTE target: outside by construction, whatever it names.
+out="$("$LOOM" new 0104-ch2 2>&1)"; rc=$?
+want_eq "(ch) setup: a second task"                                 "$rc" "0"
+CH2="$WTU/0104-ch2"
+( cd "$CH2" && ln -s "$REPO_REAL/core" backend/absolute && git add -A && git commit -qm "work on ch2" )
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0104-ch2 2>&1)"; rc=$?
+want_fail   "(ch) loom check refuses an ABSOLUTE symlink target"    "$rc"
+want_in     "(ch) ... naming the path"                              "$out" "backend/absolute"
+want_in     "(ch) ... and the target it names"                      "$out" "$REPO_REAL/core"
+"$LOOM" drop 0104-ch2 > /dev/null 2>&1 || true
+# The control: a link that stays inside the tree is nobody's business.
+out="$("$LOOM" new 0105-ch3 2>&1)"; rc=$?
+want_eq "(ch) setup: a third task"                                  "$rc" "0"
+CH3="$WTU/0105-ch3"
+( cd "$CH3" && ln -s ../docs backend/inside && git add -A && git commit -qm "work on ch3" )
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0105-ch3 2>&1)"; rc=$?
+want_eq   "(ch) control: a link that stays inside the tree passes"  "$rc" "0"
+want_file "(ch) ... and the patch is written"                       "$CH3/.agents/reviews/0105-ch3.patch"
+out="$("$LOOM" land 0105-ch3 2>&1)"; rc=$?
+want_eq   "(ch) control: and it lands"                              "$rc" "0"
 
 # --- (j)/(t)/(cg) doctor lists the profiles, touches no network, and counts -
 # (cg): `local pname pprov prel role m mp bad` inside the [fence_profiles] loop

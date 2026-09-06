@@ -3219,6 +3219,111 @@ fence_enforce() { # fence_enforce <worktree>
   fence_verify "$1"
 }
 
+# ------------------------------------------------- symlinks out of the tree
+# A symlink is a MODE, not a file, and `ln -s ../../core backend/allofit` at an
+# ASSIST path is a legal commit: `loom check` reviewed it, `loom land` merged
+# it, `create mode 120000 backend/allofit` — and from then on every worktree
+# `loom new` builds reads `core/` straight through it, fence or no fence. The
+# symlink AT a fenced path was already caught; this is the sibling case, and it
+# does not care what zone the link itself sits in.
+#
+# Judged LEXICALLY, and that is deliberate. `realpath` needs the entry to be on
+# disk, and under a fence half the tree is not checked out at all — so the
+# question is asked of the link's TEXT: an absolute target is outside by
+# construction, and a relative one escapes when its `..`s take it above the
+# worktree root. Nothing is followed, nothing is resolved, and a link that
+# stays inside the tree (`backend/inside -> ../docs`) is left alone.
+link_target_escapes() { # link_target_escapes <path-in-tree> <target>
+  local path="$1" tgt="$2" rest comp depth=0 dir
+  case "$tgt" in /*) return 0 ;; esac      # absolute: outside, whatever it names
+  # How deep the LINK's own directory sits below the tree root.
+  dir="${path%/*}"
+  if [ "$dir" != "$path" ] && [ -n "$dir" ]; then
+    rest="$dir"
+    while [ -n "$rest" ]; do
+      comp="${rest%%/*}"
+      if [ "$rest" = "$comp" ]; then rest=""; else rest="${rest#*/}"; fi
+      case "$comp" in ""|.) ;; ..) depth=$((depth - 1)) ;; *) depth=$((depth + 1)) ;; esac
+    done
+  fi
+  # Then walk the target from there. Going ABOVE the root at any point is the
+  # escape — `a/../../b` from depth 1 never does, `../../b` does.
+  rest="$tgt"
+  while [ -n "$rest" ]; do
+    comp="${rest%%/*}"
+    if [ "$rest" = "$comp" ]; then rest=""; else rest="${rest#*/}"; fi
+    case "$comp" in
+      ""|.) ;;
+      ..)   depth=$((depth - 1)); [ "$depth" -lt 0 ] && return 0 ;;
+      *)    depth=$((depth + 1)) ;;
+    esac
+  done
+  return 1
+}
+
+# The tracked symlinks in a worktree's INDEX that leave it. The index, not the
+# disk: under a fence the entry may not be checked out, and an untracked link
+# an agent made for itself is not the thing that survives into the next
+# worktree — a COMMITTED one is.
+wt_escaping_links() { # wt_escaping_links <worktree>  -> the offending lines
+  local wt="$1" rec mode sha path tgt bad="" out
+  out="$(mktemp "${TMPDIR:-/tmp}/loom-links.XXXXXX")" \
+    || die "cannot create a temporary file for the symlink scan"
+  tmp_track "$out"
+  git -C "$wt" ls-files -s -z > "$out" 2>/dev/null \
+    || die "cannot list the index of $wt — refusing to guess what it links to"
+  while IFS= read -r -d '' rec; do
+    mode="${rec%% *}"
+    [ "$mode" = 120000 ] || continue
+    path="${rec#*$'\t'}"
+    sha="${rec#* }"; sha="${sha%% *}"
+    tgt="$(git -C "$wt" cat-file -p "$sha" 2>/dev/null)" \
+      || die "cannot read the symlink target of $path in $wt — refusing to guess"
+    link_target_escapes "$path" "$tgt" && bad="$bad
+  $path -> $tgt"
+  done < "$out"
+  rm -f "$out"
+  printf '%s' "$bad"
+}
+
+# The same question asked of a COMMIT's tree, for the history checks: a
+# worktree can be re-fenced or the link removed from disk, and the commit still
+# carries mode 120000 into the review patch, the merge and every future
+# worktree built from it.
+tree_escaping_links() { # tree_escaping_links <dir> <rev>  -> the offending lines
+  local d="$1" rev="$2" rec mode sha path tgt bad="" out
+  out="$(mktemp "${TMPDIR:-/tmp}/loom-links.XXXXXX")" \
+    || die "cannot create a temporary file for the symlink scan"
+  tmp_track "$out"
+  git -C "$d" ls-tree -r -z "$rev" > "$out" 2>/dev/null \
+    || die "cannot list the tree of $rev in $d — refusing to guess what it links to"
+  while IFS= read -r -d '' rec; do
+    mode="${rec%% *}"
+    [ "$mode" = 120000 ] || continue
+    path="${rec#*$'\t'}"
+    sha="${rec%%$'\t'*}"; sha="${sha##* }"
+    tgt="$(git -C "$d" cat-file -p "$sha" 2>/dev/null)" \
+      || die "cannot read the symlink target of $path at $rev — refusing to guess"
+    link_target_escapes "$path" "$tgt" && bad="$bad
+  $path -> $tgt"
+  done < "$out"
+  rm -f "$out"
+  printf '%s' "$bad"
+}
+
+link_reconcile_history() { # link_reconcile_history <dir> <rev>
+  local bad; bad="$(tree_escaping_links "$1" "$2")"
+  [ -n "$bad" ] || return 0
+  die "this branch's commits carry symlinks that point OUTSIDE the worktree:$bad
+A committed symlink is a mode, not a file: every worktree loom builds from this
+branch checks it out, and whatever it names is then readable through it — the
+fence removes PATHS, and it cannot remove a doorway to one. Targets are read as
+text and never followed, so this is what the link says, not what happens to be
+there today.
+Replace them with links that stay inside the tree, or throw the branch away:
+  loom drop <task-id>"
+}
+
 # ---------------------------------------------------------------- reconcile
 # THE gate between a worktree and a model. Driven by what is ON DISK — never by
 # a recorded profile, and not by the index either: `git show HEAD:core/lib.rs >
@@ -3253,8 +3358,18 @@ fence_enforce() { # fence_enforce <worktree>
 #      release; it is the ordinary case, and it is numbered so that the count
 #      above matches the list.)
 fence_reconcile() { # fence_reconcile <worktree> <asserted-profile-or-empty>
-  local wt="$1" asserted="${2:-}" present p stray=""
+  local wt="$1" asserted="${2:-}" present p stray="" links
   [ -d "$wt" ] || return 0
+  # FIRST, because it is the one thing re-fencing cannot fix: a tracked symlink
+  # pointing out of the tree is a doorway the sparse rules do not close, and it
+  # is in the index of every worktree built from the branch that carries it.
+  links="$(wt_escaping_links "$wt")"
+  [ -z "$links" ] || die "worktree $wt has tracked symlinks that point OUTSIDE it:$links
+The fence removes PATHS from a worktree; it cannot remove a doorway to one, and
+this tree has one — whatever those links name is readable here whether it was
+fenced or not. Targets are read as text and never followed, so this is what the
+link says, not what happens to be there today.
+Remove them, or start clean:  loom drop <task-id>"
   present="$(zones_py fence-present-full "$wt")" \
     || die "cannot tell which fenced paths are present in $wt — refusing to guess"
 
@@ -4662,6 +4777,7 @@ cmd_check() {
   # ordinary diff — reviewed, approved, and refused only at the very end. A
   # reviewer is never handed a hand-zone diff as if it were authorised.
   hand_reconcile_history "$ROOT" "$base" "$PINNED_TIP"
+  link_reconcile_history "$ROOT" "$PINNED_TIP"
   # BEFORE the patch, for the same reason the history check is: writing it runs
   # `git diff` in this repository, and a `diff.<d>.textconv` or a
   # `filter.<d>.clean` named by a config planted since `loom new` is a program
@@ -4808,6 +4924,7 @@ cmd_loop() {
     base="$(security_base "$task")"
     fence_reconcile_history "$task" "$base" "$FENCE_PROFILE"
     hand_reconcile_history "$ROOT" "$base" "$PINNED_TIP"
+    link_reconcile_history "$ROOT" "$PINNED_TIP"
     cmd_check "$task" ${passthru[0]+"${passthru[@]}"}
     verdict="$(grep '^VERDICT:' "$review" 2>/dev/null | tail -1 || true)"
     # No verdict line at all means a truncated or derailed review, not a
@@ -4875,6 +4992,7 @@ cmd_diff() {
   base="$(security_base "$task")"
   fence_reconcile_history "$task" "$base" "$FENCE_PROFILE"
   hand_reconcile_history "$ROOT" "$base" "$PINNED_TIP"   # same range, same reason
+  link_reconcile_history "$ROOT" "$PINNED_TIP"
   require_recorded_config "$task" diff       # same reason as `loom check`
   # Same order and the same reason as `loom check`: the directory is resolved
   # before a byte of the patch is written, and the patch goes to what it
@@ -4965,6 +5083,7 @@ Commit it in the worktree, or discard it, then re-run:  loom check $task"
   base="$(security_base "$task")"
   fence_reconcile_history "$task" "$base" "$FENCE_PROFILE"
   hand_reconcile_history "$ROOT" "$base" "$PINNED_TIP"
+  link_reconcile_history "$ROOT" "$PINNED_TIP"
   # The tip a reviewer actually read. A branch that moved since — an extra
   # commit, an `update-ref` from a gate script, a force-push into the ref — is
   # not the thing that was reviewed, and `--force` does not skip this either.
