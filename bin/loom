@@ -809,6 +809,28 @@ not $cmd against a remote it cannot vouch for. Put it back, or start clean:
 #     worktree, the branch and the record, runs no model and publishes nothing,
 #     so refusing to clean up a repository because its config moved would leave
 #     the released paths on disk — the opposite of what the check is for.
+# --- the dumps, and cleaning them up ---------------------------------------
+# Every config path in this file goes through a temp FILE, because a NUL stream
+# cannot survive a command substitution. Each caller removes its own dump on
+# the way out — and each caller also has a dozen ways to `die` in between, and
+# `loom new` in particular has an EXIT trap that unwinds a half-built task and
+# used to leave the dump behind every single time it fired (measured: one
+# `loom-gitconfig.XXXXXX` per test run, from (ap)'s deliberately-failed add).
+#
+# So the dumps are tracked and swept at exit as well. The list is only ever
+# APPENDED to: `rm -f` on a file a caller already removed is free, and an
+# untrack step is one more thing to forget. `config_snapshot` cannot do the
+# tracking itself — it answers through `$(…)`, i.e. from a subshell, where an
+# assignment to this array would be discarded — so tracking is the caller's,
+# one line under each call.
+CFG_TMPS=()
+cfg_track()   { CFG_TMPS+=("$1"); }
+cfg_cleanup() {
+  local p
+  for p in ${CFG_TMPS[0]+"${CFG_TMPS[@]}"}; do rm -f "$p"; done
+}
+trap 'cfg_cleanup' EXIT
+
 config_sidecar() { # config_sidecar <task> -> the path of that task's pinned config
   printf '%s\n' "$(state_file "$1").gitconfig"
 }
@@ -1236,7 +1258,7 @@ config_programs() { # config_programs <dump>
 # from a path an agent reaches.
 config_repin() { # config_repin <task>
   local f d
-  f="$(config_snapshot "$(config_wt "$1")")"
+  f="$(config_snapshot "$(config_wt "$1")")"; cfg_track "$f"
   d="$(config_digest_of "$f")" || { rm -f "$f"; return 1; }
   config_write_sidecar "$1" "$f"
   rm -f "$f"
@@ -1278,7 +1300,7 @@ That record was written by a loom from before the git config was pinned, so
 there is nothing to compare this repository's config against — and loom will not
 run, fetch, push or merge against a config it cannot vouch for. Start clean:
   loom drop $task && loom new $task"
-  f="$(config_snapshot "$(config_wt "$task")")"
+  f="$(config_snapshot "$(config_wt "$task")")"; cfg_track "$f"
   now="$(config_digest_of "$f")"
   if [ "$rec" = "$now" ]; then rm -f "$f"; return 0; fi
   changed="$(config_py diff "$(config_sidecar "$task")" "$f" 2>&1)" \
@@ -1405,7 +1427,7 @@ repo_config_write() { # repo_config_write <dump>
 # argument: the task scope is not the repository's.
 repo_config_repin() {
   local f
-  f="$(config_snapshot)"
+  f="$(config_snapshot)"; cfg_track "$f"
   repo_config_write "$f"
   rm -f "$f"
 }
@@ -1427,7 +1449,7 @@ of which name a program git runs in YOUR session. \`loom scout\` in particular
 updates a working tree (the shared _scout mirror), which is what runs a planted
 smudge filter. loom will not $cmd against a config it cannot vouch for:
   loom pin-config          # record what this repository's config says now"
-  f="$(config_snapshot)"
+  f="$(config_snapshot)"; cfg_track "$f"
   now="$(config_digest_of "$f")"
   if [ "$rec" = "$now" ]; then rm -f "$f"; return 0; fi
   changed="$(config_py diff "$(repo_config_sidecar)" "$f" 2>&1)" \
@@ -3355,15 +3377,18 @@ fenced paths into this worktree. Confirm it on the command line:
   # (measured, git 2.34). An interrupt in between leaves the earlier digest,
   # which is a refusal, not a pass.
   local newcfgdump newconfig
-  newcfgdump="$(config_snapshot "$(config_wt "$task")")"
+  newcfgdump="$(config_snapshot "$(config_wt "$task")")"; cfg_track "$newcfgdump"
   newconfig="$(config_digest_of "$newcfgdump")"
   NEW_WT="$wt"
   # $NEW_BR before the add, on purpose: the add CREATES the branch and can then
   # fail on the path, and the check above observed that this branch did not
   # exist. new_abort deletes it only if it exists when the abort runs.
   NEW_BR="$br"
-  trap 'new_abort' EXIT
-  trap 'new_abort; exit 130' INT TERM
+  # The dumps go with it: new_abort replaces the process-wide `cfg_cleanup`
+  # trap for the length of this command, and the half-built task it unwinds is
+  # exactly the run that used to leave one behind.
+  trap 'new_abort; cfg_cleanup' EXIT
+  trap 'new_abort; cfg_cleanup; exit 130' INT TERM
   # --no-checkout first: the operator record is written while the tree is still
   # empty, so an interrupt can never leave released content without a record.
   git worktree add --no-checkout -b "$br" "$wt" "$newbase" >&2
@@ -3394,7 +3419,8 @@ fenced paths into this worktree. Confirm it on the command line:
   config_summary  "$(config_sidecar "$task")"
   config_programs "$(config_sidecar "$task")"
   NEW_WT=""; NEW_BR=""; NEW_STATE=""
-  trap - EXIT INT TERM
+  trap 'cfg_cleanup' EXIT       # back to the process-wide sweep, not to none
+  trap - INT TERM
   echo "$wt"
 }
 
@@ -4228,7 +4254,7 @@ cmd_pin_config() {
 REPOSITORY's git config baseline, which is not a task's and not a worktree's."
   repo_config_read > /dev/null            # a malformed baseline dies here
   rec="$(repo_config_read)"
-  f="$(config_snapshot)"
+  f="$(config_snapshot)"; cfg_track "$f"
   now="$(config_digest_of "$f")"
   if [ -n "$rec" ] && [ "$rec" = "$now" ]; then
     rm -f "$f"
