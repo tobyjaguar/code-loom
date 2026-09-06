@@ -802,16 +802,23 @@ Semantics:
   into the operator's own checkout. A chain that cycles, or runs past 40 hops,
   is refused as unresolvable rather than guessed at.
 
-  **What is JUDGED is what the branch added or changed.** An entry whose path
-  and target match the recorded base is the TRUNK's, and loom cannot rewrite the
-  consumer's trunk — refusing every command over one made such a repository
-  permanently unusable, with `loom drop` + `loom new` no help at all. Those are
-  **fenced out** instead: their exact paths are appended to the sparse rules
-  after the profile-filtered patterns (so no profile releases them), verified
-  absent on disk by `fence_verify`, and warned about once at `loom new`, `loom
-  attach` and `loom doctor`. They remain in the resolution MAP, so a chain
-  through an inherited link is caught like any other; with no base, or one that
-  cannot be read, nothing is inherited and every entry is judged.
+  **What is JUDGED is what the branch turned into a doorway.** An entry that
+  ALREADY resolved OUTSIDE the tree at the recorded base — same path and target,
+  and still escaping under the base's OWN link map — is the TRUNK's, and loom
+  cannot rewrite the consumer's trunk: refusing every command over one made such
+  a repository permanently unusable, with `loom drop` + `loom new` no help at
+  all. Those are **fenced out** instead: their exact paths are appended to the
+  sparse rules after the profile-filtered patterns (so no profile releases them),
+  verified absent on disk by `fence_verify`, and warned about once at `loom new`,
+  `loom attach` and `loom doctor`. The exemption is decided by RE-RESOLVING every
+  entry against the CURRENT map, not by a path+target match: an entry that was
+  "inside" at the base becomes a doorway the moment the branch adds a SECOND link
+  on its resolution path, and it never changed, so a match-the-base test would
+  have exempted it (round 18, B18-1). The exempt set is therefore EQUAL to the
+  fenced-out set — an escape under the base's own map — and nothing else. Every
+  entry stays in the resolution MAP either way, so a chain THROUGH an inherited
+  link, in either direction, is caught like any other; with no base, or one that
+  cannot be read, nothing is inherited and every escape is refused.
 - **`loom run` applies the `[hand]` rule at its own commit.** `loom
   install-hooks` is a separate step, so a fresh clone has no pre-commit guard —
   and there `loom run` committed an implementer's edit to `.agents/gate.sh`,

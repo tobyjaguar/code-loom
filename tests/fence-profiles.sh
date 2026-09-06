@@ -285,7 +285,8 @@ for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p \
          0109-cj 0110-cj2 0111-cj3 \
          0112-ck 0113-ck2 0114-ck3 0115-ck4 0116-ck5 \
          0117-cl 0118-cl2 0119-cm 0120-cm2 0121-cn 0122-cn2 \
-         0123-cp 0124-cp2 0125-cq; do mk_task "$t"; done
+         0123-cp 0124-cp2 0125-cq \
+         0126-cr 0127-cr2 0128-cr3 0129-cr4 0130-cs 0131-ct 0132-ct2 0133-cu 0134-cv; do mk_task "$t"; done
 mk_task 0040-ar  codex
 mk_task 0042-as  codex
 mk_task 0005-f codex
@@ -4322,6 +4323,96 @@ want_eq   "(cq) ... leaving the branch at the tip it pinned" \
           "$(git rev-parse refs/heads/agent/0125-cq)" "$cq_tip"
 want_eq   "(cq) ... and the recorded base where it was"             "$(state_field 0125-cq base)" "$cq_base"
 "$LOOM" drop 0125-cq > /dev/null 2>&1 || true
+
+# --- (cr) B18-1: an inherited link, unchanged, turned into a doorway ----------
+# The judge exempted an entry whose path AND target matched the base — but
+# whether it escapes NOW is decided by the rest of the map, which the branch
+# controls. So a link that was "inside" at the base becomes a doorway the moment
+# the branch adds a SECOND link on its resolution path, and the exemption waved
+# it through. Reproduced end to end: task 1 lands `backend/loot -> ../ta/tb/../..`
+# (inside), task 2 adds `ta/tb -> ..` and `backend/loot` now points at the parent
+# of the operator's checkout. The judge now RE-RESOLVES every entry against the
+# current map and exempts an escape only when it ALSO escaped under the base's
+# own map, so the exempt set equals the fenced-out set.
+cr_trunk0="$(git rev-parse HEAD)"
+out="$("$LOOM" new 0126-cr 2>&1)"; rc=$?
+want_eq "(cr) setup: task 1"                                        "$rc" "0"
+CR1="$WTU/0126-cr"
+( cd "$CR1" && ln -s ../ta/tb/../.. backend/loot && git add -A && git commit -qm "work on cr1" )
+want_eq "(cr) setup: the link is mode 120000" \
+        "$(git -C "$CR1" ls-tree -r HEAD -- backend/loot | cut -d' ' -f1)" "120000"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0126-cr 2>&1)"; rc=$?
+want_eq "(cr) task 1: an inside link reviews clean"                 "$rc" "0"
+out="$("$LOOM" land 0126-cr 2>&1)"; rc=$?
+want_eq "(cr) task 1: and it LANDS"                                 "$rc" "0"
+want_ne "(cr) ... the trunk tip advanced (rev-list count +1)"      "$(git rev-parse HEAD)" "$cr_trunk0"
+want_eq "(cr) ... and the trunk now carries backend/loot (mode 120000)" \
+        "$(git ls-tree HEAD -- backend/loot | cut -d' ' -f1)" "120000"
+"$LOOM" drop 0126-cr > /dev/null 2>&1 || true
+git branch -D agent/0126-cr > /dev/null 2>&1 || true
+# Task 2, cut from the trunk that now carries backend/loot: loom materialises it
+# (no WARN — it did not escape at the base), then the branch adds the hop.
+out="$("$LOOM" new 0127-cr2 2>&1)"; rc=$?
+want_eq "(cr) setup: task 2"                                        "$rc" "0"
+CR2="$WTU/0127-cr2"
+# It is a DANGLING symlink (its target does not exist on disk), so test the
+# ENTRY with -L, not -e — the point is that loom checked it out, not fenced it.
+want_eq "(cr) setup: backend/loot was checked out (inside at the base)" \
+        "$([ -L "$CR2/backend/loot" ] && echo yes || echo no)" "yes"
+( cd "$CR2" && mkdir -p ta && ln -s .. ta/tb && git add -A && git commit -qm "work on cr2" )
+cr_trunk2="$(git rev-parse HEAD)"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0127-cr2 2>&1)"; rc=$?
+want_fail   "(cr) task 2: loom check REFUSES the inherited link turned doorway" "$rc"
+want_in     "(cr) ... naming backend/loot"                         "$out" "backend/loot"
+want_in     "(cr) ... its resolved escape, outside the tree"       "$out" "outside the tree"
+want_in     "(cr) ... as the branch's own doing (on this branch)"  "$out" "on this branch"
+want_not_in "(cr) ... not pointed at the trunk as the fix"         "$out" "trunk"
+want_eq     "(cr) ... and the trunk is untouched"                  "$(git rev-parse HEAD)" "$cr_trunk2"
+out="$("$LOOM" land 0127-cr2 2>&1)"; rc=$?
+want_fail   "(cr) task 2: loom land REFUSES it too"                "$rc"
+want_in     "(cr) ... naming backend/loot"                         "$out" "backend/loot"
+want_eq     "(cr) ... trunk still untouched — merged nothing"      "$(git rev-parse HEAD)" "$cr_trunk2"
+cr_claude0="$(wc -l < "$TMP/called-claude.log" 2>/dev/null || echo 0)"
+out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 "$LOOM" run 0127-cr2 2>&1)"; rc=$?
+want_fail   "(cr) task 2: the run-time reconcile REFUSES, before any model"  "$rc"
+want_in     "(cr) ... naming backend/loot"                         "$out" "backend/loot"
+want_eq     "(cr) ... and launched no implementer (reconcile refused first)" \
+            "$(wc -l < "$TMP/called-claude.log" 2>/dev/null || echo 0)" "$cr_claude0"
+"$LOOM" drop 0127-cr2 > /dev/null 2>&1 || true
+git branch -D agent/0127-cr2 > /dev/null 2>&1 || true
+# Control: the branch adds an INSIDE link instead, and nothing is refused.
+out="$("$LOOM" new 0128-cr3 2>&1)"; rc=$?
+want_eq "(cr) setup: task 3 (control)"                             "$rc" "0"
+CR3="$WTU/0128-cr3"
+( cd "$CR3" && mkdir -p ta && ln -s tb ta/inside && git add -A && git commit -qm "work on cr3" )
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0128-cr3 2>&1)"; rc=$?
+want_eq   "(cr) control: an inside hop (ta/inside -> tb) still passes" "$rc" "0"
+want_file "(cr) ... and the review patch is written"               "$CR3/.agents/reviews/0128-cr3.patch"
+"$LOOM" drop 0128-cr3 > /dev/null 2>&1 || true
+git branch -D agent/0128-cr3 > /dev/null 2>&1 || true
+# The trunk's backend/loot taken back out before the next case.
+git rm -q --cached backend/loot > /dev/null 2>&1; rm -f backend/loot
+git commit -qm "(cr) and the landed link taken back out"
+# The operator-trunk variant: the trunk itself carries an inside link, and the
+# agent adds a hop that makes it escape — refused as the branch's own doing, not
+# fenced out as the trunk's.
+ln -s ../ua/ub/../.. backend/up
+git add backend/up
+git commit -qm "(cr) a trunk link that stays inside on its own"
+out="$("$LOOM" new 0129-cr4 2>&1)"; rc=$?
+want_eq "(cr) setup: task 4 cut from that trunk"                   "$rc" "0"
+CR4="$WTU/0129-cr4"
+want_eq "(cr) setup: the trunk's inside link is in the worktree" \
+        "$([ -L "$CR4/backend/up" ] && echo yes || echo no)" "yes"
+( cd "$CR4" && mkdir -p ua && ln -s .. ua/ub && git add -A && git commit -qm "work on cr4" )
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0129-cr4 2>&1)"; rc=$?
+want_fail "(cr) a trunk inside-link + a branch hop that escapes it is REFUSED"  "$rc"
+want_in   "(cr) ... naming backend/up"                            "$out" "backend/up"
+want_in   "(cr) ... as the branch's own doing"                    "$out" "on this branch"
+"$LOOM" drop 0129-cr4 > /dev/null 2>&1 || true
+git branch -D agent/0129-cr4 > /dev/null 2>&1 || true
+git rm -q --cached backend/up > /dev/null 2>&1; rm -f backend/up
+git commit -qm "(cr) and the trunk inside-link removed"
 
 # --- (j)/(t)/(cg) doctor lists the profiles, touches no network, and counts -
 # (cg): `local pname pprov prel role m mp bad` inside the [fence_profiles] loop

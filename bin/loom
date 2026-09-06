@@ -3353,13 +3353,23 @@ fence_enforce() { # fence_enforce <worktree>
 # before the branch existed — is not the branch's doing, and loom cannot rewrite
 # the consumer's trunk: refusing every command made such a repository
 # permanently unusable, with `loom drop` + `loom new` provably no help. So an
-# entry whose path AND target match the task's recorded base is INHERITED. It is
-# not a refusal; it is FENCED OUT of the worktree instead (fence_apply, below),
-# so the doorway is never materialised, and the operator is warned at `loom new`,
-# `loom attach` and `loom doctor`. It stays in the resolution MAP either way, so
-# a chain THROUGH an inherited link is caught like any other. With no base, or
-# one that cannot be read, nothing is inherited and every entry is judged —
-# which is the refusing answer.
+# entry that ALREADY RESOLVED OUTSIDE the tree at the task's recorded base, with
+# the SAME path and target, is INHERITED. It is not a refusal; it is FENCED OUT
+# of the worktree instead (fence_apply, below), so the doorway is never
+# materialised, and the operator is warned at `loom new`, `loom attach` and
+# `loom doctor`.
+#
+# The exemption is decided by RE-RESOLVING, not by a path+target match alone
+# (round 18, B18-1). Every entry is resolved against the CURRENT map, because
+# whether it escapes now is decided by every other link the branch controls: an
+# entry that was "inside" at the base becomes a doorway the moment the branch
+# adds a SECOND link on its resolution path, and it never changed, so a
+# match-the-base test would exempt it. The exempt set is therefore EQUAL to the
+# fenced-out set — a link that also resolves outside under the base's OWN map —
+# and nothing else. Every entry stays in the resolution MAP either way, so a
+# chain THROUGH an inherited link, in either direction, is caught like any
+# other. With no base, or one that cannot be read, nothing is inherited and
+# every escape is refused — the closed answer.
 links_py() { # links_py judge <dir> <spec> [<base-spec>] | escaping <dir> <spec>
   python3 - "$@" << 'PY'
 import os, subprocess, sys
@@ -3487,12 +3497,25 @@ def resolve(path, target, m):
 
 links = link_map(spec)
 if mode == "judge":
-    inherited = link_map(base, soft=True) if base else {}
+    base_links = link_map(base, soft=True) if base else {}
     for p in sorted(links):
         t = links[p]
-        if p in inherited and inherited[p] == t:
-            continue                   # the trunk's doing, not this branch's
+        # Resolve against the CURRENT map, ALWAYS: whether a link escapes now is
+        # decided by every other link, and the branch controls those. An entry
+        # that was "inside" at the base can be turned into a doorway by a SECOND
+        # link the branch adds elsewhere on its resolution path (round 18,
+        # B18-1). An escape is exempt from refusal ONLY when the SAME link (path
+        # and target) ALSO escaped under the BASE's own map — which is exactly
+        # the set link_fence_load fences out of the worktree, so the exempt set
+        # and the excluded set now coincide: an inside-at-base link that escapes
+        # at the tip is the branch's doing and refused; an escape-at-base link
+        # stays fenced out and exempt.
         kind, where = resolve(p, t, links)
+        if kind == "inside":
+            continue
+        if p in base_links and base_links[p] == t \
+           and resolve(p, t, base_links)[0] != "inside":
+            continue                   # already a doorway at the base — fenced out
         if kind == "escape":
             emit("\n  %s -> %s  (resolves to %s, outside the tree)" % (p, t, where))
         elif kind == "unresolvable":
@@ -3567,14 +3590,16 @@ link_inherited_warn() { # link_inherited_warn <dir> <base>
 }
 
 link_refuse_history() { # link_refuse_history <offending-lines>
-  die "this branch's commits carry symlinks that point OUTSIDE the worktree:$1
+  die "this branch's commits carry symlinks that resolve OUTSIDE the worktree:$1
 A committed symlink is a mode, not a file: every worktree loom builds from this
 branch checks it out, and whatever it names is then readable through it — the
 fence removes PATHS, and it cannot remove a doorway to one. Targets are resolved
 through this tree's OWN links and never followed on disk, so this is what the
 links say, not what happens to be there today.
-These are the branch's own — the trunk does not carry them, or they would not be
-named here. Rewrite the commits that added them, and re-run."
+The escape is this branch's own doing: it added or changed a link on the
+resolution path, whichever entry that turned out to be. A link that ALREADY
+resolved outside at this task's base — same path and target — is fenced out
+instead, not named here. Rewrite the commits responsible, and re-run."
 }
 
 link_reconcile_history() { # link_reconcile_history <dir> <base> <rev>
@@ -3636,15 +3661,16 @@ fence_reconcile() { # fence_reconcile <worktree> <asserted-profile-or-empty>
   # is in the index of every worktree built from the branch that carries it.
   links="$(wt_escaping_links "$wt" "${FENCE_BASE:-}")" \
     || die "cannot read the tracked symlinks of $wt — refusing to guess what they point at"
-  [ -z "$links" ] || die "worktree $wt has tracked symlinks that point OUTSIDE it, added or
-changed on this branch:$links
+  [ -z "$links" ] || die "worktree $wt has tracked symlinks that resolve OUTSIDE it on this branch:$links
 The fence removes PATHS from a worktree; it cannot remove a doorway to one, and
 this tree has one — whatever those links name is readable here whether it was
 fenced or not. Targets are resolved through this tree's OWN links and never
 followed on disk, so this is what the links say, not what happens to be there
 today.
-These are the branch's own — a link the trunk already carried is fenced out
-instead, not refused. Remove them, or point them back inside the tree."
+The escape is this branch's own doing — it added or changed a link on the
+resolution path, whichever entry that turned out to be. A link that ALREADY
+resolved outside at this task's base is fenced out instead, not refused. Remove
+them, or point them back inside the tree."
   present="$(zones_py fence-present-full "$wt")" \
     || die "cannot tell which fenced paths are present in $wt — refusing to guess"
 
