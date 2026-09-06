@@ -4205,10 +4205,16 @@ cmd_drop() {
   # disk is the thing `loom drop` exists to prevent, so say what is left and
   # stop — before the record that explains why it is there is deleted.
   if [ -e "$wt" ]; then
+    # The TOP LEVEL, sorted, with the total beside it. A depth-limited walk was
+    # the first shape and it was the wrong one: the entry that matters — the
+    # directory a fence profile released — fell off the end of the listing
+    # behind a dozen dotfiles. The top level of a worktree is bounded, it is
+    # sorted, and it names every released path by its own first segment.
     { echo "loom: the worktree for $task is STILL on disk after 'git worktree remove --force':"
       echo "  $wt"
-      echo "loom: what remains:"
-      find "$wt" -maxdepth 2 2>/dev/null | head -20 | sed 's|^|loom:   |' || true
+      echo "loom: what remains ($(find "$wt" 2>/dev/null | wc -l | tr -d ' ') paths in all, top level):"
+      find "$wt" -mindepth 1 -maxdepth 1 2>/dev/null | LC_ALL=C sort | head -50 \
+        | sed 's|^|loom:   |' || true
     } >&2
     die "nothing was dropped for $task: its worktree is still there, so its operator
 record and its branch have been left alone too — the record is what says what
@@ -4259,7 +4265,10 @@ REPOSITORY's git config baseline, which is not a task's and not a worktree's."
   # overwritten, which is exactly what the operator asked for. Without it, the
   # dead stop stands.
   if [ -n "$FLAG_ACCEPT_CONFIG" ]; then
-    rec="$( repo_config_read 2>/dev/null || true )"
+    # `|| rec=""` OUTSIDE the substitution, deliberately: repo_config_read dies
+    # with `exit`, and `exit` in a subshell terminates it there — a `|| true`
+    # INSIDE `$( … )` never runs, and the assignment fails under `set -e`.
+    rec="$( repo_config_read 2>/dev/null )" || rec=""
   else
     repo_config_read > /dev/null          # a malformed baseline dies here
     rec="$(repo_config_read)"
