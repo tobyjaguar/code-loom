@@ -2847,6 +2847,13 @@ cmd_loop() {
   local task="${FLAG_ARGS[0]:?usage: loom loop <task-id> [--fence-profile <name>]}"
   local rounds="${LOOM_LOOP_ROUNDS:-2}"
   local wt review verdict tfile base i=1     # $base is set per round, below
+  # `loom loop` calls cmd_new, cmd_run and cmd_check, and each of those re-runs
+  # scan_fence_flag on ITS OWN argv — which resets $FLAG_ACCEPT_CONFIG in this
+  # shell, because only cmd_run's cmd_new call happens in a subshell. Snapshot
+  # the operator's flag here and put it back before this function's own config
+  # check, so that a nested command cannot quietly withdraw the consent the
+  # operator gave on THIS command line.
+  local accept_cfg="$FLAG_ACCEPT_CONFIG"
   local -a passthru=()
   [ -n "$FLAG_PROFILE" ] && passthru=(--fence-profile "$FLAG_PROFILE")
   wt="$(wt_path "$task")"
@@ -2877,6 +2884,7 @@ cmd_loop() {
   # of theirs surfaces as "the implementer never reached a green gate". The
   # config pin is checked here as a plain statement so the refusal is the loop's
   # own, with its own message. (Both of them check again, per launch.)
+  FLAG_ACCEPT_CONFIG="$accept_cfg"
   require_recorded_config "$task" loop
 
   implement() { # one implementer pass, with cmd_run's exit codes named
