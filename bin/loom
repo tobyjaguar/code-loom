@@ -302,6 +302,34 @@ unset _v _g_i _g_was _g_val GIT_SNAP GIT_HOOK_VARS
 #                    `--upload-pack=` / `--receive-pack=` on the fetch and the
 #                    push, which do win. Measured, both ways.
 #
+# `pager.<cmd>`, and why `core.pager=cat` alone was not enough. MEASURED, git
+# 2.34.1, in a pty (git only pages on a tty):
+#
+#   pager.log=<script>  in .git/config, core.pager=cat via this variable  -> the
+#                       script RAN. git_pager() reads $GIT_PAGER, then
+#                       `pager_program`, then core.pager — and check_pager_config
+#                       has ALREADY set pager_program from pager.<cmd>, so
+#                       core.pager is never consulted.
+#   GIT_PAGER=cat                                                        -> not run
+#   pager.<cmd>=cat via this variable                                    -> not run
+#   git --no-pager <cmd>                                                 -> not run
+#
+# and `pager.<cmd>` with a STRING value also turns paging ON for a subcommand
+# that never pages by default. Measured across everything loom invokes: status,
+# remote, branch, worktree, ls-files, show-ref, merge-base, rev-list,
+# update-ref, add, commit, checkout, reset, diff, log, show, ls-remote,
+# symbolic-ref, sparse-checkout and patch-id all ran the planted pager; only
+# `rev-parse` and `config` did not. So a `pager.update-ref=<script>` planted
+# from a worktree is a program run in your session by a plumbing command.
+#
+# Both levers are used, and they are not redundant:
+#   * $GIT_PAGER=cat below is the COMPLETE one — it beats pager.<cmd> for every
+#     subcommand, including ones loom does not invoke today;
+#   * the 'pager.<cmd>=cat' entries here are the FLOOR, one per subcommand loom
+#     actually runs, so the pin survives an edit that drops the export.
+# `--no-pager` on every call site was the third option and was rejected: it is
+# ~100 sites, and a site added later silently has no pin.
+#
 # core.sshCommand is pinned to the operator's own GLOBAL/SYSTEM value when they
 # have one, rather than to a bare `ssh`: the repo-local key is the attack, an
 # `~/.gitconfig` that names an identity file is not, and a plain `ssh` would
@@ -312,11 +340,26 @@ _ssh="$(git config --global --get core.sshCommand 2>/dev/null || true)"
 # GIT_CONFIG_PARAMETERS is a list of sq-quoted `key=value` words, so a literal
 # quote inside a value has to be escaped the way the shell escapes one.
 _ssh="${_ssh//\'/\'\\\'\'}"
+# One 'pager.<cmd>=cat' per subcommand `loom` runs. Keep this list in step with
+# the git commands in this file; $GIT_PAGER below covers anything missed.
+_pagers=""
+for _c in add branch checkout commit config diff fetch log ls-files ls-remote \
+          merge merge-base patch-id push rebase remote reset rev-list rev-parse \
+          show show-ref sparse-checkout status symbolic-ref update-ref worktree; do
+  _pagers="$_pagers 'pager.$_c=cat'"
+done
 export GIT_CONFIG_PARAMETERS="'core.pager=cat' 'core.fsmonitor=false' \
 'protocol.ext.allow=never' 'core.sshCommand=$_ssh' \
 'remote.origin.uploadpack=git-upload-pack' 'remote.origin.receivepack=git-receive-pack' \
-'core.editor=true' 'sequence.editor=true'"
-unset _ssh
+'core.editor=true' 'sequence.editor=true'${_pagers}"
+# The complete lever: $GIT_PAGER outranks pager.<cmd> AND core.pager for every
+# subcommand there is. It is exported AFTER the blanket `unset GIT_*` above, so
+# a value from `.agents/loom.env` is overwritten rather than honoured — the same
+# shape as `core.pager=cat`, not a new channel. A caller that wanted a pager for
+# loom's own git calls has already lost it to core.pager=cat; LOOM_DIFF_CMD is
+# where an operator pager goes.
+export GIT_PAGER=cat
+unset _ssh _c _pagers
 
 for _k in ZHIPU_API_KEY ZAI_API_KEY DEEPSEEK_API_KEY MOONSHOT_API_KEY; do
   case "$(eval "echo \"\${$_k:-}\"")" in *PASTE-YOUR*) unset "$_k" ;; esac
