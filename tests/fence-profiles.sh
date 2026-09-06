@@ -269,7 +269,8 @@ for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p \
          0084-bu 0085-bu2 0086-bu3 0087-bu4 0088-bu5 0089-bu6 0090-bu7 \
          0091-bw 0093-bx 0094-by 0095-bz 0096-ca 0097-cb \
          0098-cc 0099-cd 0100-ce 0101-cf 0102-cf2 \
-         0103-ch 0104-ch2 0105-ch3 0106-ci 0107-ci2 0108-ci3; do mk_task "$t"; done
+         0103-ch 0104-ch2 0105-ch3 0106-ci 0107-ci2 0108-ci3 \
+         0109-cj 0110-cj2 0111-cj3; do mk_task "$t"; done
 mk_task 0040-ar  codex
 mk_task 0042-as  codex
 mk_task 0005-f codex
@@ -3885,6 +3886,73 @@ printf '%s\n' "$ci_zones_orig" > .agents/zones.toml
 git rm -q -r --cached spike > /dev/null
 rm -rf spike
 git commit -qm "(ci) and the fence back as it was"
+
+# --- (cj) loom attach: the way back from drop --keep-branch ----------------
+# `loom land --pr` used to end with "drop it once the PR exists: loom drop
+# <task> --keep-branch" — and after that there was no way back: `loom new` and
+# `loom run` refuse ("branch already exists"), `loom check` says "no worktree",
+# `loom ls` is empty. `loom attach` adopts a branch that already exists and has
+# no worktree and no record, and writes a FRESH record: base = merge-base with
+# the operator's trunk, `reviewed=` empty, so nothing is inherited.
+git init -q --bare "$TMP/origin-cj.git"
+git remote add origin "$TMP/origin-cj.git"
+git push -q origin main
+out="$("$LOOM" new 0109-cj 2>&1)"; rc=$?
+want_eq "(cj) setup: a task cut against a real origin"              "$rc" "0"
+CJ="$WTU/0109-cj"
+echo "cj work" > "$CJ/backend/cj.txt"
+git -C "$CJ" add backend/cj.txt
+git -C "$CJ" commit -qm "work on cj"
+cj_tip="$(git rev-parse refs/heads/agent/0109-cj)"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0109-cj 2>&1)"; rc=$?
+want_eq "(cj) setup: it is reviewed"                                "$rc" "0"
+out="$("$LOOM" land 0109-cj --pr 2>&1)"; rc=$?
+want_eq "(cj) land --pr pushes the branch"                          "$rc" "0"
+want_in "(cj) ... and points at loom attach, not at a one-way door" "$out" "loom attach 0109-cj"
+"$LOOM" drop 0109-cj --keep-branch > /dev/null 2>&1
+want_absent "(cj) drop --keep-branch removes the worktree"          "$CJ"
+want_absent "(cj) ... and the record"                               "$(state_of 0109-cj)"
+want_ne     "(cj) ... and keeps the branch" \
+            "$(git rev-parse --verify --quiet refs/heads/agent/0109-cj || echo GONE)" "GONE"
+want_not_in "(cj) ... so loom ls no longer shows it"                "$("$LOOM" ls 2>&1)" "0109-cj"
+out="$("$LOOM" new 0109-cj 2>&1)"; rc=$?
+want_fail "(cj) ... and loom new refuses, as it always did"         "$rc"
+# The way back.
+out="$("$LOOM" attach 0109-cj 2>&1)"; rc=$?
+want_eq "(cj) loom attach adopts the branch"                        "$rc" "0"
+want_file "(cj) ... rebuilding the worktree"                        "$CJ/backend/cj.txt"
+want_absent "(cj) ... with the fence still applied"                 "$CJ/core/lib.rs"
+want_in "(cj) ... and loom ls shows it again"                       "$("$LOOM" ls 2>&1)" "0109-cj"
+want_eq "(cj) the record's base is the merge-base with the trunk" \
+        "$(state_field 0109-cj base)" "$(git merge-base refs/heads/agent/0109-cj HEAD)"
+want_eq "(cj) ... and NOTHING is marked reviewed"                   "$(state_field 0109-cj reviewed)" ""
+want_eq "(cj) ... on the same branch"                               "$(state_field 0109-cj branch)" "agent/0109-cj"
+out="$("$LOOM" land 0109-cj 2>&1)"; rc=$?
+want_fail "(cj) so loom land refuses until it is reviewed again"    "$rc"
+want_in   "(cj) ... saying so"                                      "$out" "never been through 'loom check'"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0109-cj 2>&1)"; rc=$?
+want_eq   "(cj) loom check works on the attached task"              "$rc" "0"
+want_in   "(cj) ... and the patch carries the branch's work"        "$(cat "$CJ/.agents/reviews/0109-cj.patch")" "backend/cj.txt"
+out="$("$LOOM" land 0109-cj 2>&1)"; rc=$?
+want_eq   "(cj) ... and then it lands"                              "$rc" "0"
+want_eq   "(cj) ... carrying the branch's tip" "$(git rev-parse 'HEAD^2')" "$cj_tip"
+# The three refusals, each with its own message.
+out="$("$LOOM" attach 0110-cj2 2>&1)"; rc=$?
+want_fail "(cj) attach refuses a task with no branch"               "$rc"
+want_in   "(cj) ... saying there is none"                           "$out" "no branch agent/0110-cj2"
+out="$("$LOOM" new 0111-cj3 2>&1)"; rc=$?
+want_eq "(cj) setup: an ordinary task"                              "$rc" "0"
+out="$("$LOOM" attach 0111-cj3 2>&1)"; rc=$?
+want_fail "(cj) attach refuses a task that already has a worktree"  "$rc"
+want_in   "(cj) ... saying so"                                      "$out" "worktree already exists"
+git worktree remove --force "$WTU/0111-cj3"
+out="$("$LOOM" attach 0111-cj3 2>&1)"; rc=$?
+want_fail "(cj) attach refuses a task that still has a record"      "$rc"
+want_in   "(cj) ... naming the record"                              "$out" "already has an operator record"
+want_absent "(cj) ... and built nothing"                            "$WTU/0111-cj3"
+"$LOOM" drop 0111-cj3 > /dev/null 2>&1 || true
+git branch -D agent/0111-cj3 > /dev/null 2>&1 || true
+git remote remove origin
 
 # --- (j)/(t)/(cg) doctor lists the profiles, touches no network, and counts -
 # (cg): `local pname pprov prel role m mp bad` inside the [fence_profiles] loop

@@ -225,10 +225,27 @@ loom land 0007-c --pr           # gate in the worktree, then: git push -u origin
                                 # prints a ready `gh pr create ...` line — it never runs it
                                 # nothing is merged, the branch stays, the checkbox stays unticked
 loom drop 0007-c --keep-branch  # later: reclaim the worktree, keep the pushed branch
+loom attach 0007-c              # and get it back if the PR needs another round
 ```
 
 Tick the plan checkbox by hand when the PR merges. `loom land 0007-c` (or
 `--merge`) is unchanged: gate, merge here, clean up, tick.
+
+`loom attach <task>` is the way back from `loom drop --keep-branch`, which used
+to be a one-way door: after it, `loom new` and `loom run` refuse ("branch
+already exists"), `loom check` says "no worktree", and `loom ls` is empty.
+`attach` adopts a branch that already exists and has **no worktree and no
+record** — it never creates a branch, never walks over a worktree, and never
+overwrites a record. It takes `--fence-profile` on exactly the terms `loom new`
+does.
+
+What it writes is a **fresh** record, and that is the part worth reading: the
+base is `git merge-base agent/<task> HEAD`, so every history check measures the
+whole of what the branch carries, and `reviewed=` is empty, so `loom land`
+refuses until `loom check` has run again. A fenced commit, a `[hand]` commit or
+a symlink out of the worktree already on that branch is refused after attaching
+exactly as it would have been before it was dropped. Attaching launders
+nothing.
 
 ### Read fences
 
@@ -759,7 +776,7 @@ never covered by a profile: its mirror is shared by every task, so it always
 runs at the full fence.
 
 **You pass the flag every time.** `--fence-profile <name>` is required by
-`loom new`, `run`, `check`, `loop`, `diff`, `rebase` and `land` for a task under
+`loom new`, `attach`, `run`, `check`, `loop`, `diff`, `rebase` and `land` for a task under
 a profile:
 
 ```sh

@@ -8,6 +8,11 @@
 #   loom plan -p "topic"               headless plan (falls back to cheap providers)
 #   loom scout "where is decode_flac"  one-shot cheap read-only lookup
 #   loom new   0007-c                  create worktree + branch for a task
+#   loom attach 0007-c                 re-adopt an EXISTING agent/0007-c branch
+#                                    that has no worktree and no record (the
+#                                    state `loom drop --keep-branch` leaves):
+#                                    new worktree, fresh record, nothing
+#                                    marked reviewed
 #   loom run   0007-c                  run the implementer in that worktree
 #   loom check 0007-c                  cheap cross-provider review of the diff
 #   loom loop  0007-c                  run, review, feed REVISE back, review again
@@ -33,8 +38,8 @@
 #   loom guard                         pre-commit zone check (used by the hook)
 #   loom install-hooks                 install the hand-zone commit guard
 #
-#   --fence-profile <name>           REQUIRED on new, run, check, loop, diff,
-#                                    rebase and land for a task under a fence
+#   --fence-profile <name>           REQUIRED on new, attach, run, check, loop,
+#                                    diff, rebase and land for a task under a fence
 #                                    profile, every time. The patterns the
 #                                    profile releases stay in the worktree, and
 #                                    every model that runs there must be one
@@ -4733,6 +4738,140 @@ fenced paths into this worktree. Confirm it on the command line:
   echo "$wt"
 }
 
+# `loom land --pr` used to end with "drop it once the PR exists: loom drop
+# <task> --keep-branch", and after that there was no way back: `loom new` and
+# `loom run` refuse ("branch already exists"), `loom check` says "no worktree",
+# `loom ls` is empty. This is the way back — an OPERATOR command, with exactly
+# the flag rules `loom new` has, that rebuilds the worktree and writes a fresh
+# record for a branch that is already there.
+#
+# What it does NOT do is inherit any judgement. The record it writes is new:
+# `reviewed=` is empty, so `loom land` refuses until `loom check` has run
+# again, and the base is the MERGE-BASE of the branch and your trunk tip — so
+# every history check (fence, [hand], symlinks) is measured over the whole of
+# what that branch carries. A fenced or hand-zone commit already on the branch
+# is refused here exactly as it would have been before it was dropped;
+# attaching is not a way to launder one.
+cmd_attach() {
+  require_roots
+  local task="" prof="" decl a
+  scan_fence_flag "$@"
+  prof="$FLAG_PROFILE"
+  for a in ${FLAG_ARGS[0]+"${FLAG_ARGS[@]}"}; do
+    case "$a" in
+      -*) die "loom attach: unknown flag '$a' — usage: loom attach <task-id> [--fence-profile <name>]" ;;
+      *)  if [ -z "$task" ]; then task="$a"; else die "loom attach: unexpected argument '$a'"; fi ;;
+    esac
+  done
+  [ -n "$task" ] || die "usage: loom attach <task-id> [--fence-profile <name>]"
+  # Same first question as `loom new`, and for the same reason: the id has to be
+  # one a record can be written for, asked before anything is created.
+  state_file "$task" > /dev/null
+  require_no_replace_refs "loom attach"
+  [ -z "$FLAG_ACCEPT_CONFIG" ] || die "loom attach: --accept-config re-records a config that has already been pinned, and
+this command is the one that pins it. Drop the flag."
+  local wt br
+  FLAG_PROFILE="$prof"
+  wt="$(wt_path "$task")"; br="$(branch_of "$task")"
+  # The three preconditions, each with its own message, all before anything is
+  # created. `attach` ADOPTS: it never creates a branch, never walks over a
+  # worktree, and never overwrites a record.
+  git show-ref --verify --quiet "refs/heads/$br" \
+    || die "no branch $br to attach to. 'loom attach' adopts a branch that already
+exists — the state 'loom drop $task --keep-branch' leaves behind. To start a new
+task, use:  loom new $task${prof:+ --fence-profile $prof}"
+  [ -d "$wt" ] && die "worktree already exists: $wt
+That task is already attached. Work in it, or start clean:  loom drop $task"
+  refuse_cross_root "$task"
+  [ ! -f "$(state_file "$task")" ] || die "task $task already has an operator record:
+  $(state_file "$task")
+'loom attach' writes a fresh one and will not overwrite yours. If the worktree
+is gone but the record is not, remove both deliberately:  loom drop $task --keep-branch
+then attach again."
+  [ -f "$AGENTS_DIR/tasks/$task.md" ] || die "no task file: .agents/tasks/$task.md"
+  # The declaration/flag rules are `loom new`'s, unchanged: the file states the
+  # intent, the flag is the consent, and a contradiction is a refusal.
+  local nm
+  while IFS= read -r nm; do
+    [ -n "$nm" ] || continue
+    echo "loom: WARN: .agents/tasks/$task.md header contains '$(printf '%s' "$nm" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')'" >&2
+    echo "loom: WARN: — that is NOT a fence-profile declaration and was not honoured." >&2
+    echo "loom: WARN: The key is spelled exactly 'Fence-profile:' (no space before the colon)." >&2
+  done <<< "$(task_profile_nearmiss "$task")"
+  decl="$(task_profile "$task")"
+  if [ -n "$decl" ] && [ -z "$prof" ]; then
+    die "loom attach: .agents/tasks/$task.md declares 'Fence-profile: $decl', which releases
+fenced paths into this worktree. Confirm it on the command line:
+  loom attach $task --fence-profile $decl"
+  fi
+  if [ -n "$prof" ] && [ -n "$decl" ] && [ "$prof" != "$decl" ]; then
+    die "loom attach: --fence-profile '$prof' contradicts 'Fence-profile: $decl' in .agents/tasks/$task.md — fix one"
+  fi
+  if [ -n "$prof" ]; then
+    fence_profile_activate "$prof"
+    profile_provider_guard implementer reviewer
+    echo "loom: fence profile '$prof' — released into this worktree: $FENCE_RELEASED" >&2
+  fi
+  # The BASE. Not the branch tip (that would make every history check empty)
+  # and not your HEAD (the branch does not descend from it any more once you
+  # have committed since): the merge-base of the two, which is the commit this
+  # branch actually diverged from and the one every check should measure over.
+  local newbase
+  newbase="$(git merge-base "$br" HEAD 2>/dev/null)" \
+    || die "cannot find a merge-base between $br and your HEAD, so there is no commit to
+measure this branch's work from. That branch does not share history with your
+checkout — inspect it, do not attach it:  git log --oneline $br"
+  [ -n "$newbase" ] || die "cannot find a merge-base between $br and your HEAD"
+  local neworigin newfetch newpushurl
+  neworigin="$(origin_url)"
+  newfetch="$(origin_fetch)"
+  newpushurl="$(origin_pushurl)"
+  require_one_line "'remote.origin.url'" "$neworigin"
+  require_one_line "'remote.origin.fetch'" "$newfetch"
+  require_one_line "the push URL of 'origin'" "$newpushurl"
+  local newcfgdump newconfig
+  newcfgdump="$(config_snapshot "$(config_wt "$task")")"; cfg_track "$newcfgdump"
+  newconfig="$(config_digest_of "$newcfgdump")"
+  local wtroot; wtroot="$(root_of_wt "$wt")"
+  mkdir -p "$(dirname "$wt")"
+  assert_wt_parent "$wt" "$wtroot"
+  NEW_WT="$wt"
+  # $NEW_BR stays EMPTY, deliberately: this command did not create the branch,
+  # and an abort here must not take somebody's work with it. new_abort only
+  # deletes a branch it is told about.
+  NEW_BR=""
+  trap 'new_abort; cfg_cleanup' EXIT
+  trap 'new_abort; cfg_cleanup; exit 130' INT TERM
+  # No `-b`: the branch exists, and this is the one command that checks one out.
+  git worktree add --no-checkout "$wt" "$br" >&2
+  assert_wt_under "$wt" "$wtroot"
+  require_wt_is_ours "$wt"
+  NEW_STATE="$task"
+  state_put "$task" "base=$newbase" "profile=$prof" "branch=$br" \
+            "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "origin=$neworigin" "fetch=$newfetch" "pushurl=$newpushurl" \
+            "config=$newconfig" "reviewed="
+  config_write_sidecar "$task" "$newcfgdump"
+  rm -f "$newcfgdump"
+  if has_fence; then
+    fence_apply "$wt"
+    git -C "$wt" checkout >&2
+    fence_verify "$wt"
+  else
+    git -C "$wt" checkout >&2
+  fi
+  config_repin "$task" strict-new \
+    || die "cannot pin this repository's git config for task $task"
+  config_summary  "$(config_sidecar "$task")"
+  config_programs "$(config_sidecar "$task")"
+  NEW_WT=""; NEW_BR=""; NEW_STATE=""
+  trap 'cfg_cleanup' EXIT
+  trap - INT TERM
+  echo "loom: attached $task at $wt (branch $br, base $(git rev-parse --short "$newbase"))" >&2
+  echo "loom: the record is NEW — nothing is marked reviewed, so run:  loom check $task${prof:+ --fence-profile $prof}" >&2
+  echo "$wt"
+}
+
 cmd_run() {
   require_roots
   scan_fence_flag "$@"
@@ -5255,7 +5394,10 @@ Landing would publish commits nobody read. Re-run the review, then land:
     echo ""
     echo "    gh pr create --head $br --title \"agent($task): $title\""
     echo ""
-    echo "loom: worktree kept at $wt (drop it once the PR exists: loom drop $task --keep-branch)"
+    echo "loom: worktree kept at $wt. Once the PR exists you can free it with:"
+    echo "loom:     loom drop $task --keep-branch"
+    echo "loom: and get it back — new worktree, fresh record, nothing marked reviewed — with:"
+    echo "loom:     loom attach $task${FENCE_PROFILE:+ --fence-profile $FENCE_PROFILE}"
     echo "loom: tick the plan checkbox for $task by hand when the PR merges."
     return 0
   fi
@@ -6215,6 +6357,7 @@ HOOK
 # ------------------------------------------------------------------ dispatch
 case "${1:-}" in
   new)    shift; cmd_new "$@" ;;
+  attach) shift; cmd_attach "$@" ;;
   run)    shift; cmd_run "$@" ;;
   check)  shift; cmd_check "$@" ;;
   loop)   shift; cmd_loop "$@" ;;

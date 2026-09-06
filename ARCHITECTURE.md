@@ -660,8 +660,8 @@ Semantics:
   which is the honest answer to "what does this repo fence?" — the release is a
   property of one task's worktree, not of a path.
 - **The opt-in is a fresh operator act, on every command.** `--fence-profile
-  <name>` is REQUIRED by `loom new`, `run`, `check`, `loop`, `diff`, `rebase` and
-  `land` for any task under a profile. `loom new` also writes the profile into
+  <name>` is REQUIRED by `loom new`, `attach`, `run`, `check`, `loop`, `diff`,
+  `rebase` and `land` for any task under a profile. `loom new` also writes the profile into
   the **operator record** (below) — and is the only thing that ever writes it —
   but that record is a **consistency check, never an authorisation**: three
   rules, all fail-closed, and there is no fourth —
@@ -790,12 +790,35 @@ Semantics:
                                          pushurl=<the PUSH url of origin, ditto>
   ```
 
-  written 0700/0600, by `loom new` alone; re-pointed by `loom rebase` (an operator
+  written 0700/0600, by `loom new` and by `loom attach` (below) — both operator
+  commands, and the only two writers; re-pointed by `loom rebase` (an operator
   command, and the only thing that moves a base); deleted by `loom drop`, with or
   without `--keep-branch`; read by every security check, by `cmd_guard` (which
   runs as the same OS user, and finds the same directory from a linked worktree
   because the key is the **main** checkout's path via `git rev-parse
   --git-common-dir`) and by `loom ls`.
+
+  **`loom attach <task>` is the second writer, and the way back from
+  `loom drop --keep-branch`.** That state — a branch with no worktree and no
+  record — used to be a one-way door: `loom new` and `loom run` refuse ("branch
+  already exists"), `loom check` says "no worktree", `loom ls` is empty, and
+  `loom land --pr` recommended getting into it. `attach` adopts such a branch:
+  it refuses if the branch does not exist, if a worktree is already there
+  (either root), or if a record already exists, then `git worktree add`s under
+  the asserted root, applies and verifies the fence, and writes a **fresh**
+  record — same fields, same pins (`origin`/`fetch`/`pushurl`/`config`), same
+  `--fence-profile` rules as `loom new`.
+
+  Two of those fields are the whole security story. `base=` is
+  `git merge-base agent/<task> HEAD` — not the branch tip (which would make
+  every history check an empty diff) and not your HEAD (the branch stops
+  descending from it the moment you commit), but the commit the branch actually
+  diverged from, so the fence, `[hand]` and symlink history checks measure the
+  **whole** of what that branch carries. And `reviewed=` is empty, so `loom
+  land` refuses until `loom check` has run again. A fenced commit, a `[hand]`
+  commit or a symlink out of the worktree already on the branch is refused
+  after attaching exactly as it was before it was dropped: attaching adopts a
+  branch, it does not launder one.
 
   Those are all eight fields, and they are the whole file: one field per line,
   each field once, every key in that fixed list. `state_put` refuses anything
