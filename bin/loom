@@ -898,7 +898,7 @@ config_py() { # config_py digest <dump> | diff <recorded> <dump>
               #         | summary <dump> | programs <dump>
               #         | diffprograms <recorded> <dump>
   python3 - "$@" << 'PY'
-import collections, hashlib, os, re, subprocess, sys, tempfile
+import collections, hashlib, os, re, stat, subprocess, sys, tempfile
 
 # The order is the order the sidecar is written in, and the order a diff names.
 SCOPES = ("local", "worktree-main", "worktree-task")
@@ -954,7 +954,11 @@ def program_key(k):
 # value half becomes `(<N> bytes, sha256 <hex>)`. The refusal for such a file
 # says "it changed and how big it is" rather than showing the change.
 CAP = 64 * 1024
-CAPPED = re.compile(r"^\((\d+) bytes, sha256 ([0-9a-f]{64})\)$")
+# The value half of a record whose bytes were NOT stored, in either shape it
+# has been written in: `(<N> bytes, sha256 <hex>)` and the capped-READ form
+# `(<N> bytes, sha256 of the first <M> <hex>)`. The hex is the digest in the
+# key half, which is what the change check runs on either way.
+CAPPED = re.compile(r"^\(\d+ bytes, sha256 (?:of the first \d+ )?([0-9a-f]{64})\)$")
 
 def unesc(s):
     """The inverse of esc(), for the one thing that is stored escaped and has
@@ -983,8 +987,9 @@ def unesc(s):
 
 def include_of(rec):
     """(path, digest, escaped bytes or None) for an INCLUDE record, else None.
-    None for the bytes means there are none to read: the target was missing, or
-    it was over CAP and only its digest was kept."""
+    None for the bytes means there are none to read: the target was missing,
+    it was not a regular file, or it was over CAP and only its digest was
+    kept."""
     key, sep, val = rec.partition(b"\n")
     k = key.decode("utf-8", "replace")
     if scope_of(k)[0] or not k.startswith("include:"):
@@ -995,7 +1000,7 @@ def include_of(rec):
         return (path, digest, None)
     v = val.decode("utf-8", "replace")
     m = CAPPED.match(v)
-    if m and m.group(2) == digest:
+    if m and m.group(1) == digest:
         return (path, digest, None)
     return (path, digest, v)
 
@@ -1099,12 +1104,42 @@ def closure(seeds):
         if path in seen:
             continue
         seen.add(path)
+        # STAT FIRST, and read nothing until it says this is an ordinary file.
+        # `include.path` is a value the writer chooses, and it need not name a
+        # file at all: `/dev/zero` and `/dev/urandom` are infinite, a FIFO
+        # blocks in `open()` until somebody writes, a directory and a socket
+        # raise. git itself refuses most of these when it reads the config —
+        # but an `includeIf.<cond>.path` whose CONDITION DOES NOT MATCH is
+        # never opened by git and still appears in `--list` as a pointer
+        # (measured), so it reached this open() with nothing before it. A
+        # `fh.read()` on /dev/zero is not a hang so much as a memory climb that
+        # ends in the OOM killer, and it happens inside the very snapshot whose
+        # job is to REFUSE what the config now says.
         try:
-            with open(path, "rb") as fh:
-                raw = fh.read()
+            st = os.stat(path)
         except OSError:
             # No value half at all: "(missing)" is the whole of what is known,
             # and an empty one would read as "present and empty".
+            out.append(("include:%s:(missing)" % esc(path))
+                       .encode("utf-8", "surrogateescape"))
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            # A distinct fact from "(missing)", and it must stay distinct: a
+            # target that turns from a config file into a FIFO has CHANGED, and
+            # a refusal that called both "missing" would show no diff at all.
+            # `programs` counts it as a hit for the same reason the over-cap
+            # record is one — "loom cannot read it" is not "it contains
+            # nothing", and git may well read it.
+            out.append(("include:%s:(not a regular file)" % esc(path))
+                       .encode("utf-8", "surrogateescape"))
+            continue
+        try:
+            with open(path, "rb") as fh:
+                # CAP + 1, never unbounded: one byte past the cap is all it
+                # takes to know the file is over it, and the record for an
+                # over-cap file keeps a digest rather than the bytes anyway.
+                raw = fh.read(CAP + 1)
+        except OSError:
             out.append(("include:%s:(missing)" % esc(path))
                        .encode("utf-8", "surrogateescape"))
             continue
@@ -1128,7 +1163,15 @@ def closure(seeds):
         # to, so the refusal still names the file and still fires.
         digest = hashlib.sha256(raw).hexdigest()
         if len(raw) > CAP:
-            body = "(%d bytes, sha256 %s)" % (len(raw), digest)
+            # The digest is over the bytes that were READ — the first CAP + 1 —
+            # and the value half says so, because a digest that silently
+            # covered part of a file would be a change check nobody could
+            # reason about. An include target is a config file and a config
+            # file is small; a bigger one is either a mistake or a way to bloat
+            # the sidecar, and either way the size and the prefix digest are
+            # what a refusal needs to name it.
+            body = "(%d bytes, sha256 of the first %d %s)" % (
+                st.st_size, len(raw), digest)
         else:
             body = esc(raw.decode("utf-8", "replace"))
         out.append(("include:%s:%s\n%s" % (esc(path), digest, body))
@@ -1211,7 +1254,10 @@ try:
             if inc is not None:
                 path, digest, raw_text = inc
                 if raw_text is None:
-                    if digest != "(missing)":
+                    if digest == "(not a regular file)":
+                        print("[include:%s] (not a regular file — loom does not read "
+                              "it; git may)" % path)
+                    elif digest != "(missing)":
                         print("[include:%s] (bytes not stored — over the %d-byte "
                               "cap; its keys are not listed)" % (path, CAP))
                     continue
@@ -1249,7 +1295,10 @@ try:
                 if inc is not None:
                     path, digest, raw_text = inc
                     if raw_text is None:
-                        if digest != "(missing)":
+                        if digest == "(not a regular file)":
+                            print("%s [include:%s] (not a regular file — loom does "
+                                  "not read it; git may)" % (sign, path))
+                        elif digest != "(missing)":
                             print("%s [include:%s] (bytes not stored — over the "
                                   "%d-byte cap)" % (sign, path, CAP))
                         continue
