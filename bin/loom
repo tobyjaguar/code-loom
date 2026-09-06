@@ -5850,12 +5850,18 @@ cmd_doctor() {
       fi
       # Fence profiles: what each one releases, to whom, and whether the
       # default chains could actually run under it.
-      local pname pprov prel role m mp bad
+      # NOT `bad`: that is this function's FAILURE COUNTER, three screens up
+      # (`local ok=0 warn=0 bad=0`), and `local` here reset it. With a
+      # [fence_profiles] table doctor then either aborted on `unbound variable`
+      # with no summary at all, or printed a model name in the failures slot and
+      # exited non-zero with zero real failures. doctor is the machine's
+      # acceptance test and its exit code is what people script against.
+      local pname pprov prel role m mp chainbad
       while IFS=$'\t' read -r pname pprov prel; do
         [ -n "$pname" ] || continue
         pass "fence profile '$pname': releases ${prel//,/ } to providers ${pprov//,/ }"
         for role in implementer reviewer; do
-          bad=""
+          chainbad=""
           # Same `set -f` bracket as profile_provider_guard and candidates: a
           # chain is a space-separated list, and $LOOM_MODELS_<role> is data
           # that must not glob against $ROOT.
@@ -5863,10 +5869,10 @@ cmd_doctor() {
           # shellcheck disable=SC2086  # deliberate word split; globbing is off
           for m in $(models_for "$role"); do
             mp="$(provider_of "$m")"
-            case ",$pprov," in *",$mp,"*) ;; *) bad="$bad $m" ;; esac
+            case ",$pprov," in *",$mp,"*) ;; *) chainbad="$chainbad $m" ;; esac
           done
           set +f
-          [ -n "$bad" ] && note "fence profile '$pname': the $role chain at tier $TIER reaches providers this profile does not allow:$bad — a task on this profile needs LOOM_MODELS_$role"
+          [ -n "$chainbad" ] && note "fence profile '$pname': the $role chain at tier $TIER reaches providers this profile does not allow:$chainbad — a task on this profile needs LOOM_MODELS_$role"
         done
       done < <(zones_py profiles 2>/dev/null || true)
     else

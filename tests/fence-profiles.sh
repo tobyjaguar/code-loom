@@ -3742,13 +3742,25 @@ want_absent "(cf) ... and there was never a hook to do any of it"    "$cf_hook"
 "$LOOM" drop 0101-cf  > /dev/null 2>&1 || true
 "$LOOM" drop 0102-cf2 > /dev/null 2>&1 || true
 
-# --- (j)/(t) doctor lists the profiles, and touches no network ------------
-out="$(timeout 180 "$LOOM" doctor 2>&1 || true)"
+# --- (j)/(t)/(cg) doctor lists the profiles, touches no network, and counts -
+# (cg): `local pname pprov prel role m mp bad` inside the [fence_profiles] loop
+# re-declared the function's own FAILURE COUNTER (`local ok=0 warn=0 bad=0`).
+# With a profile table present — which is exactly the shape this repo has —
+# doctor either aborted on `unbound variable` with no summary at all, or
+# printed a model name in the failures slot and exited non-zero with zero real
+# failures. Its exit code is what people script against, so the summary's shape
+# and the code are asserted together.
+out="$(timeout 180 "$LOOM" doctor 2>&1)"; rc=$?
 want_in "(j) doctor lists the profile"                    "$out" "fence profile 'codex'"
 want_in "(j) doctor names its providers"                  "$out" "claude codex"
 want_in "(j) doctor still reports the fence"              "$out" "fence: 3 pattern(s)"
 want_in "(j) doctor names the providers a profile refuses" "$out" "providers this profile does not allow"
 want_absent "(t) doctor made no network call"             "$TMP/called-curl.log"
+docsum="$(printf '%s\n' "$out" | grep -E '^loom doctor: [0-9]+ ok, [0-9]+ warnings, [0-9]+ failures$' | tail -1)"
+want_ne "(cg) the summary line counts three NUMBERS"      "$docsum" ""
+want_in "(cg) ... and the failures slot is a count, not a model" "$docsum" " 0 failures"
+want_eq "(cg) ... so doctor exits 0 when it says 0 failures" "$rc" "0"
+want_not_in "(cg) doctor never aborted on an unbound variable" "$out" "unbound variable"
 
 echo ""
 echo "tests/fence-profiles.sh: $npass passed, $nfail failed"
