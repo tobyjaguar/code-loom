@@ -1437,20 +1437,25 @@ config_programs() { # config_programs <dump>
 # `--accept-config`, by `loom new` once its own worktree setup has run, and by
 # `loom land --pr` after the `--set-upstream-to` it writes itself. Never called
 # from a path an agent reaches.
-config_repin() { # config_repin <task>
+config_repin() { # config_repin <task> [strict-new|strict-push]
   local f d
-  f="$(config_snapshot "$(config_wt "$1")")"; cfg_track "$f"
-  d="$(config_digest_of "$f")" || { rm -f "$f"; return 1; }
-  config_write_sidecar "$1" "$f"
-  rm -f "$f"
-  state_update "$1" "config=$d"
-  # ... and the REPOSITORY's own baseline, which is what the roles with no task
+  # The REPOSITORY's own baseline FIRST, which is what the roles with no task
   # are judged against. Pinning a task and baselining the repository are the
   # same operator act — `loom new`, `--accept-config`, and `land --pr`'s re-pin
   # after its own `--set-upstream-to` — so they happen in the same place. If
   # they did not, `land --pr` would leave `branch.<br>.remote` in the local
   # scope and the next `loom scout` would refuse a change loom itself made.
-  repo_config_repin
+  #
+  # First rather than last, because in a `strict` mode it can REFUSE, and a
+  # refusal must not leave the TASK re-pinned against a config the repository
+  # is not allowed to adopt: that would be the same silent adoption one level
+  # down.
+  repo_config_repin ${2:+"$2"}
+  f="$(config_snapshot "$(config_wt "$1")")"; cfg_track "$f"
+  d="$(config_digest_of "$f")" || { rm -f "$f"; return 1; }
+  config_write_sidecar "$1" "$f"
+  rm -f "$f"
+  state_update "$1" "config=$d"
 }
 
 # The git config a task was created against — all three scopes and the include
@@ -1604,11 +1609,108 @@ repo_config_write() { # repo_config_write <dump>
   mv "$f.tmp.$$" "$f" || die "cannot write the repository git config baseline $f"
 }
 
+# The recorded repository digest as a RAW string, with no opinion about it:
+# "" when there is no baseline, and "" for a baseline that is not one loom
+# wrote. repo_config_read is the one with the opinion, and it DIES — which is
+# right where the baseline is being judged and wrong where it is being
+# re-recorded, because a re-record is the way out of a malformed one.
+repo_config_raw() {
+  local f v
+  f="$(repo_config_file)"
+  [ -f "$f" ] || return 0
+  v="$(cat "$f" 2>/dev/null || true)"
+  case "$v" in ""|*[!0-9a-f]*) return 0 ;; esac
+  [ "${#v}" -eq 64 ] || return 0
+  printf '%s\n' "$v"
+}
+
+# The `-`/`+` lines between the recorded repository baseline and a fresh dump.
+# Empty when there is no baseline to compare against, or when nothing moved.
+repo_config_delta() { # repo_config_delta <dump>
+  local rec
+  rec="$(repo_config_raw)"
+  [ -n "$rec" ] || return 0
+  [ "$rec" != "$(config_digest_of "$1")" ] || return 0
+  config_py diff "$(repo_config_sidecar)" "$1" 2>/dev/null || true
+}
+
+# The same delta, reduced to the entries that name a PROGRAM git runs.
+repo_config_delta_programs() { # repo_config_delta_programs <dump>
+  local rec
+  rec="$(repo_config_raw)"
+  [ -n "$rec" ] || return 0
+  [ "$rec" != "$(config_digest_of "$1")" ] || return 0
+  config_py diffprograms "$(repo_config_sidecar)" "$1" 2>/dev/null || true
+}
+
 # The config as it is NOW becomes the repository's baseline. No worktree
 # argument: the task scope is not the repository's.
-repo_config_repin() {
-  local f
+#
+# A re-record over a baseline that ALREADY EXISTS and says something else is
+# the one write in this file that used to be silent. Every path that reaches
+# here is a path where loom expects to be adopting its OWN writes —
+# `loom new`'s `sparse-checkout init` (`extensions.worktreeConfig`),
+# `scout_root`'s (the same), `land --pr`'s `--set-upstream-to`
+# (`branch.<br>.remote`/`.merge`) — and "loom expects" is not "loom checked".
+# Anything else that moved in the same window rode in under those writes and
+# became the baseline the NEXT `loom scout` and `loom plan` are judged against,
+# with nothing printed. So the delta is always shown, and in `strict` mode a
+# delta that ADDS a key naming a program git runs is a refusal instead of an
+# adoption. (Additions only: a program key going away is not the danger, and
+# refusing that would make "put it back" — the escape every one of these
+# refusals names — a refusal of its own.)
+#
+#   repo_config_repin                 print the delta, re-record
+#   repo_config_repin strict-new      ... but refuse a program-naming delta,
+#   repo_config_repin strict-push         each with the words for its command
+repo_config_repin() { # repo_config_repin [strict-new|strict-push]
+  local mode="${1:-}" f delta progs
   f="$(config_snapshot)"; cfg_track "$f"
+  delta="$(repo_config_delta "$f")"
+  if [ -n "$delta" ]; then
+    progs=""
+    case "$mode" in strict-*) progs="$(repo_config_delta_programs "$f")" ;; esac
+    if [ -n "$progs" ]; then
+      rm -f "$f"
+      {
+        echo "loom: repository config baseline moved:"
+        printf '%s\n' "$delta"
+        echo "loom: and the move names a PROGRAM git runs:"
+        printf '%s\n' "$progs" | sed 's|^|loom:   |'
+      } >&2
+      case "$mode" in
+        strict-push)
+          die "refusing to re-record that as this repository's config baseline.
+THE PUSH ALREADY HAPPENED — the branch is on origin and nothing about it is
+undone by this refusal. What has NOT happened is the re-pin: the baseline still
+says what it said before, so the next 'loom scout' and 'loom plan' will refuse
+until you deal with this.
+loom re-pins here only to adopt its own 'git branch --set-upstream-to' writes
+(branch.<br>.remote and branch.<br>.merge, neither of which names a program).
+Something else moved in the same window and would have ridden in under them.
+Read the lines above, then record them deliberately or put them back:
+  loom pin-config --accept-config     # after reading, this is the baseline
+  git config --local --list           # the [local] lines
+  git config --worktree --list        # the [worktree-main] lines" ;;
+        *)
+          die "refusing to record that as this repository's config baseline.
+'loom new' is the command that PINS, so it takes no --accept-config and has
+nothing to weigh this against — and the keys above are not preferences: they
+name a program git runs in YOUR session. Baseline them deliberately first, then
+create the task:
+  loom pin-config --accept-config     # after reading the lines above
+  loom new <task>
+or put them back:
+  git config --local --list           # the [local] lines
+  git config --worktree --list        # the [worktree-main] lines" ;;
+      esac
+    fi
+    {
+      echo "loom: repository config baseline moved:"
+      printf '%s\n' "$delta"
+      echo "loom: re-recording it. loom vouches for none of it — you do."
+    } >&2
+  fi
   repo_config_write "$f"
   rm -f "$f"
 }
@@ -3591,7 +3693,13 @@ fenced paths into this worktree. Confirm it on the command line:
   # Re-pin, now that this command's own writes to the config have happened — in
   # BOTH scopes: `extensions.worktreeConfig` in the shared .git/config, and
   # `core.sparseCheckout` in the new worktree's own config.worktree.
-  config_repin "$task" || die "cannot pin this repository's git config for task $task"
+  # `strict-new`: this command pins, so it takes no --accept-config — which
+  # means a repository baseline that has moved since the last one, in a way that
+  # names a program git runs, cannot be weighed here. It is refused and pointed
+  # at `loom pin-config --accept-config`, which is the command that CAN weigh
+  # it. A move that names no program is adopted, with its diff printed.
+  config_repin "$task" strict-new \
+    || die "cannot pin this repository's git config for task $task"
   # `loom new` is the command that pins, so it is the command that says what it
   # pinned. Every later command only ever compares against this. The counts and
   # the include targets first, then the keys that name a PROGRAM — because
@@ -3993,7 +4101,13 @@ Landing would publish commits nobody read. Re-run the review, then land:
     # itself — everything this command checks has already passed, and the push
     # has already happened.
     git branch --set-upstream-to="origin/$br" "$br" >/dev/null 2>&1 || true
-    config_repin "$task" || true
+    # `strict-push`: the only thing this re-pin is for is loom's own two writes
+    # above (branch.<br>.remote and branch.<br>.merge), neither of which names a
+    # program. Anything in the same delta that DOES name one did not come from
+    # loom, and adopting it silently would hand the next `loom scout` and
+    # `loom plan` a baseline nobody read. It refuses instead — after the push,
+    # which it says.
+    config_repin "$task" strict-push || true
     title="$(head -1 "$AGENTS_DIR/tasks/$task.md" 2>/dev/null | sed 's/^#[[:space:]]*//')"
     [ -n "$title" ] || title="$task"
     echo ""
