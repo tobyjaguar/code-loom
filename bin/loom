@@ -821,16 +821,41 @@ config_sidecar() { # config_sidecar <task> -> the path of that task's pinned con
 #                               key, which is not a detail: the three live in
 #                               three different files with three different
 #                               writers.
-#   include:<path>:<sha256>     one file pulled into the config by an
+#   include:<path>:<sha256>\n<bytes>
+#                               one file pulled into the config by an
 #                               `include.path` / `includeIf.<cond>.path`
-#                               directive, digested. `<sha256>` is `(missing)`
-#                               when the target does not exist — recorded as
-#                               such, because "the include target appeared" is
-#                               exactly as much of a change as "its contents
-#                               changed".
+#                               directive: its resolved path, the sha256 of its
+#                               raw bytes, and THE BYTES THEMSELVES. `<sha256>`
+#                               is `(missing)` when the target does not exist —
+#                               and then there is no value half — because "the
+#                               include target appeared" is exactly as much of a
+#                               change as "its contents changed".
+#
+#                               The bytes are there so that a change to an
+#                               included file shows up as a `-`/`+` CONTENT
+#                               diff. A digest alone said only "this file is
+#                               not the file it was", which is a refusal the
+#                               operator cannot read: the whole point of the
+#                               sidecar is that a mismatch is shown rather than
+#                               asserted, and an include was the one entry that
+#                               could not be.
+#
+#                               The path AND the bytes are escaped ON THE WAY
+#                               IN (the same escaping `show` renders values
+#                               with), not on the way out. That is what keeps
+#                               the framing unambiguous: a NUL in an included
+#                               file would otherwise split one record into two,
+#                               and a newline in either half would move the
+#                               boundary between them.
+#
+# A record's SHAPE is judged by its scope tag and nothing else: a record whose
+# key half does not begin with one of `local:` / `worktree-main:` /
+# `worktree-task:` is an include record. Keying off "does it contain a newline"
+# was wrong in exactly the case that matters — an include path (or now its
+# content) carrying one.
 config_py() { # config_py digest <dump> | diff <recorded> <dump>
               #         | snapshot <out> <dump> <file> <dump> <file> <dump> <file>
-              #         | summary <dump>
+              #         | summary <dump> | programs <dump>
   python3 - "$@" << 'PY'
 import collections, hashlib, os, subprocess, sys
 
@@ -844,28 +869,58 @@ def read(path):
     with open(path, "rb") as fh:
         return records(fh.read())
 
+def esc(s):
+    """One line, printable, and reversible enough to read. Used on a config
+    VALUE at render time, and on an include record's path and bytes at WRITE
+    time — the same escaping either way, so what a diff prints for an include
+    is what it prints for anything else."""
+    s = s.replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t")
+    return "".join(c if c >= " " and c != "\x7f" else "\\x%02x" % ord(c) for c in s)
+
+def scope_of(k):
+    """The scope tag a record's key half carries, and the key without it.
+    ("", k) means NO tag, which is what an include record is — judged by the
+    tag's absence and never by the record's shape, because an include path or
+    an included file's bytes may contain anything at all."""
+    for s in SCOPES:
+        if k.startswith(s + ":"):
+            return s, k[len(s) + 1:]
+    return "", k
+
+def program_key(k):
+    """Keys whose value names a PROGRAM git runs in your session — or a file
+    that can name one. git lower-cases the section and the final key in its
+    listings, so the comparison is against that form. Keep in step with the
+    list in `loom new`'s WARN block and ARCHITECTURE.md § 5."""
+    if k in ("core.hookspath", "core.askpass", "gpg.program",
+             "core.attributesfile", "core.sshcommand"):
+        return True
+    for p in ("credential.", "filter.", "pager.", "include.", "includeif."):
+        if k.startswith(p):
+            return True
+    if k.startswith("merge.") and k.endswith(".driver"):
+        return True
+    if k.startswith("diff.") and (k.endswith(".textconv") or k.endswith(".command")):
+        return True
+    return False
+
 def show(rec):
     key, sep, val = rec.partition(b"\n")
     k = key.decode("utf-8", "replace")
-    # An include record is one flat line and carries no value half.
-    if k.startswith("include:") and not sep:
-        return k
-    scope = ""
-    for s in SCOPES:
-        if k.startswith(s + ":"):
-            scope, k = s, k[len(s) + 1:]
-            break
+    scope, k = scope_of(k)
+    if not scope:
+        # An include record: `include:<escaped path>:<sha256>`, and after it the
+        # target's own bytes, ALREADY escaped when the record was written. Both
+        # halves go out as they are — escaping them again here would double
+        # every backslash the file happens to contain.
+        return k + ("=" + val.decode("utf-8", "replace") if sep else "")
     out = k
     if sep:
-        v = val.decode("utf-8", "replace")
-        v = v.replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t")
-        v = "".join(c if c >= " " and c != "\x7f" else "\\x%02x" % ord(c) for c in v)
-        out += "=" + v
+        out += "=" + esc(val.decode("utf-8", "replace"))
     # AFTER the key=value, deliberately: a reader (and a test) looking for the
     # key it planted finds "+ <key>=" where it always did, and the scope is the
     # extra fact rather than a prefix that moves it.
-    if scope:
-        out += "   [%s]" % scope
+    out += "   [%s]" % scope
     return out
 
 # --- the include closure ---------------------------------------------------
@@ -923,10 +978,17 @@ def closure(seeds):
             with open(path, "rb") as fh:
                 raw = fh.read()
         except OSError:
-            out.append(("include:%s:(missing)" % path).encode("utf-8", "surrogateescape"))
+            # No value half at all: "(missing)" is the whole of what is known,
+            # and an empty one would read as "present and empty".
+            out.append(("include:%s:(missing)" % esc(path)).encode("utf-8"))
             continue
-        out.append(("include:%s:%s" % (path, hashlib.sha256(raw).hexdigest()))
-                   .encode("utf-8", "surrogateescape"))
+        # path, sha256 AND the bytes — so a later edit of the target is a
+        # content diff and not a pair of digests nobody can compare. Escaped
+        # here rather than at render time: the record is NUL-framed with a
+        # newline between its halves, and an included file may contain both.
+        out.append(("include:%s:%s\n%s"
+                    % (esc(path), hashlib.sha256(raw).hexdigest(),
+                       esc(raw.decode("utf-8", "replace")))).encode("utf-8"))
         sub = file_records(path)
         if sub is None:            # git cannot parse it, so git honours no
             continue               # include of its either; the digest above
@@ -972,17 +1034,37 @@ try:
         n_local = n_wt = 0
         targets = []
         for r in read(sys.argv[2]):
-            k = r.partition(b"\n")[0].decode("utf-8", "replace")
-            if k.startswith("include:") and b"\n" not in r:
-                targets.append(k[len("include:"):].rsplit(":", 1)[0])
-            elif k.startswith("local:"):
+            scope, k = scope_of(r.partition(b"\n")[0].decode("utf-8", "replace"))
+            if scope == "local":
                 n_local += 1
-            elif k.startswith("worktree-main:") or k.startswith("worktree-task:"):
+            elif scope:
                 n_wt += 1
+            else:
+                # No scope tag, so an include record. The path is already
+                # escaped (one line, printable), which is why it can be printed
+                # into a WARN block without checking it first.
+                if k.startswith("include:"):
+                    k = k[len("include:"):]
+                targets.append(k.rsplit(":", 1)[0])
         print(n_local)
         print(n_wt)
         for t in targets:
             print(t)
+    elif mode == "programs":
+        # Every pinned key that names a program git runs, tagged with its
+        # scope. `loom new` and `loom pin-config` print these once, out loud:
+        # the pin is a CHANGE check, so whatever is here is being adopted as
+        # the baseline, and the operator should meet that fact at the moment of
+        # pinning rather than never.
+        for r in read(sys.argv[2]):
+            key, sep, val = r.partition(b"\n")
+            scope, k = scope_of(key.decode("utf-8", "replace"))
+            if not scope:
+                continue          # an include record; `summary` names those
+            if not program_key(k.lower()):
+                continue
+            print("[%s] %s=%s"
+                  % (scope, k, esc(val.decode("utf-8", "replace")) if sep else ""))
     else:
         sys.stderr.write("loom: internal error: unknown config mode '%s'\n" % mode)
         raise SystemExit(2)
@@ -1094,6 +1176,31 @@ config_summary() { # config_summary <dump>
   echo "loom: WARN: an edit to one is a refusal — and an included file can carry every" >&2
   echo "loom: WARN: key .git/config can, core.hooksPath and credential.helper included:" >&2
   printf '%s\n' "$targets" | sed 's|^|loom: WARN:   |' >&2
+}
+
+# The keys in the pin that name a PROGRAM git runs, said out loud at the moment
+# they are adopted — because that is the moment, and there is no other one.
+#
+# The pin is a CHANGE check: whatever `core.hooksPath`, `credential.helper`,
+# `filter.<d>.clean`, `merge.<d>.driver`, `diff.<d>.textconv`/`.command`,
+# `gpg.program`, `pager.<cmd>`, `core.attributesFile`, `core.sshCommand` or
+# `include.path`/`includeIf.*` the repository ALREADY carried is the baseline
+# and is trusted from here on (ARCHITECTURE.md § 5, residual 1). An operator
+# who never sees that list has no way to know they accepted it. Printed per
+# SCOPE, with the values escaped, because the three scopes have three different
+# writers and "which file is this in" is the actionable half.
+config_programs() { # config_programs <dump>
+  local out
+  out="$(config_py programs "$1" 2>/dev/null)" || return 0
+  if [ -z "$out" ]; then
+    echo "loom: the pinned config names no program for git to run" >&2
+    return 0
+  fi
+  echo "loom: WARN: the pinned config names PROGRAMS git runs in YOUR session — on" >&2
+  echo "loom: WARN: checkout, 'git add', commit, a merge, a fetch, a push or any" >&2
+  echo "loom: WARN: subcommand at all. They are the BASELINE now: loom refuses a" >&2
+  echo "loom: WARN: change to them and vouches for none of them." >&2
+  printf '%s\n' "$out" | sed 's|^|loom: WARN:   |' >&2
 }
 
 # Re-pin: the config as it is NOW becomes task <task>'s baseline. Called by
@@ -3102,8 +3209,12 @@ fenced paths into this worktree. Confirm it on the command line:
   # `core.sparseCheckout` in the new worktree's own config.worktree.
   config_repin "$task" || die "cannot pin this repository's git config for task $task"
   # `loom new` is the command that pins, so it is the command that says what it
-  # pinned. Every later command only ever compares against this.
-  config_summary "$(config_sidecar "$task")"
+  # pinned. Every later command only ever compares against this. The counts and
+  # the include targets first, then the keys that name a PROGRAM — because
+  # those are the ones being ADOPTED, and this is the only moment an operator
+  # is shown them.
+  config_summary  "$(config_sidecar "$task")"
+  config_programs "$(config_sidecar "$task")"
   NEW_WT=""; NEW_BR=""; NEW_STATE=""
   trap - EXIT INT TERM
   echo "$wt"
