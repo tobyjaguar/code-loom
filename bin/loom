@@ -51,7 +51,10 @@
 #   LOOM_LAND=merge|pr             land by merging here, or by pushing a branch
 #                                  for review (--pr / --merge win over this)
 #   LOOM_DIFF_CMD="delta"          how `loom diff` shows a patch; the patch path
-#                                  is appended. Default: git's own pager. Split
+#                                  is appended. Default: the patch streams,
+#                                  UNPAGED (`core.pager` is a program git runs,
+#                                  and it lives in the shared .git/config — set
+#                                  LOOM_DIFF_CMD="less -R" for a pager). Split
 #                                  on whitespace, no quoting — wrap a path with
 #                                  spaces in a one-line script.
 #   LOOM_ENV=<file>                provider keys, sourced if present
@@ -140,6 +143,45 @@ TIER="${LOOM_TIER:-standard}"
 MAX_ATTEMPTS="${LOOM_MAX_ATTEMPTS:-3}"
 SKIP="${LOOM_SKIP:-}"
 
+# --- git's own environment, as it reaches a HOOK ---------------------------
+# Snapshotted HERE, before either env file is sourced, and restored after the
+# blanket `unset GIT_*` further down. Same carve-out shape as $OC_VARS: what
+# was in the environment when `loom` started survives; what a file in the tree
+# sets does not.
+#
+# The reason is `loom guard`, which git runs as a pre-commit hook. For
+# `git commit -a`, `git commit -- <path>`, `--only` and `--include`, git builds
+# a TEMPORARY index for the commit and hands the hook its path in
+# $GIT_INDEX_FILE — the staged content of that commit lives there and NOWHERE
+# else. Round 6 unset that variable along with the rest, so `cmd_guard`'s
+# `git diff --cached` read the standard index instead, found nothing staged,
+# and exited 0: a `git commit -a` touching a hand-zone path walked straight
+# through a guard that printed no complaint. Measured with git 2.34 —
+# `GIT_INDEX_FILE=<repo>/.git/index.lock` for `commit -a` in the main
+# checkout, and `<gitdir>/next-index-<pid>.lock` plus a $GIT_DIR naming the
+# worktree's git dir for a path-limited commit in a LINKED worktree.
+#
+# So: $GIT_INDEX_FILE, and the variables git sets alongside it in one layout or
+# another ($GIT_DIR, $GIT_WORK_TREE, $GIT_PREFIX and the $GIT_AUTHOR_*/
+# $GIT_COMMITTER_* identity), are restored to whatever they held on entry.
+# $ROOT and $INVOKED_ROOT are resolved BEFORE this and never re-read, so a
+# restored $GIT_DIR cannot move them.
+#
+# What this does NOT claim: a caller that exports $GIT_DIR itself is
+# indistinguishable from git doing it, and wins — exactly as a caller that
+# exports $OPENCODE_CONFIG wins. The hook runs in the agent's own session
+# (KNOWN-GAPS 1's residual already concedes that $XDG_CONFIG_HOME there is the
+# agent's), and the whole hook is dominated by `git commit --no-verify`. The
+# guard is a seatbelt; `loom land`'s check of the COMMITS is the lock.
+GIT_HOOK_VARS="GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE GIT_PREFIX \
+GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_AUTHOR_DATE \
+GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL GIT_COMMITTER_DATE"
+GIT_SNAP=()
+for _v in $GIT_HOOK_VARS; do
+  if [ -n "${!_v+x}" ]; then GIT_SNAP+=("1" "${!_v}"); else GIT_SNAP+=("0" ""); fi
+done
+unset _v
+
 # Provider keys live in one file outside every repo (chmod 600). Sourced here
 # so loom and everything it launches (opencode included) see them without the
 # keys ever entering a repo or a shell profile.
@@ -189,8 +231,92 @@ unset _v _oc_i _oc_was _oc_val OC_SNAP
 # and every merge at a repo of its choosing. $ROOT and $INVOKED_ROOT were
 # resolved before that file was read; from here on nothing in the environment
 # moves them.
+#
+# The second half of the list is the CONFIG channel, and it is a code channel
+# rather than a location one: $GIT_CONFIG_PARAMETERS (and the
+# $GIT_CONFIG_COUNT/$GIT_CONFIG_KEY_n/$GIT_CONFIG_VALUE_n form) inject config at
+# the highest precedence git has, $GIT_CONFIG_GLOBAL/$GIT_CONFIG_SYSTEM
+# re-aim whole config files, and the rest name PROGRAMS git runs
+# ($GIT_SSH_COMMAND, $GIT_PROXY_COMMAND, $GIT_EXTERNAL_DIFF, $GIT_PAGER,
+# $GIT_EDITOR, $GIT_SEQUENCE_EDITOR, $GIT_ASKPASS/$SSH_ASKPASS). One line in a
+# landed loom.env is a shell of the agent's choosing, running as you, the next
+# time you type any loom command.
 unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
-      GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_CEILING_DIRECTORIES
+      GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_CEILING_DIRECTORIES \
+      GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_AUTHOR_DATE \
+      GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL GIT_COMMITTER_DATE \
+      GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM \
+      GIT_SSH_COMMAND GIT_PROXY_COMMAND GIT_EXTERNAL_DIFF GIT_PAGER GIT_EDITOR \
+      GIT_SEQUENCE_EDITOR GIT_ASKPASS SSH_ASKPASS
+# $GIT_CONFIG_COUNT is gone, but the numbered pairs it counted are separate
+# variables and survive it — and git reads them whenever the count is set, so a
+# later `GIT_CONFIG_COUNT=2` from anywhere would pick up whatever is still
+# standing. Remove every one of them by name.
+while IFS= read -r _k; do
+  [ -n "$_k" ] && unset "$_k"
+done < <(compgen -v 2>/dev/null | grep -E '^GIT_CONFIG_(KEY|VALUE)_[0-9]+$' || true)
+unset _k
+
+# git's environment as a HOOK gets it back — only the values that were there
+# when loom started, never one a file in the tree wrote. See $GIT_HOOK_VARS.
+_g_i=0
+for _v in $GIT_HOOK_VARS; do
+  _g_was="${GIT_SNAP[$_g_i]}"; _g_val="${GIT_SNAP[$((_g_i + 1))]}"
+  _g_i=$((_g_i + 2))
+  [ "$_g_was" = 1 ] && export "$_v=$_g_val"
+done
+unset _v _g_i _g_was _g_val GIT_SNAP GIT_HOOK_VARS
+
+# ------------------------------------------- loom's OWN git config, on top
+# `.git/config` is in the SHARED git directory, so every linked worktree can
+# write it — `git -C <worktree> config core.pager /tmp/x` is one command from
+# inside an agent's tree. Several of its keys name a PROGRAM git then runs, in
+# YOUR session, the next time loom touches this repository: core.pager,
+# core.fsmonitor, core.sshCommand, remote.<n>.uploadpack/receivepack,
+# diff.external, core.editor, sequence.editor. That is repo-local config as a
+# code channel, and it is a shorter path than anything KNOWN-GAPS 3 describes.
+#
+# $GIT_CONFIG_PARAMETERS is what `git -c` uses internally, and it outranks every
+# config FILE, so this is the highest-precedence answer for every git subprocess
+# loom spawns — including `git -C "$wt" …`, the operator's `.agents/gate.sh`
+# (which inherits this environment), and any hook git runs underneath them.
+#
+# What is deliberately NOT here:
+#   core.hooksPath   the operator's hooks MUST run — `loom install-hooks` puts
+#                    the hand-zone guard in one. Overriding it would disarm the
+#                    guard from inside loom. It stays trusted, and
+#                    ARCHITECTURE.md § 5 / KNOWN-GAPS 6 say what that is worth.
+#   protocol.allow   already defaults to `user`, which is what we want.
+#   credential.helper  yours; a push has to be able to authenticate.
+#   diff.external    MEASURED, and it is the one entry that cannot go here: an
+#                    empty value is not "unset", it is a command named "", and
+#                    `git -c diff.external= diff` dies with "cannot run : No
+#                    such file or directory" on every hunk. `--no-ext-diff` on
+#                    each diff-producing command is the lever that works, and it
+#                    covers the per-attribute `diff.<driver>.command` too.
+#   remote.*.uploadpack / receivepack — they ARE below, as a floor, but they do
+#                    not win: git collects those into a list and keeps the
+#                    FIRST ("more than one receivepack given, using the first"),
+#                    and a config file is read before this variable. The lock is
+#                    `--upload-pack=` / `--receive-pack=` on the fetch and the
+#                    push, which do win. Measured, both ways.
+#
+# core.sshCommand is pinned to the operator's own GLOBAL/SYSTEM value when they
+# have one, rather than to a bare `ssh`: the repo-local key is the attack, an
+# `~/.gitconfig` that names an identity file is not, and a plain `ssh` would
+# break that operator's push for nothing.
+_ssh="$(git config --global --get core.sshCommand 2>/dev/null || true)"
+[ -n "$_ssh" ] || _ssh="$(git config --system --get core.sshCommand 2>/dev/null || true)"
+[ -n "$_ssh" ] || _ssh="ssh"
+# GIT_CONFIG_PARAMETERS is a list of sq-quoted `key=value` words, so a literal
+# quote inside a value has to be escaped the way the shell escapes one.
+_ssh="${_ssh//\'/\'\\\'\'}"
+export GIT_CONFIG_PARAMETERS="'core.pager=cat' 'core.fsmonitor=false' \
+'protocol.ext.allow=never' 'core.sshCommand=$_ssh' \
+'remote.origin.uploadpack=git-upload-pack' 'remote.origin.receivepack=git-receive-pack' \
+'core.editor=true' 'sequence.editor=true'"
+unset _ssh
+
 for _k in ZHIPU_API_KEY ZAI_API_KEY DEEPSEEK_API_KEY MOONSHOT_API_KEY; do
   case "$(eval "echo \"\${$_k:-}\"")" in *PASTE-YOUR*) unset "$_k" ;; esac
 done
@@ -1638,8 +1764,8 @@ an empty diff."
   # status of a process substitution cannot be read — so it goes through a
   # file, and a git that fails is a refusal rather than an empty path list.
   local out; out="$(mktemp "${TMPDIR:-/tmp}/loom-hist.XXXXXX")"
-  if ! { git -C "$d" diff -z --no-renames --name-only "$base" "$rev" \
-      && git -C "$d" diff -z --no-renames --name-only --diff-filter=A "$base" "$rev"
+  if ! { git -C "$d" diff --no-ext-diff --no-textconv -z --no-renames --name-only "$base" "$rev" \
+      && git -C "$d" diff --no-ext-diff --no-textconv -z --no-renames --name-only --diff-filter=A "$base" "$rev"
        } > "$out" 2>/dev/null; then
     rm -f "$out"
     die "git diff $base..$rev failed in $d — refusing to guess what those commits touch"
@@ -1779,7 +1905,7 @@ cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
       violations="$violations
   $file"
     fi
-  done < <(git -C "$INVOKED_ROOT" diff --cached --name-only)
+  done < <(git -C "$INVOKED_ROOT" diff --no-ext-diff --no-textconv --cached --name-only)
   if [ -n "$violations" ]; then
     echo "BLOCKED: agent branch '$branch' touches hand-zone paths:$violations" >&2
     echo "" >&2
@@ -2334,7 +2460,7 @@ cmd_check() {
   # handed to the reviewer is exactly the range the history check just cleared,
   # cut against the SHA that range was cleared for.
   reviews_dir "$wt"
-  git -C "$ROOT" diff "$base" "$PINNED_TIP" > "$wt/.agents/reviews/$task.patch" \
+  git -C "$ROOT" diff --no-ext-diff --no-textconv "$base" "$PINNED_TIP" > "$wt/.agents/reviews/$task.patch" \
     || die "cannot write the review patch for $task"
   review="$wt/.agents/reviews/$task-review.md"
   log="$(mktemp "${TMPDIR:-/tmp}/loom-review.XXXXXX")"
@@ -2464,14 +2590,21 @@ cmd_diff() {
   fence_reconcile_history "$task" "$base" "$FENCE_PROFILE"
   patch="$wt/.agents/reviews/$task.patch"
   reviews_dir "$wt"
-  git -C "$ROOT" diff "$base" "$PINNED_TIP" > "$patch" \
+  git -C "$ROOT" diff --no-ext-diff --no-textconv "$base" "$PINNED_TIP" > "$patch" \
     || die "cannot write the diff for $task"
   echo "loom: patch at $(relpath "$patch")" >&2
   # No editor is assumed. LOOM_DIFF_CMD takes the patch path as its last
-  # argument (`delta`, `bat`, `less`, `code --wait`, `vim -R` — whatever you
-  # use); otherwise git shows it through its own pager, honouring your
-  # color.diff and core.pager settings. Either way it is the SAME range the
-  # history check just cleared: base..$PINNED_TIP, read in $ROOT.
+  # argument (`delta`, `bat`, `less -R`, `code --wait`, `vim -R` — whatever you
+  # use). Either way it is the SAME range the history check just cleared:
+  # base..$PINNED_TIP, read in $ROOT.
+  #
+  # WITHOUT it the patch streams, unpaged. That is a deliberate loss: `core.pager`
+  # names a program git runs, and it lives in the shared .git/config that every
+  # linked worktree can write, so loom pins it to `cat` for every git subprocess
+  # it spawns (see $GIT_CONFIG_PARAMETERS at the top of this file). `--no-pager`
+  # here says the same thing on the command line rather than leaving it to a
+  # variable a future edit might drop. A pager is operator-side now, and
+  # LOOM_DIFF_CMD is where it goes: `export LOOM_DIFF_CMD="less -R"`.
   if [ -n "${LOOM_DIFF_CMD:-}" ]; then
     # Word-split on purpose: the value is a command line, not one filename.
     # shellcheck disable=SC2086
@@ -2480,7 +2613,7 @@ cmd_diff() {
     have "$1" || die "LOOM_DIFF_CMD: '$1' is not on PATH — the patch is at $patch"
     "$@" "$patch"
   else
-    git -C "$ROOT" diff "$base" "$PINNED_TIP"
+    git -C "$ROOT" --no-pager diff --no-ext-diff --no-textconv "$base" "$PINNED_TIP"
   fi
 }
 
@@ -2545,7 +2678,13 @@ Landing would publish commits nobody read. Re-run the review, then land:
     # The SHA, pushed INTO the branch's ref name. Pushing the name would publish
     # whatever the ref says at push time, which is not necessarily what the gate
     # ran on and the reviewer read.
-    git push origin "$PINNED_TIP:refs/heads/$br" \
+    # `--receive-pack` is spelled out, and it is not decoration: git collects
+    # `remote.<n>.receivepack` into a list and keeps the FIRST value, so the
+    # config file beats the GIT_CONFIG_PARAMETERS floor loom exports ("more
+    # than one receivepack given, using the first" — measured). The command
+    # line is the one place that wins, and this is the command that runs a
+    # program on the far side of a push.
+    git push --receive-pack=git-receive-pack origin "$PINNED_TIP:refs/heads/$br" \
       || die "push of $PINNED_TIP to origin/$br failed — nothing was published"
     git branch --set-upstream-to="origin/$br" "$br" >/dev/null 2>&1 || true
     title="$(head -1 "$AGENTS_DIR/tasks/$task.md" 2>/dev/null | sed 's/^#[[:space:]]*//')"
@@ -2641,7 +2780,7 @@ $(printf '%s\n' "$dirty" | sed 's/^/  /')"
   # The remote a rebase replays onto must be the remote this task was created
   # against. Checked BEFORE the fetch, so a re-aimed URL is never contacted.
   require_recorded_origin "$task" "rebase"
-  old_pid="$(git show "$old_base" | git patch-id --stable | cut -d' ' -f1)"
+  old_pid="$(git show --no-ext-diff --no-textconv "$old_base" | git patch-id --stable | cut -d' ' -f1)"
   # A failed fetch used to be swallowed. It must not be: the whole point of the
   # fetch is that `$upstream` is current, and replaying onto a stale ref moves
   # this task's base onto commits the operator has not seen — silently, because
@@ -2680,7 +2819,7 @@ fetched. Fix the fetch (network, credentials, the remote URL) and re-run."
   elif [ -n "$old_pid" ]; then
     # The old base was replayed onto the upstream: find it by patch-id.
     for c in $(git rev-list --reverse "$mb..$br"); do
-      if [ "$(git show "$c" | git patch-id --stable | cut -d' ' -f1)" = "$old_pid" ]; then new_base="$c"; break; fi
+      if [ "$(git show --no-ext-diff --no-textconv "$c" | git patch-id --stable | cut -d' ' -f1)" = "$old_pid" ]; then new_base="$c"; break; fi
     done
   fi
   if [ -z "$new_base" ]; then
@@ -2783,7 +2922,7 @@ cmd_drop() {
     local where
     if ! git remote get-url origin >/dev/null 2>&1; then
       where="(no 'origin' remote)"
-    elif ! rem="$(git ls-remote --heads origin "$br" 2>/dev/null)"; then
+    elif ! rem="$(git ls-remote --upload-pack=git-upload-pack --heads origin "$br" 2>/dev/null)"; then
       where="(could not reach origin to check)"
     elif [ -n "$rem" ]; then
       where="(it is on origin)"
