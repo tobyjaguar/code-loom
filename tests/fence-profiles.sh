@@ -208,7 +208,8 @@ for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p \
          0043-at 0044-at2 0045-at3 0046-au 0047-au2 0048-av 0049-av2 \
          0050-loom 0051-ax 0052-ax2 0053-au3 \
          0054-az 0055-az2 0056-az3 0057-ba 0058-bb 0059-bc 0060-bd 0061-ba2 0062-bf \
-         0063-bh 0064-bi 0065-bj; do mk_task "$t"; done
+         0063-bh 0064-bi 0065-bj \
+         0066-bk 0067-bk2 0068-bk3 0069-bk4 0070-bl 0071-bl2; do mk_task "$t"; done
 mk_task 0040-ar  codex
 mk_task 0042-as  codex
 mk_task 0005-f codex
@@ -2038,6 +2039,191 @@ want_in "(bj) ... saying the repository has none"         "$out" "this repositor
 want_in "(bj) ... and what it would have replayed onto"   "$out" "refs/remotes/origin/main"
 want_eq "(bj) ... with the base left alone"               "$(state_field 0065-bj base)" "$bj_up"
 "$LOOM" drop 0065-bj > /dev/null 2>&1 || true
+
+# ==========================================================================
+# ROUND-8 fixes. Every case below FAILS against the pre-fix bin/loom (97af9b6).
+#
+# The theme: the two things left in `.git/config` and in a ref NAME. The config
+# keys that matter cannot be enumerated in advance, because the attack is in the
+# KEY (`filter.<anything>`, `pager.<anything>`, `includeIf.<anything>`) — so the
+# whole local config is pinned instead. And `origin/main` is not a ref, it is a
+# lookup, and the lookup order puts a forgery first.
+# ==========================================================================
+
+# --- (bk) the repository's LOCAL git config is pinned to the task ---------
+# `.git/config` is in the SHARED git directory, so `git -C <worktree> config
+# <anything> <anything>` is one command from inside an agent's tree. Several of
+# those keys name a PROGRAM git runs in your session, and two of them —
+# `credential.helper` and `core.askPass` — are HANDED YOUR CREDENTIAL as well as
+# executed. The digest of the whole local config is recorded at `loom new` and
+# re-checked before every model launch, fetch, push, merge, replay and review
+# patch; `--accept-config` is the only escape.
+git init -q --bare "$TMP/origin-bk.git"
+git remote add origin "$TMP/origin-bk.git"
+git push -q origin main
+out="$("$LOOM" new 0066-bk 2>&1)"; rc=$?
+want_eq   "(bk) setup: a task against a real origin"      "$rc" "0"
+want_ne   "(bk) ... with the local config pinned in the record" "$(state_field 0066-bk config)" ""
+want_file "(bk) ... and the full list beside it, for the diff" "$(state_of 0066-bk).gitconfig"
+BKW="$WTU/0066-bk"
+echo "benign" > "$BKW/backend/bk.txt"
+git -C "$BKW" add backend/bk.txt
+git -C "$BKW" commit -qm "benign work on bk"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0066-bk 2>&1)"; rc=$?
+want_eq "(bk) setup: it is reviewed"                      "$rc" "0"
+cat > "$TMP/bk-cred.sh" << CRED
+#!/usr/bin/env bash
+: > "$TMP/bk-cred-ran"
+exit 0
+CRED
+chmod +x "$TMP/bk-cred.sh"
+# 1. credential.helper, set from inside the worktree. `!<command>` is a shell,
+#    and git also hands it the credential to store.
+git -C "$BKW" config credential.helper "!$TMP/bk-cred.sh"
+out="$("$LOOM" land 0066-bk --pr 2>&1)"; rc=$?
+want_eq     "(bk) land --pr refuses a credential.helper planted from the worktree" "$rc" "1"
+want_in     "(bk) ... naming the key that appeared"       "$out" "+ credential.helper="
+want_in     "(bk) ... and saying which task it is not the config of" \
+            "$out" "not the one task 0066-bk was created against"
+want_in     "(bk) ... with the one escape"                "$out" "--accept-config"
+want_absent "(bk) ... refused before any transport: the helper never ran" "$TMP/bk-cred-ran"
+want_eq     "(bk) ... and origin received nothing" \
+            "$(git -C "$TMP/origin-bk.git" rev-parse --verify --quiet refs/heads/agent/0066-bk || echo GONE)" "GONE"
+git config --unset credential.helper
+# 2. core.askPass, the same way.
+git -C "$BKW" config core.askPass "$TMP/bk-cred.sh"
+out="$("$LOOM" land 0066-bk --pr 2>&1)"; rc=$?
+want_eq     "(bk) land --pr refuses a core.askPass too"   "$rc" "1"
+# git lower-cases the variable name in `--list`, so the pinned list says
+# `core.askpass` however it was written.
+want_in     "(bk) ... naming it"                          "$out" "+ core.askpass="
+want_absent "(bk) ... which never ran either"             "$TMP/bk-cred-ran"
+want_eq     "(bk) ... and origin still received nothing" \
+            "$(git -C "$TMP/origin-bk.git" rev-parse --verify --quiet refs/heads/agent/0066-bk || echo GONE)" "GONE"
+git config --unset core.askPass
+# 3. ... and with the config back where the record pinned it, the push happens.
+out="$("$LOOM" land 0066-bk --pr 2>&1)"; rc=$?
+want_eq "(bk) with the config back, land --pr pushes"     "$rc" "0"
+want_ne "(bk) ... and origin now carries the branch" \
+        "$(git -C "$TMP/origin-bk.git" rev-parse --verify --quiet refs/heads/agent/0066-bk || echo GONE)" "GONE"
+"$LOOM" drop 0066-bk > /dev/null 2>&1 || true
+
+# 4. a filter driver planted AFTER `loom new`: `loom run` refuses before the
+#    model, not after it. filter.<d>.clean is the shape that cannot be pinned
+#    key by key — the driver name is the agent's to choose.
+out="$("$LOOM" new 0067-bk2 2>&1)"; rc=$?
+want_eq "(bk) setup: a second task"                       "$rc" "0"
+BK2W="$WTU/0067-bk2"
+git -C "$BK2W" config filter.x.clean "$TMP/bk-cred.sh"
+bk_claude_before="$(wc -l < "$TMP/called-claude.log" 2>/dev/null || echo 0)"
+out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 "$LOOM" run 0067-bk2 2>&1)"; rc=$?
+want_eq     "(bk) loom run refuses a filter driver planted after loom new" "$rc" "1"
+want_in     "(bk) ... naming it"                          "$out" "+ filter.x.clean="
+want_not_in "(bk) ... before the model, not after"        "$out" "running on"
+want_eq     "(bk) ... so no model was launched" \
+            "$(wc -l < "$TMP/called-claude.log" 2>/dev/null || echo 0)" "$bk_claude_before"
+# 5. --accept-config prints the diff and proceeds, and what it re-records is
+#    the new baseline.
+out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 "$LOOM" run 0067-bk2 --accept-config 2>&1)"; rc=$?
+want_eq "(bk) --accept-config proceeds"                   "$rc" "0"
+want_in "(bk) ... printing what changed"                  "$out" "+ filter.x.clean="
+want_in "(bk) ... saying it is re-recorded, and by whom"  "$out" "re-recording it as the baseline"
+want_in "(bk) ... and the model really ran"               "$out" "gate green"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0067-bk2 2>&1)"; rc=$?
+want_eq "(bk) the re-recorded config is the new baseline, no flag needed" "$rc" "0"
+"$LOOM" drop 0067-bk2 > /dev/null 2>&1 || true
+git config --unset filter.x.clean
+
+# 6. a record with no `config=` at all — the shape a pre-pin `loom` wrote. There
+#    is nothing to compare against, so it is a refusal, and --accept-config is
+#    NOT an escape from it: re-recording would pin whatever is there now and
+#    call it the baseline the operator chose.
+out="$("$LOOM" new 0068-bk3 2>&1)"; rc=$?
+want_eq "(bk) setup: a third task"                        "$rc" "0"
+BK3W="$WTU/0068-bk3"
+echo "benign" > "$BK3W/backend/bk3.txt"
+git -C "$BK3W" add backend/bk3.txt
+git -C "$BK3W" commit -qm "benign work on bk3"
+sedi '/^config=/d' "$(state_of 0068-bk3)"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0068-bk3 2>&1)"; rc=$?
+want_eq     "(bk) a record with no config= is refused"    "$rc" "1"
+want_in     "(bk) ... saying there is nothing to compare against" "$out" "pins no git config"
+want_in     "(bk) ... with the recreate instruction"      "$out" "loom drop 0068-bk3 && loom new 0068-bk3"
+want_not_in "(bk) ... and no reviewer was launched"       "$out" "running on"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0068-bk3 --accept-config 2>&1)"; rc=$?
+want_eq "(bk) ... and --accept-config does not paper over a MISSING pin" "$rc" "1"
+want_in "(bk) ... for the same reason"                    "$out" "pins no git config"
+"$LOOM" drop 0068-bk3 > /dev/null 2>&1 || true
+# 7. `loom new` is the command that pins, so it has nothing to accept — and
+#    swallowing the flag would read as "the config was re-pinned".
+out="$("$LOOM" new 0069-bk4 --accept-config 2>&1)"; rc=$?
+want_eq     "(bk) loom new refuses --accept-config"       "$rc" "1"
+want_in     "(bk) ... because it is the command that pins" "$out" "this command is the one that pins it"
+want_absent "(bk) ... and created nothing"                "$WTU/0069-bk4"
+want_absent "(bk) ... not a record either"                "$(state_of 0069-bk4)"
+git remote remove origin
+
+# --- (bl) a rebase resolves its refs; it does not look them up ------------
+# `origin/main` and `main` are not ref names, they are things git RESOLVES, and
+# the order (gitrevisions) is refs/<n> > refs/tags/<n> > refs/heads/<n> >
+# refs/remotes/<n>. So a local branch literally named "origin/main", a
+# `refs/origin/main`, and a TAG named "main" each answer before the ref
+# `loom rebase` fetched and means — and each is one `git update-ref` from inside
+# a worktree, which is where they are planted from here.
+git init -q --bare "$TMP/origin-bl.git"
+git remote add origin "$TMP/origin-bl.git"
+git push -q origin main
+out="$("$LOOM" new 0070-bl 2>&1)"; rc=$?
+want_eq "(bl) setup: a task against a real origin"        "$rc" "0"
+BLW="$WTU/0070-bl"
+echo "benign" > "$BLW/backend/bl.txt"
+git -C "$BLW" add backend/bl.txt
+git -C "$BLW" commit -qm "the task's own work"
+bl_tip="$(git rev-parse agent/0070-bl)"
+echo "upstream" > backend/bl-upstream.txt        # what the REAL origin/main has
+git add backend/bl-upstream.txt
+git commit -qm "upstream: the real main moved for bl"
+bl_up="$(git rev-parse HEAD)"
+git push -q origin main
+# the three forgeries, all at the branch's own tip: burying the branch's own
+# work under its own base is what a hijacked `origin/main` buys.
+git -C "$BLW" update-ref refs/heads/origin/main "$bl_tip"
+git -C "$BLW" update-ref refs/origin/main       "$bl_tip"
+git -C "$BLW" update-ref refs/tags/origin/main  "$bl_tip"
+out="$("$LOOM" rebase 0070-bl origin/main --accept-upstream 2>&1)"; rc=$?
+want_eq     "(bl) the rebase replays onto the REAL refs/remotes/origin/main" "$rc" "0"
+want_eq     "(bl) ... so the recorded base is the real upstream tip" \
+            "$(state_field 0070-bl base)" "$bl_up"
+want_ne     "(bl) ... never the branch's own tip"         "$(state_field 0070-bl base)" "$bl_tip"
+want_not_in "(bl) ... and git never had to pick"          "$out" "is ambiguous"
+want_in     "(bl) the branch's own work is still ABOVE the base" \
+            "$(git diff --name-only "$(state_field 0070-bl base)" refs/heads/agent/0070-bl)" "backend/bl.txt"
+git update-ref -d refs/heads/origin/main 2>/dev/null || true
+git update-ref -d refs/origin/main       2>/dev/null || true
+git update-ref -d refs/tags/origin/main  2>/dev/null || true
+"$LOOM" drop 0070-bl > /dev/null 2>&1 || true
+# ... and the LOCAL-branch leg, where a TAG named `main` outranks the branch
+# `main` that the `show-ref --verify refs/heads/main` guard just proved exists.
+out="$("$LOOM" new 0071-bl2 2>&1)"; rc=$?
+want_eq "(bl) setup: a second task"                       "$rc" "0"
+BL2W="$WTU/0071-bl2"
+echo "benign" > "$BL2W/backend/bl2.txt"
+git -C "$BL2W" add backend/bl2.txt
+git -C "$BL2W" commit -qm "the task's own work on bl2"
+bl2_tip="$(git rev-parse agent/0071-bl2)"
+echo "assist only" > backend/bl2-upstream.txt
+git add backend/bl2-upstream.txt
+git commit -qm "upstream: the local main moved for bl2"
+bl2_up="$(git rev-parse refs/heads/main)"
+git -C "$BL2W" update-ref refs/tags/main "$bl2_tip"       # the forgery
+out="$("$LOOM" rebase 0071-bl2 main --accept-upstream 2>&1)"; rc=$?
+want_eq     "(bl) the local leg replays onto refs/heads/main" "$rc" "0"
+want_eq     "(bl) ... so the base is the local BRANCH's tip"  "$(state_field 0071-bl2 base)" "$bl2_up"
+want_ne     "(bl) ... not the tag's"                      "$(state_field 0071-bl2 base)" "$bl2_tip"
+want_not_in "(bl) ... and git never had to pick here either" "$out" "is ambiguous"
+git update-ref -d refs/tags/main 2>/dev/null || true
+"$LOOM" drop 0071-bl2 > /dev/null 2>&1 || true
+git remote remove origin
 
 # --- (j)/(t) doctor lists the profiles, and touches no network ------------
 out="$(timeout 180 "$LOOM" doctor 2>&1 || true)"
