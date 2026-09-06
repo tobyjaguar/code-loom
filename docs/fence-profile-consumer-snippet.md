@@ -86,7 +86,7 @@ providers = ["claude", "codex"]
 scope v1 and cannot be gated locally at all, and `spike/**` is unreviewed
 exploratory code including live-key harnesses.
 
-## 1b. `.agents/zones.toml` — five paths that belong in `[hand]`
+## 1b. `.agents/zones.toml` — five paths (six patterns) that belong in `[hand]`
 
 Check that `[hand].paths` in the consuming repo lists the control plane itself,
 and add what is missing:
@@ -222,13 +222,19 @@ LOOM_MODELS_reviewer="codex-sub claude-sub" \
 ls <worktree>/core <worktree>/ios               # core present, ios absent
 
 loom check <some-task>                            # must die: the flag is missing
-# and the local git config is pinned too — plant a key and it must refuse,
-# naming it, before any model, fetch, push or merge:
+# and the git config is pinned too — plant a key and it must refuse, naming it
+# AND the scope it appeared in, before any model, fetch, push or merge:
 git config filter.probe.clean /bin/true
 loom check <some-task> --fence-profile codex      # must die: "+ filter.probe.clean="
 loom check <some-task> --fence-profile codex --accept-config   # must proceed
 git config --unset filter.probe.clean
 loom check <some-task> --fence-profile codex --accept-config   # re-pin the removal
+
+# ... and the same at WORKTREE scope, which `git config --local --list` does
+# not show at all:
+git -C <worktree> config --worktree core.hooksPath /tmp/probe
+loom check <some-task> --fence-profile codex      # must die: "[worktree-task]"
+git -C <worktree> config --worktree --unset core.hooksPath
 
 loom check <other-unprofiled-task> --fence-profile codex
                                                 # must die: a profile cannot be
@@ -280,30 +286,46 @@ or up to date. Two consequences worth knowing before you rely on it:
   read those and I accept them under the base". Either way the range is printed
   whenever the base moves — the `git log --oneline` and the fenced/hand path
   lists — so the consent is an informed one.
-* **The repository's LOCAL git config is pinned to the task.** `.git/config` is
-  in the shared git directory, so `git -C <worktree> config <anything>
-  <anything>` is one command from inside an agent's tree — and the keys that
-  matter cannot be listed in advance (`filter.<anything>.clean`,
+* **The repository's git config is pinned to the task — all of it.**
+  `.git/config` is in the shared git directory, so `git -C <worktree> config
+  <anything> <anything>` is one command from inside an agent's tree — and the
+  keys that matter cannot be listed in advance (`filter.<anything>.clean`,
   `pager.<anything>`, `includeIf.<anything>` put the attack in the key name),
   while `credential.helper` and `core.askPass` are handed your credential as
-  well as being run. `loom new` records a digest of the whole local config, plus
-  the list itself beside the record as `<task>.gitconfig`, and every command
-  that runs a model, fetches, pushes, merges, replays or writes a review patch
-  recomputes it first. A change prints a `-`/`+` diff and refuses.
+  well as being run. "All of it" is **three scopes and an include closure**,
+  because `git config --local --list` is not what git reads:
+  `.git/config` (`local`), `.git/config.worktree` (`worktree-main`, the main
+  checkout's own scope — a `core.hooksPath` there runs your hooks during
+  `loom land`'s merge), `.git/worktrees/<wt>/config.worktree` (`worktree-task`,
+  one `git config --worktree` from inside the agent's tree), and every file an
+  `include.path`/`includeIf` in any of them pulls in, digested by its bytes.
+  `loom new` records a digest of the lot, plus the list itself beside the record
+  as `<task>.gitconfig` (each entry tagged with its scope), and every command
+  recomputes it **before its first fence operation** and again before it runs a
+  model, fetches, pushes, merges, replays or writes a review patch. A change
+  prints a `-`/`+` diff — naming the scope — and refuses.
   **`--accept-config`** is the one escape and re-records the config as the new
   baseline. Practical consequences for a consuming repo:
-  - an agent that runs `git config user.name` in its worktree trips it. That is
-    intended — it is the same command as `git config credential.helper
-    '!sh -c …'` — and `loom <cmd> <task> --accept-config` is the one-word
-    answer once you have read the diff;
+  - an agent that runs `git config user.name` in its worktree trips it, and so
+    does `git config --worktree <anything>`. That is intended — it is the same
+    command as `git config credential.helper '!sh -c …'` — and
+    `loom <cmd> <task> --accept-config` is the one-word answer once you have
+    read the diff;
   - so does your own `git remote add`, `git config pull.rebase true`, or any
-    other local-config edit you make while a task is open;
+    other config edit you make while a task is open — **including an edit to a
+    file your `.git/config` includes**, which is the case that surprises people;
+  - `loom new` prints `loom: pinned N local + M worktree config entries`, and
+    WARNs, naming the targets, if your config pulls other files in. It
+    **refuses** `--accept-config`: it is the command that pins;
+  - `loom drop` deliberately does not check the pin — it runs no model and
+    publishes nothing, and a repo you cannot clean up is worse than one whose
+    config moved;
   - a task created by a `loom` from before the pin has no `config=` field and is
     refused with no escape: `loom drop <task> && loom new <task>`;
-  - `loom` writes local config on your behalf in exactly two places, and both
-    re-pin themselves: the first `git sparse-checkout init` in a repository
-    (which adds `extensions.worktreeConfig`), and `loom land --pr`'s
-    `--set-upstream-to`.
+  - `loom` writes config on your behalf in exactly two places, and both re-pin
+    themselves: the first `git sparse-checkout init` in a repository (which adds
+    `extensions.worktreeConfig` locally and `core.sparseCheckout` at worktree
+    scope), and `loom land --pr`'s `--set-upstream-to`.
 * **The remote is pinned to the task: the URL *and* `remote.origin.fetch`.**
   Both are recorded at `loom new` and refused when changed. The refspec matters
   because it decides which local ref a fetch updates at all — pointed at
@@ -329,9 +351,12 @@ cat "${XDG_CONFIG_HOME:-$HOME/.config}/loom/repos/"*"/tasks/<some-task>"
 #   pushurl=<`git remote get-url --push origin` at loom new — where a push
 #            actually goes, which remote.origin.pushurl and a
 #            url.<x>.pushInsteadOf rewrite both move without touching `origin`>
-#   config=<sha256 of `git config --local --list --null`, sorted — the whole
-#           local git config, pinned; the list itself is in the file beside
-#           this one, <task>.gitconfig>
+#   config=<sha256, sorted, of the whole git config: the `local` scope, the
+#           `worktree-main` scope (.git/config.worktree), the `worktree-task`
+#           scope (.git/worktrees/<wt>/config.worktree), and one
+#           include:<path>:<sha256> record per file the include directives in
+#           any of them pull in. The list itself is in the file beside this
+#           one, <task>.gitconfig, with each entry tagged by scope>
 ```
 
 Then read [`docs/KNOWN-GAPS.md`](KNOWN-GAPS.md) in the harness repo, in full:

@@ -307,29 +307,77 @@ enough":
   floor). `--no-pager` on every call site also works and was rejected: ~100
   sites, and a site added later would silently have no pin.
 
-**The whole local config is pinned, because the keys that matter cannot be
+**The whole git config is pinned, because the keys that matter cannot be
 enumerated.** `filter.<anything>.clean`, `merge.<anything>.driver`,
 `pager.<anything>`, `includeIf.<anything>` put the attack **in the key name**,
 so there is no finite list for `GIT_CONFIG_PARAMETERS` to override, and
 `credential.helper` / `core.askPass` are worse than a program: git hands them
-the credential as well as running them. So `loom new` records
-`config=<sha256 of the sorted, NUL-separated `git config --local --list
---null`>` as a field of the operator record, and the full list beside it as
-`<task>.gitconfig` (mode 0600) so a mismatch can be shown as a diff rather than
-two digests. It is recomputed and compared:
+the credential as well as running them.
 
+**And "the whole git config" is not `git config --local --list`.** git reads
+three files here, a linked worktree can write two of them, and a fourth channel
+hides behind a pointer:
+
+| scope | file | who can write it |
+|---|---|---|
+| `local` | `$GIT_COMMON_DIR/config` | every worktree — it is shared |
+| `worktree-main` | `$GIT_COMMON_DIR/config.worktree` | the main checkout's own scope; a `core.hooksPath` here runs **your** hooks, in **your** checkout, during `loom land`'s merge |
+| `worktree-task` | `$GIT_COMMON_DIR/worktrees/<wt>/config.worktree` | the task worktree's own scope — `git config --worktree <k> <v>` from inside the agent's tree |
+| `include` | every file an `include.path` / `includeIf.<cond>.path` names, recursively | whoever can write that file, which is not necessarily anyone in this repository |
+
+Both `config.worktree` files are live whenever `extensions.worktreeConfig` is
+enabled — which **loom itself enables**, on the first `git sparse-checkout init`
+in a repository (measured, git 2.34) — and **neither of them appears in
+`git config --local --list`**. Nor do the keys an include brings: `--list`
+prints `include.path=<file>` as a *pointer*, and only the full, all-scopes
+`git config --list` shows the `core.hooksPath` it pulled in (measured, git
+2.34.1). A pin taken over the local listing therefore pinned one file out of
+three and one pointer instead of a file.
+
+So `loom new` records `config=<sha256 of the sorted, NUL-separated union of all
+three scopes' `--list --null` output, each entry tagged with its scope, plus one
+`include:<resolved path>:<sha256 of its bytes>` record per file in the include
+closure>` as a field of the operator record, and the full list beside it as
+`<task>.gitconfig` (mode 0600) so a mismatch can be shown as a diff — one that
+names the scope — rather than two digests. A missing include target is recorded
+as `(missing)`, because "the target appeared" is as much of a change as "its
+contents changed". It is recomputed and compared:
+
+- **before the first fence operation of every command**, which is `loom run`,
+  `check`, `loop`, `diff`, `land` and `rebase` — see the ordering note below;
 - before **every** model launch (in `run_role`, per *attempt* — attempt 1 can
   plant a config and hit a rate limit, and attempt 2 would inherit it);
 - before `loom land`'s **merge** and before its **push**;
 - before `loom rebase`'s **fetch** and again before its **replay**;
 - in `loom check` and `loom diff` before the **review patch** is written.
 
+**The ordering is part of the check.** `fence_reconcile` calls `fence_apply`,
+whose `git sparse-checkout set` is a *working-tree update*: git materialises
+every path the new pattern list admits, and materialising a path runs the
+**smudge** side of whatever `filter.<d>` a `.gitattributes` in that worktree
+selects. The `.gitattributes` is a file the agent writes (uncommitted is
+enough), and `filter.<d>.smudge` is one `git config` away — so with the pin
+checked one line *after* the reconcile, the planted program ran as the operator
+before the refusal it exists for. Every command now reads the pin first, and
+`run_role` reads it above its own per-attempt reconcile.
+
 A change is a dead stop that prints the `-`/`+` lines and names the one escape,
 `--accept-config`, which prints the same diff and re-records it as the new
-baseline. `loom` writes local config on your behalf in exactly two places and
+baseline. **`loom new` refuses `--accept-config`**: it is the command that
+*pins*, so it has nothing to accept, and swallowing the flag would read as "the
+config was re-pinned". It says what it pinned instead — one line,
+`loom: pinned N local + M worktree config entries`, and a WARN naming the
+targets whenever an `include.path`/`includeIf` is present, because an included
+file's bytes are now part of this task's baseline and the operator should meet
+that fact before they meet the refusal. **`loom drop` deliberately does not
+check the pin at all**: it runs no model, publishes nothing, and removes the
+worktree, the branch and the record — refusing to clean up because the config
+moved would strand released paths on disk, which is the opposite of what the
+check is for. `loom` writes config on your behalf in exactly two places and
 both re-pin themselves: `loom new`'s first `git sparse-checkout init` in a
-repository adds `extensions.worktreeConfig` to the shared `.git/config`
-(measured, git 2.34), and `loom land --pr`'s `--set-upstream-to` adds
+repository adds `extensions.worktreeConfig` to the shared `.git/config` and
+`core.sparseCheckout` to the new worktree's own `config.worktree` (measured, git
+2.34), and `loom land --pr`'s `--set-upstream-to` adds
 `branch.<br>.remote`/`.merge`. Everything else that changes it is you or an
 agent — an agent's `git config user.name` in its worktree **will** trip this,
 and that is the intended shape, because it is the same command as
@@ -346,22 +394,25 @@ command refusing.
 **What is still trusted, honestly enumerated.** The residual is three things,
 and it is a residual by construction rather than an oversight:
 
-1. **Whatever the local config already said at `loom new`.** The pin is a
-   *change* check. A repository that already had a hostile `filter.x.clean` in
-   `.git/config` when the task was created has it in the baseline. So is
+1. **Whatever the config already said at `loom new`, in every scope the pin
+   covers.** The pin is a *change* check. A repository that already had a
+   hostile `filter.x.clean` in `.git/config`, in either `config.worktree`, or in
+   an included file when the task was created has it in the baseline. So is
    whatever `--accept-config` was used to re-record — that flag is an operator
    act with the same weight as `--fence-profile`, and `loom` vouches for none of
    what it accepts.
-2. **The operator's own `~/.gitconfig` and the system config.** Neither is in
-   the shared `.git`, neither is writable from a worktree, and neither is
-   pinned. `core.sshCommand` is deliberately *read* from there (see the cost
+2. **The operator's own `~/.gitconfig` and the system config**, and any git
+   config scope outside the three above. None of them is in the shared `.git`,
+   none is writable from a worktree, and none is pinned — they are the
+   operator's. `core.sshCommand` is deliberately *read* from there (see the cost
    below).
 3. **In-tree `.gitattributes`.** The driver lives in the config, which is
    pinned; the *attribute* that selects it for a path lives in the tree. It is a
    `[hand]` path in the shipped template (`.gitattributes` and
    `**/.gitattributes`, because git reads one in any directory), so `loom land`
    refuses a branch that changed it — which is the lock, since the pre-commit
-   guard is a seatbelt.
+   guard is a seatbelt. An *uncommitted* one still selects a driver for a
+   working-tree update, which is why the pin is read before the reconcile.
 
 `remote.origin.url` / `.fetch` / the push URL keep their own named checks on
 top of the pin, because "the remote was re-aimed" is a clearer message than "the

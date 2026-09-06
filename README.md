@@ -444,30 +444,57 @@ part of the branch that still changes your runs:
   is the lock. **Two costs:** `loom diff` no longer pages by default (`export
   LOOM_DIFF_CMD="less -R"` if you want one), and a repo-local `core.sshCommand`
   is ignored — your global one is not.
-- **...and the whole local config is PINNED to the task**, because the keys that
+- **...and the whole git config is PINNED to the task**, because the keys that
   matter cannot be enumerated: `filter.<anything>.clean`,
   `merge.<anything>.driver`, `pager.<anything>` and `includeIf.<anything>` put
   the attack in the **key name**, so there is no list for
   `GIT_CONFIG_PARAMETERS` to override — and `credential.helper` /
-  `core.askPass` are handed your credential as well as being run. `loom new`
-  records `config=<sha256 of `git config --local --list --null`, sorted>` in the
-  operator record, with the full list beside it as `<task>.gitconfig` so a
-  mismatch is shown as a diff. It is recomputed and compared **before every
-  model launch** (per *attempt*, not per command), before `land`'s merge and its
-  push, before `rebase`'s fetch and again before its replay, and before `check`
-  and `diff` write the review patch. A change is a refusal;
-  **`--accept-config`** is the one escape — it prints what changed and
-  re-records it as the baseline. `loom` writes local config on your behalf in
-  exactly two places and both re-pin themselves (`loom new`'s first
-  `sparse-checkout init`, which adds `extensions.worktreeConfig`; and `land
-  --pr`'s `--set-upstream-to`). Everything else that changes it is you or an
+  `core.askPass` are handed your credential as well as being run. "The whole
+  git config" is **three scopes and an include closure**, because
+  `git config --local --list` is not what git reads:
+  - `local` — `.git/config`, shared by every worktree;
+  - `worktree-main` — `$GIT_COMMON_DIR/config.worktree`, the **main checkout's**
+    own scope. A `core.hooksPath` there runs *your* hooks, in *your* checkout,
+    during `loom land`'s merge;
+  - `worktree-task` — `$GIT_COMMON_DIR/worktrees/<wt>/config.worktree`, the task
+    worktree's own scope, one `git config --worktree <k> <v>` away from inside
+    the agent's tree;
+  - `include` — every file an `include.path` / `includeIf.<cond>.path` in any of
+    those pulls in, recursively, digested by its raw bytes. `--list` prints
+    those directives as **pointers** and never the keys they bring, so pinning
+    the listing alone pins the pointer and nothing behind it.
+
+  Both worktree scopes are live whenever `extensions.worktreeConfig` is on —
+  which loom's own `git sparse-checkout init` turns on — and **neither shows up
+  in `git config --local --list`**. `loom new` records `config=<sha256 of all of
+  that, sorted>` in the operator record, with the full list beside it as
+  `<task>.gitconfig` (each entry tagged with its scope, plus one
+  `include:<path>:<sha256>` line per included file) so a mismatch is shown as a
+  diff that names the scope. It is recomputed and compared **before the first
+  fence operation of every command**, **before every model launch** (per
+  *attempt*, not per command), before `land`'s merge and its push, before
+  `rebase`'s fetch and again before its replay, and before `check` and `diff`
+  write the review patch. A change is a refusal; **`--accept-config`** is the one
+  escape — it prints what changed and re-records it as the baseline, and
+  **`loom new` refuses it**, because `new` is the command that pins and so has
+  nothing to accept. `loom new` also prints one line saying what it pinned
+  (`loom: pinned N local + M worktree config entries`) and WARNs, naming the
+  targets, when the config pulls other files in. `loom` writes config on your
+  behalf in exactly two places and both re-pin themselves (`loom new`'s first
+  `sparse-checkout init`, which adds `extensions.worktreeConfig` locally and
+  `core.sparseCheckout` at worktree scope; and `land --pr`'s
+  `--set-upstream-to`). Everything else that changes it is you or an
   agent, so **an agent's `git config user.name` in its worktree will trip
   this** — deliberately: it is the same command as `git config
   credential.helper '!sh -c …'`. A record with no `config=` (one an older
   `loom` wrote) is refused outright, and `--accept-config` is not an escape from
-  that: `loom drop <task> && loom new <task>`. What the pin leaves trusted — the
-  config as it stood at `loom new`, your `~/.gitconfig`, and in-tree
-  `.gitattributes` (now a `[hand]` path) — is enumerated in
+  that: `loom drop <task> && loom new <task>`. **`loom drop` deliberately does
+  not check the pin**: dropping runs no model, publishes nothing and removes the
+  worktree, the branch and the record, so refusing to clean up because the
+  config moved would strand the released paths on disk — the opposite of what
+  the check is for. What the pin leaves trusted — the config as it stood at
+  `loom new` or as `--accept-config` re-recorded it, your `~/.gitconfig` and the
+  system config, and git scopes outside those three — is enumerated in
   `docs/KNOWN-GAPS.md` gap 6.
 - **`loom rebase` resolves its refs instead of looking them up.** `origin/main`
   and `main` are not ref names, they are things git *resolves*, and the order is
