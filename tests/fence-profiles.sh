@@ -216,7 +216,7 @@ for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p \
          0054-az 0055-az2 0056-az3 0057-ba 0058-bb 0059-bc 0060-bd 0061-ba2 0062-bf \
          0063-bh 0064-bi 0065-bj \
          0066-bk 0067-bk2 0068-bk3 0069-bk4 0070-bl 0071-bl2 \
-         0072-bm 0073-bn 0074-bo; do mk_task "$t"; done
+         0072-bm 0073-bn 0074-bo 0075-bp 0076-bq 0077-bq2; do mk_task "$t"; done
 mk_task 0040-ar  codex
 mk_task 0042-as  codex
 mk_task 0005-f codex
@@ -2468,6 +2468,269 @@ done
 git config --unset filter.evil.smudge
 rm -f "$BOW/.gitattributes"
 "$LOOM" drop 0074-bo > /dev/null 2>&1 || true
+
+# ==========================================================================
+# ROUND-10 fixes. Every case below FAILS against the pre-fix bin/loom (144eaf1).
+#
+# Two themes. The pin was PER TASK, and two roles have no task: `loom plan`'s
+# architect and `loom scout`, the second of which does a working-tree update on
+# a mirror it shares with every task and every provider. And a worktree was
+# taken on trust: `$wt/.git` is a one-line FILE in a directory the agent owns,
+# and rewriting it points every later `git -C "$wt" …` at a repository of the
+# agent's choosing — which `require_wt_on_branch` could not see, because a decoy
+# built with the same branch name answers the branch question correctly.
+# ==========================================================================
+
+# --- (bp) the REPOSITORY's config baseline, and a disposable scout mirror ---
+# `loom scout` runs `fence_apply` -> `sparse-checkout set`, a `clean` and a
+# `reset --hard` on $WT_ROOT/_scout. Every one of those is a WORKING-TREE
+# UPDATE, and a working-tree update runs the SMUDGE side of whatever
+# `filter.<d>` a .gitattributes there selects — with the driver read out of the
+# SHARED .git/config, one `git config` from inside any agent's worktree. There
+# was no task, so there was no pin, so nothing looked.
+cat > "$TMP/bp-prog.sh" << PROG
+#!/usr/bin/env bash
+exit 0
+PROG
+chmod +x "$TMP/bp-prog.sh"
+# A program-naming key that is ALREADY in the config when the task is pinned.
+# The pin is a CHANGE check, so this is adopted as the baseline and trusted from
+# here on — which the operator has to be told once, at the moment it happens.
+git config gpg.program "$TMP/bp-prog.sh"
+out="$("$LOOM" new 0075-bp 2>&1)"; rc=$?
+want_eq   "(bp) setup: a task, which baselines the REPOSITORY too" "$rc" "0"
+want_file "(bp) ... at \$STATE_DIR/config"                "$STATE/config"
+want_file "(bp) ... with the dump beside it, for the diff" "$STATE/config.gitconfig"
+want_in   "(bp) ... and loom new names the programs it is adopting" "$out" "names PROGRAMS git runs"
+want_in   "(bp) ... with the key, its value and its scope" "$out" "[local] gpg.program=$TMP/bp-prog.sh"
+BPW="$WTU/0075-bp"
+cat > "$TMP/bp-smudge.sh" << SM
+#!/usr/bin/env bash
+: > "$TMP/bp-smudge-ran"
+exec cat
+SM
+chmod +x "$TMP/bp-smudge.sh"
+printf '* filter=evil\n' > "$TMP/bp-attrs"
+# Both planted from INSIDE an agent worktree, both landing in the SHARED
+# .git/config: the driver, and the attributes file that selects it for a path.
+git -C "$BPW" config filter.evil.smudge  "$TMP/bp-smudge.sh"
+git -C "$BPW" config core.attributesFile "$TMP/bp-attrs"
+# ... and a narrowed sparse spec in the MIRROR, so that loom's own fence_apply
+# has files to MATERIALISE. That materialisation is the step that runs the
+# smudge, and it is the first thing `loom scout` used to do.
+git -C "$WTU/_scout" sparse-checkout set '/.agents/' > /dev/null 2>&1
+bp_oc_before="$(wc -l < "$TMP/called-opencode.log" 2>/dev/null || echo 0)"
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
+       "$LOOM" scout "where is main" 2>&1)"; rc=$?
+want_eq     "(bp) loom scout refuses a config change although it has no task" "$rc" "1"
+want_in     "(bp) ... naming the filter"                  "$out" "+ filter.evil.smudge="
+want_in     "(bp) ... and the attributes file that selects it" "$out" "+ core.attributesfile="
+want_in     "(bp) ... in the shared scope"                "$out" "[local]"
+want_absent "(bp) ... before fence_apply could run it"    "$TMP/bp-smudge-ran"
+want_in     "(bp) ... pointing at the operator command"   "$out" "loom pin-config --accept-config"
+want_eq     "(bp) ... and no model was launched" \
+            "$(wc -l < "$TMP/called-opencode.log" 2>/dev/null || echo 0)" "$bp_oc_before"
+# `loom plan` is the same launch without the tree: the architect runs in $ROOT.
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_architect="deepseek/deepseek-v4-flash" \
+       "$LOOM" plan -p "a topic" 2>&1)"; rc=$?
+want_eq "(bp) loom plan refuses the same change, before the architect" "$rc" "1"
+want_in "(bp) ... naming the filter"                      "$out" "+ filter.evil.smudge="
+want_eq "(bp) ... and no architect was launched" \
+        "$(wc -l < "$TMP/called-opencode.log" 2>/dev/null || echo 0)" "$bp_oc_before"
+# The operator's command: it shows the diff, and it refuses without consent.
+out="$("$LOOM" pin-config 2>&1)"; rc=$?
+want_eq "(bp) loom pin-config refuses a changed baseline on its own"  "$rc" "1"
+want_in "(bp) ... printing the diff rather than two digests"          "$out" "+ filter.evil.smudge="
+want_in "(bp) ... and naming the flag that accepts it"               "$out" "--accept-config"
+out="$("$LOOM" pin-config --accept-config 2>&1)"; rc=$?
+want_eq "(bp) loom pin-config --accept-config re-records it"          "$rc" "0"
+want_in "(bp) ... printing what it accepted"                         "$out" "+ filter.evil.smudge="
+want_in "(bp) ... and saying which programs are now the baseline"    "$out" "names PROGRAMS git runs"
+want_in "(bp) ... tagged with the scope they live in"                "$out" "[local] filter.evil.smudge="
+# ... and now the scout runs. The smudge firing is what proves the plant was
+# live all along, i.e. that the refusal above was not theatre.
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
+       "$LOOM" scout "where is main" 2>&1)"; rc=$?
+want_eq   "(bp) with the baseline re-recorded, the scout runs"        "$rc" "0"
+want_file "(bp) ... and the planted smudge really does fire"          "$TMP/bp-smudge-ran"
+git config --unset filter.evil.smudge
+git config --unset core.attributesFile
+rm -f "$TMP/bp-smudge-ran"
+"$LOOM" pin-config --accept-config > /dev/null 2>&1
+
+# The mirror's OWN worktree scope — $GITCOMMON/worktrees/_scout/config.worktree
+# — is the one scope no repository baseline can cover: it is not the local
+# scope, not the main checkout's, and not any task's. `git -C <mirror> config
+# --worktree` writes it, and the mirror is where every scout run's cwd is.
+git -C "$WTU/_scout" config --worktree filter.evil.smudge "$TMP/bp-smudge.sh"
+printf '* filter=evil\n' > "$WTU/_scout/.gitattributes"
+git -C "$WTU/_scout" sparse-checkout set '/.agents/' > /dev/null 2>&1
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
+       "$LOOM" scout "where is main" 2>&1)"; rc=$?
+want_eq     "(bp) loom scout refuses a key in the MIRROR's own worktree scope" "$rc" "1"
+want_in     "(bp) ... naming the key"                     "$out" "filter.evil.smudge"
+want_in     "(bp) ... and the file it is in"              "$out" "worktrees/_scout/config.worktree"
+want_absent "(bp) ... with the smudge never run"          "$TMP/bp-smudge-ran"
+git -C "$WTU/_scout" config --worktree --unset filter.evil.smudge
+
+# The mirror is shared by every task and every provider, so nothing may survive
+# in it: `reset --hard` never touches an untracked file, so a previous run's
+# scratch — or a copy of a fenced path made with `git show HEAD:core/lib.rs >
+# notes.txt`, which the index never sees — sat there for the next provider.
+printf 'copied out of a fenced path\n' > "$WTU/_scout/backend/leftover.txt"
+mkdir -p "$WTU/_scout/scratch"
+printf 'notes from the last provider\n' > "$WTU/_scout/scratch/notes.txt"
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
+       "$LOOM" scout "where is main" 2>&1)"; rc=$?
+want_eq     "(bp) with the mirror's scope clear, the scout runs"      "$rc" "0"
+want_absent "(bp) ... and an untracked file planted in it is gone"    "$WTU/_scout/backend/leftover.txt"
+want_absent "(bp) ... including a whole directory of them"            "$WTU/_scout/scratch"
+want_absent "(bp) ... and the .gitattributes that selected a driver"  "$WTU/_scout/.gitattributes"
+want_file   "(bp) ... while the mirror itself is intact"              "$WTU/_scout/backend/main.go"
+want_absent "(bp) ... still fenced, as it always was"                 "$WTU/_scout/core/lib.rs"
+
+# No baseline at all is its own refusal, in the words written for it — and it
+# is the state every repository that has never run `loom new` is in.
+mv "$STATE/config"           "$TMP/bp-baseline"
+mv "$STATE/config.gitconfig" "$TMP/bp-baseline.gitconfig"
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
+       "$LOOM" scout "where is main" 2>&1)"; rc=$?
+want_eq "(bp) with no baseline at all, the scout refuses" "$rc" "1"
+want_in "(bp) ... in the words written for it"            "$out" "no repository config baseline"
+want_in "(bp) ... naming both ways to get one"            "$out" "loom pin-config"
+out="$("$LOOM" pin-config 2>&1)"; rc=$?
+want_eq   "(bp) loom pin-config records one from nothing" "$rc" "0"
+want_file "(bp) ... at \$STATE_DIR/config"                "$STATE/config"
+want_in   "(bp) ... saying what it pinned"                "$out" "loom: pinned "
+# ... and a baseline that is not one loom wrote is a dead stop, with the one
+# command that can overwrite it still able to.
+printf 'not a digest at all\n' > "$STATE/config"
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
+       "$LOOM" scout "where is main" 2>&1)"; rc=$?
+want_eq "(bp) a baseline loom did not write is a dead stop" "$rc" "1"
+want_in "(bp) ... saying so"                              "$out" "not one loom wrote"
+out="$("$LOOM" pin-config --accept-config 2>&1)"; rc=$?
+want_eq "(bp) ... and --accept-config is a way out of it"  "$rc" "0"
+git config --unset gpg.program
+# The baseline is the REPOSITORY's, not a task's: dropping every task leaves it.
+"$LOOM" drop 0075-bp > /dev/null 2>&1 || true
+want_file "(bp) loom drop leaves the repository baseline where it is" "$STATE/config"
+
+# --- (bq) a worktree whose .git was rewritten is not this repository's ------
+# `$wt/.git` in a linked worktree is a FILE — one line, `gitdir: <path>` — in a
+# directory the agent owns. Rewrite it and every `git -C "$wt" …` afterwards
+# reads a git directory of the writer's choosing: its config (filter drivers,
+# core.hooksPath, credential.helper), its hooks, its refs, its objects. The
+# trap is that everything downstream still ANSWERS — a decoy built with the
+# same branch name answers `symbolic-ref HEAD` with refs/heads/agent/<task>, so
+# require_wt_on_branch passed it.
+out="$("$LOOM" new 0076-bq 2>&1)"; rc=$?
+want_eq "(bq) setup: an ordinary worktree"                "$rc" "0"
+BQW="$WTU/0076-bq"
+bq_gitfile="$(cat "$BQW/.git")"
+echo "benign" > "$BQW/backend/bq.txt"
+git -C "$BQW" add backend/bq.txt
+git -C "$BQW" commit -qm "benign work on bq"
+bq_tip="$(git rev-parse agent/0076-bq)"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0076-bq 2>&1)"; rc=$?
+want_eq "(bq) setup: it is reviewed"                      "$rc" "0"
+mkdir -p "$TMP/bq-hooks"
+cat > "$TMP/bq-hooks/pre-commit" << HOOK
+#!/usr/bin/env bash
+: > "$TMP/bq-hook-ran"
+exit 0
+HOOK
+cat > "$TMP/bq-prog.sh" << PROG
+#!/usr/bin/env bash
+: > "$TMP/bq-prog-ran"
+exec cat
+PROG
+chmod +x "$TMP/bq-hooks/pre-commit" "$TMP/bq-prog.sh"
+# The decoy, built the way one would actually be built: its own repository, the
+# SAME BRANCH NAME (so the branch question is answered correctly),
+# extensions.worktreeConfig on and core.sparseCheckout in the holder's own
+# scope (so the config pin, which reads the task worktree's scope through
+# `git -C "$wt"`, sees what it saw before), and the two programs the pin exists
+# for — a clean filter and a hooksPath.
+(
+  cd "$TMP" || exit 1
+  git init -q bq-decoy
+  cd bq-decoy || exit 1
+  git symbolic-ref HEAD refs/heads/main
+  git config user.email test@example.invalid
+  git config user.name  "fence test"
+  git config extensions.worktreeConfig true
+  git config core.hooksPath     "$TMP/bq-hooks"
+  git config filter.evil.clean  "$TMP/bq-prog.sh"
+  git config filter.evil.smudge "$TMP/bq-prog.sh"
+  printf '* filter=evil\n' > .gitattributes
+  echo "the decoy's own content" > decoy.txt
+  git add -A
+  git commit -qm "the decoy"
+  git worktree add -q -b agent/0076-bq "$TMP/bq-holder" HEAD
+  git -C "$TMP/bq-holder" config --worktree core.sparseCheckout true
+) > /dev/null 2>&1
+# Building the decoy runs its OWN hook (on its commit) and its own smudge (on
+# the worktree checkout), which is the cheapest possible proof that both plants
+# are live before a single loom command is typed. Cleared, so that what the
+# assertions below measure is loom.
+want_file "(bq) setup: the decoy's hook and filter are live"   "$TMP/bq-hook-ran"
+want_file "(bq) setup: ... both of them"                       "$TMP/bq-prog-ran"
+rm -f "$TMP/bq-hook-ran" "$TMP/bq-prog-ran"
+mv "$TMP/bq-decoy/.git/worktrees/bq-holder" "$TMP/bq-decoy/.git/worktrees/holder"
+printf 'gitdir: %s/bq-decoy/.git/worktrees/holder\n' "$TMP" > "$BQW/.git"
+want_eq "(bq) setup: the rewritten worktree still answers with the task's branch" \
+        "$(git -C "$BQW" symbolic-ref -q HEAD 2>/dev/null || echo NONE)" "refs/heads/agent/0076-bq"
+want_eq "(bq) setup: ... while pointing at another repository entirely" \
+        "$(git -C "$BQW" rev-parse --git-common-dir 2>/dev/null || echo NONE)" "$TMP/bq-decoy/.git"
+for c in run check diff land rebase; do
+  case "$c" in
+    run)    out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 "$LOOM" run 0076-bq 2>&1)"; rc=$? ;;
+    rebase) out="$("$LOOM" rebase 0076-bq main 2>&1)"; rc=$? ;;
+    *)      out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" "$c" 0076-bq 2>&1)"; rc=$? ;;
+  esac
+  want_eq "(bq) loom $c refuses a worktree whose .git points elsewhere" "$rc" "1"
+  want_in "(bq) ... naming the foreign git directory"     "$out" "$TMP/bq-decoy/.git"
+  want_in "(bq) ... and saying what is wrong with it"     "$out" "does not belong to this repository"
+done
+want_absent "(bq) ... with the decoy's hook never run"    "$TMP/bq-hook-ran"
+want_absent "(bq) ... nor its filter"                     "$TMP/bq-prog-ran"
+want_eq     "(bq) ... and the real branch is exactly where it was" \
+            "$(git rev-parse agent/0076-bq)" "$bq_tip"
+out="$("$LOOM" drop 0076-bq 2>&1)"; rc=$?
+want_eq     "(bq) loom drop refuses it too"               "$rc" "1"
+want_not_in "(bq) ... and never prints its success line"  "$out" "loom: dropped"
+want_file   "(bq) ... leaving the operator record that explains the directory" "$(state_of 0076-bq)"
+want_file   "(bq) ... and the directory itself, for inspection" "$BQW/.git"
+printf '%s\n' "$bq_gitfile" > "$BQW/.git"
+out="$("$LOOM" drop 0076-bq 2>&1)"; rc=$?
+want_eq     "(bq) ... and with the .git file put back, the drop goes through" "$rc" "0"
+want_in     "(bq) ... this time saying so"                "$out" "loom: dropped"
+want_absent "(bq) ... with the worktree gone"             "$BQW"
+
+# A removal that did not remove is not a drop either. `git worktree remove`
+# refuses a LOCKED worktree even with --force ("use remove -f -f"), and the old
+# code wrote that call `|| true` — so the released paths stayed on disk under a
+# message that said they were gone.
+out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MODELS_reviewer="codex-sub" \
+       "$LOOM" new 0077-bq2 --fence-profile codex 2>&1)"; rc=$?
+want_eq   "(bq) setup: a profiled worktree, holding a released path" "$rc" "0"
+BQ2W="$WTP/0077-bq2"
+want_file "(bq) setup: ... which is core/, released by the profile" "$BQ2W/core/lib.rs"
+git worktree lock "$BQ2W"
+out="$("$LOOM" drop 0077-bq2 2>&1)"; rc=$?
+want_eq     "(bq) loom drop refuses to call a failed removal a drop" "$rc" "1"
+want_not_in "(bq) ... so it never prints its success line" "$out" "loom: dropped"
+want_in     "(bq) ... it says what is still there"        "$out" "STILL on disk"
+want_in     "(bq) ... and lists it"                       "$out" "$BQ2W/core"
+want_file   "(bq) ... the released path really is still on disk" "$BQ2W/core/lib.rs"
+want_file   "(bq) ... with the operator record kept, so it can be explained" "$(state_of 0077-bq2)"
+git worktree unlock "$BQ2W"
+out="$("$LOOM" drop 0077-bq2 2>&1)"; rc=$?
+want_eq     "(bq) ... and once it can be removed, it is"  "$rc" "0"
+want_in     "(bq) ... saying so"                          "$out" "loom: dropped"
+want_absent "(bq) ... with the released path gone with it" "$BQ2W"
+want_absent "(bq) ... and the operator record too"        "$(state_of 0077-bq2)"
 
 # --- (j)/(t) doctor lists the profiles, and touches no network ------------
 out="$(timeout 180 "$LOOM" doctor 2>&1 || true)"
