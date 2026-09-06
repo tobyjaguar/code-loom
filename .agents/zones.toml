@@ -17,10 +17,52 @@
 # structural code, not numerical correctness. Edit honestly for your repo.
 
 [hand]
-reason = "Rust learning surface + DSP numerical correctness. Type system does not cover these."
+reason = "Rust learning surface + DSP numerical correctness. Type system does not cover these. Plus the control plane, which is what judges everything else."
 paths = [
   "crates/audat-dsp/src/**",
   "crates/audat-core/src/restore/**",
+
+  # The control plane. An agent may PROPOSE a change to any of these — that is
+  # what the hand zone means — and may never commit one, because each of them
+  # is an input to the checks that judge the agent's own work:
+  #
+  #   gate.sh    decides "green, commit it" and "green, land it". `loom` runs the
+  #              MAIN checkout's copy for both, but a worktree copy that landed
+  #              would become that copy on the next task.
+  #   zones.toml is this file: the zones, the fence, and the profiles. An agent
+  #              that could commit it could widen its own zone.
+  #   loom.env   is `.`-sourced as shell, in your environment, on every `loom`
+  #              invocation (docs/KNOWN-GAPS.md § 3).
+  #   .gitattributes
+  #              is the FILE HALF of filter/merge-driver execution. A driver
+  #              lives in .git/config (which loom pins to the task — a change is
+  #              refused, `--accept-config` is the escape); the attribute that
+  #              SELECTS it for a path lives here, in the tree, where an agent
+  #              writes it. `filter=x` on one path plus a `filter.x.clean`
+  #              anywhere in the config chain is a program git runs on checkout,
+  #              `git add` and commit — and a landed .gitattributes is the copy
+  #              every later task checks out under.
+  #   .opencode/ is the provider IDENTITY and every role prompt.
+  #              `provider.<name>.options.baseURL` in opencode.json decides
+  #              which host answers as "deepseek", which is the fact a fence
+  #              profile's `providers` list is built on, and the agent
+  #              definitions there supply each role's system prompt. `loom`
+  #              points every opencode run at the MAIN checkout's copy — so a
+  #              worktree copy is inert while the task runs, and would become
+  #              the main checkout's copy the moment it LANDED.
+  #
+  # Keep them here even if you fence nothing: the fence is optional, the guard
+  # is not. Three of them may not be FENCED either — `loom` refuses a [fence]
+  # pattern covering zones.toml, gate.sh or .opencode/, because a worktree (or
+  # a harness) without them disarms the very checks that judge the agent.
+  # `.gitattributes` is listed twice on purpose: the repo-root one, and every
+  # nested one, since git reads a .gitattributes in any directory.
+  ".agents/gate.sh",
+  ".agents/zones.toml",
+  ".agents/loom.env",
+  ".opencode/**",
+  ".gitattributes",
+  "**/.gitattributes",
 ]
 
 [assist]
@@ -52,3 +94,23 @@ paths = [
 #   "crates/audat-nda/**",
 #   "docs/audits/**",
 # ]
+
+# Optional, and only meaningful with a [fence] above it: a NAMED, per-provider
+# relaxation of the fence. A task opts in with `loom new <task> --fence-profile
+# <name>`, and EVERY later command for that task repeats the flag (run, check,
+# loop, diff, rebase, land). Its worktree is fenced by [fence] MINUS `release`, and
+# `loom` refuses to run any role there whose model chain (fallbacks included)
+# reaches a provider outside `providers`. A `Fence-profile: <name>` line in the
+# task file documents the intent but never opts in on its own.
+#
+# Every `release` entry must appear verbatim in [fence].paths, and must not be
+# covered by another pattern that stays fenced. Provider names are matched
+# exactly: no whitespace, no globs.
+#
+# Read README § Fence profiles before using it: this scopes exposure, not
+# exfiltration, and docs/KNOWN-GAPS.md lists what it does not close.
+#
+# [fence_profiles.codex]
+# reason    = "The two subscription CLIs may read this; per-token APIs may not."
+# release   = ["docs/audits/**"]
+# providers = ["claude", "codex"]
