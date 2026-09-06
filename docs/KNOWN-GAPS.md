@@ -41,7 +41,7 @@ your environment.
 
 **What closes it.** `bin/loom:164` (`ROOT="$(cd "$(dirname "$_common")" …)"`,
 from `git rev-parse --git-common-dir` at `bin/loom:160`) and `bin/loom:189`
-(`AGENTS_DIR="$ROOT/.agents"`); the guard's own reads are `bin/loom:3928`
+(`AGENTS_DIR="$ROOT/.agents"`); the guard's own reads are `bin/loom:3979`
 onward. `$ROOT` is now the **main checkout** for every command:
 `git rev-parse --git-common-dir` answers `.git` from the main checkout and the
 absolute path of the main `.git` from a linked worktree, so its parent is the
@@ -87,7 +87,7 @@ own. That is not worth plugging: the entire hook is dominated by `git commit
 
 ## 2. `loom plan` runs the architect unfenced, in your own tree
 
-**Where.** `bin/loom:6253`, in `cmd_plan` (`bin/loom:6226`):
+**Where.** `bin/loom:6320`, in `cmd_plan` (`bin/loom:6293`):
 `run_role architect "$ROOT" "$prompt"` (and the
 interactive leg, `claude --append-system-prompt … "$prompt"`, likewise in
 `$ROOT`). The architect's chain at every tier ends in cheap third-party
@@ -417,9 +417,9 @@ closed from outside git; what follows is the boundary, drawn honestly.
 `require_recorded_config`); `bin/loom:1735` onward (the REPOSITORY baseline:
 `repo_config_file`, `repo_config_read`, `repo_config_write`,
 `repo_config_repin`, and `require_recorded_config_repo` at `bin/loom:1945`),
-read from `scout_root` (`bin/loom:6320`) and `cmd_plan`, written by
-`cmd_pin_config` (`bin/loom:6121`); `scout_mirror_config_check`
-(`bin/loom:6280`) for the one scope neither pin can cover; and the
+read from `scout_root` (`bin/loom:6387`) and `cmd_plan`, written by
+`cmd_pin_config` (`bin/loom:6188`); `scout_mirror_config_check`
+(`bin/loom:6347`) for the one scope neither pin can cover; and the
 `--no-ext-diff` / `--upload-pack=` / `--receive-pack=` spelled out at the diff,
 fetch and push call sites.
 
@@ -756,7 +756,7 @@ what that directory is. Cleaning it up is the operator's, by hand.
 generalises: it is the only directory in this system that loom writes to on the
 agent's side of the fence.
 
-**Where.** `reviews_dir` (`bin/loom:4082`), the write sites in `cmd_run`
+**Where.** `reviews_dir` (`bin/loom:4137`), the write sites in `cmd_run`
 (gate log), `cmd_check` (patch + review), `cmd_diff` (patch) and `cmd_loop`
 (the review text it appends to the task spec), the `--add-dir` sandbox root in
 `run_headless` (`bin/loom:2395`), and the pathspec in `wt_dirty`.
@@ -872,7 +872,7 @@ is gap 6's residual, and it is unchanged.
 asking the same question one level lower.
 
 **Where.** `place_file`, `resolve_under_wt`, `probe_agent_file`, `link_count`
-and `reviews_entries_plain` (`bin/loom:4337`), the write sites in `cmd_run`
+and `reviews_entries_plain` (`bin/loom:4392`), the write sites in `cmd_run`
 (the gate log, and the `-blocked.md` probe), `cmd_check` (patch + review),
 `cmd_diff` (patch) and `cmd_loop` (the append to `.agents/tasks/<task>.md`),
 the artifact copies at `state_artifact` (`bin/loom:2026`), and the pathspec in
@@ -946,7 +946,7 @@ the shape recurs: loom keeps directories of its own beside the task worktrees
 under `$LOOM_WORKTREES`, and a task id is a directory name there.
 
 **Where.** `state_file` (`bin/loom:611`), asked by `cmd_new` before anything is
-created (`bin/loom:4838`).
+created (`bin/loom:4894`).
 
 **What it was.** `_scout` is the shared scout mirror — one directory, reset,
 `clean -xdff`'d and re-fenced on every `loom scout`, deliberately under the
@@ -1213,3 +1213,15 @@ symlink as a **residual by design** — loom closes the doorway in the worktrees
 it builds and tells you three times, but the link is still in your trunk and in
 every clone of it, and loom will not rewrite a file it does not own.
 
+
+**Known residual after round 18 (`loom rebase`, non-blocking).** `cmd_rebase`
+records the new base but does not re-run `fence_reconcile` against it before it
+returns, so an inherited escaping symlink the operator's trunk gained *between*
+`loom new` and `loom rebase` is left materialised on disk in the worktree until
+the next command. It is not a provider-reads-`core/**` path: `loom rebase`
+launches no model, and every model-facing command (`run`/`check`/`loop`)
+re-fences with the recorded new base before it does anything, so it falls inside
+the "operator's own worktree" residual already stated here. The one-line fix —
+`FENCE_BASE="$new_base"; fence_reconcile "$wt" "$FENCE_PROFILE"` (and
+`link_inherited_warn`) at the end of `cmd_rebase`, mirroring `cmd_attach` — is a
+follow-up, not a merge blocker.
