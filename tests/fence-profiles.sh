@@ -84,6 +84,10 @@ if [ -n "${LOOM_TEST_SWAP_TASKFILE:-}" ]; then
   rm -f ".agents/tasks/$LOOM_TEST_SWAP_TASKFILE.md"
   ln -s "${LOOM_TEST_TMP:?}/bu-task-decoy.md" ".agents/tasks/$LOOM_TEST_SWAP_TASKFILE.md"
 fi
+# Where loom's own scratch lands, as the launched model sees it. `.agents/loom.env`
+# is `.`-sourced shell from a tracked path an agent can write, so this is a
+# security fact, not a detail: see (by).
+printf 'TMPDIR=%s\n' "${TMPDIR:-(unset)}" >> "${LOOM_TEST_TMP:?}/called-claude.log"
 # An implementer must be able to write; prove the stub ran by leaving a file.
 echo "written by the stub implementer" > backend/from-implementer.txt
 echo "stub claude done"
@@ -242,7 +246,8 @@ for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p \
          0066-bk 0067-bk2 0068-bk3 0069-bk4 0070-bl 0071-bl2 \
          0072-bm 0073-bn 0074-bo 0075-bp 0076-bq 0077-bq2 \
          0078-br 0079-br2 0080-bs 0081-bs2 0083-bs3 \
-         0084-bu 0085-bu2 0086-bu3 0087-bu4 0088-bu5 0089-bu6 0090-bu7; do mk_task "$t"; done
+         0084-bu 0085-bu2 0086-bu3 0087-bu4 0088-bu5 0089-bu6 0090-bu7 \
+         0091-bw 0093-bx 0094-by; do mk_task "$t"; done
 mk_task 0040-ar  codex
 mk_task 0042-as  codex
 mk_task 0005-f codex
@@ -3202,6 +3207,151 @@ want_eq "(bv) ... pin-config records it without reading it"        "$rc" "0"
 want_in "(bv) ... counting it among the program-naming entries"    "$out" "not a regular file"
 git config --local --unset "includeIf.gitdir:/no/such/directory/.path"
 "$LOOM" pin-config --accept-config > /dev/null 2>&1
+
+# ==========================================================================
+# ROUND-13 fixes. Every case below FAILS against the pre-fix bin/loom (46a92d1).
+# ==========================================================================
+
+# --- (bw) the dirty-tree tripwire, in a repo that GITIGNORES the reviews dir -
+# `wt_dirty` drops its `.agents/reviews` exclusion the moment that directory —
+# or an entry inside it — stops being loom's own plain scratch, and the dropped
+# pathspec is what makes the swap show up as a `git status` line `loom land`
+# refuses on. In the repo the README actually asks for, that is not enough:
+# `.agents/reviews/` is GITIGNORED, so a link planted inside it is an ignored
+# path and `git status` says nothing about it with or without the exclusion.
+# The tripwire reported a clean tree and landing went ahead.
+printf '.agents/reviews/\n' > .gitignore
+git add .gitignore
+git commit -qm "gitignore .agents/reviews, as the README asks a consumer to"
+out="$("$LOOM" new 0091-bw 2>&1)"; rc=$?
+want_eq   "(bw) setup: a task in the gitignoring repo"             "$rc" "0"
+BW="$WTU/0091-bw"
+want_file "(bw) setup: ... whose worktree carries the .gitignore"  "$BW/.gitignore"
+echo "bw work" > "$BW/backend/bw.txt"
+git -C "$BW" add backend/bw.txt
+git -C "$BW" commit -qm "work on bw"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0091-bw 2>&1)"; rc=$?
+want_eq   "(bw) setup: it is reviewed"                             "$rc" "0"
+want_file "(bw) setup: ... with loom's own patch in the ignored directory" \
+          "$BW/.agents/reviews/0091-bw.patch"
+# The plant, and the thing that makes this case what it is: git will not
+# mention it, so the first `git status` cannot be the whole tripwire.
+printf 'not this tree\n' > "$TMP/bw-decoy.txt"
+ln -s "$TMP/bw-decoy.txt" "$BW/.agents/reviews/bw-decoy-link.txt"
+want_eq "(bw) the planted link is invisible to a plain git status" \
+        "$(git -C "$BW" status --porcelain -- . 2>&1)" ""
+out="$("$LOOM" land 0091-bw 2>&1)"; rc=$?
+want_fail "(bw) loom land refuses the tree anyway"                 "$rc"
+want_in   "(bw) ... as uncommitted work"                           "$out" "uncommitted changes"
+want_in   "(bw) ... naming the planted link"                       "$out" "bw-decoy-link.txt"
+want_in   "(bw) ... as the IGNORED entry it is"                    "$out" "!! .agents/reviews/"
+want_ne   "(bw) ... with the branch not merged into main" \
+          "$(git rev-parse HEAD)" "$(git rev-parse refs/heads/agent/0091-bw)"
+# The control: loom's OWN scratch, in the same gitignored directory, is not
+# dirt — every entry a plain one-link file, so the exclusion applies, the
+# second step never runs, and landing goes ahead.
+rm -f "$BW/.agents/reviews/bw-decoy-link.txt"
+want_eq "(bw) control: a clean gitignored reviews directory reads as clean" \
+        "$(git -C "$BW" status --porcelain -- . 2>&1)" ""
+out="$("$LOOM" land 0091-bw 2>&1)"; rc=$?
+want_eq "(bw) ... and loom land goes ahead"                        "$rc" "0"
+want_in "(bw) ... saying so"                                       "$out" "landed 0091-bw"
+git rm -q .gitignore
+git commit -qm "and back to a repo that ignores nothing"
+
+# --- (bx) place_file writes inside the directory it RESOLVED ----------------
+# `resolve_under_wt` answers "is `.agents/reviews` still inside this worktree",
+# and the answer is true of a NAME at the instant it is asked. Spelling that
+# name out again for the `mktemp`, the `mv` and the post-check re-walks it at
+# every syscall, so a rename of `reviews` (or of `.agents`) between any two of
+# them moves the write to wherever the name points now. The fix holds the
+# resolved directory as the working directory and names everything relative to
+# it: a cwd is an INODE, and no rename of any name above it moves this shell.
+#
+# The window is microseconds wide, so the assertion that FAILS before the fix
+# is a code-shape one — a race cannot be made deterministic from the outside
+# without instrumenting `place_file` itself. The swap drive below it is a real
+# drive, and it is what a deterministic reproduction would be if the window
+# could be held open.
+bx_body="$(sed -n '/^place_file() {/,/^}$/p' "$LOOM")"
+# shellcheck disable=SC2016  # these needles are literal shell SOURCE, not expansions
+{
+  want_in     "(bx) place_file holds the resolved directory as its cwd" \
+              "$bx_body" 'cd -P "$rdir"'
+  want_in     "(bx) ... and asks the held directory what it is" \
+              "$bx_body" '[ "$(pwd -P)" = "$rdir" ]'
+  want_in     "(bx) ... with its temp named relative to that cwd" \
+              "$bx_body" 'mktemp ./.loom-place.'
+  want_in     "(bx) ... and the rename onto a relative target" \
+              "$bx_body" 'mv -T "$tmp" "./$base"'
+  want_in     "(bx) ... the post-check too" \
+              "$bx_body" 'link_count "./$base"'
+  want_not_in "(bx) ... never re-walking an absolute path for the temp" \
+              "$bx_body" 'mktemp "$rdir'
+  want_not_in "(bx) ... nor for the rename" \
+              "$bx_body" 'mv -T "$tmp" "$target"'
+  want_not_in "(bx) ... nor for the post-check" \
+              "$bx_body" 'link_count "$target"'
+}
+out="$("$LOOM" new 0093-bx 2>&1)"; rc=$?
+want_eq "(bx) setup: a task to race"                               "$rc" "0"
+BX="$WTU/0093-bx"; BXV="$TMP/bx-victim"; mkdir -p "$BXV"
+echo "bx work" > "$BX/backend/bx.txt"
+git -C "$BX" add backend/bx.txt
+git -C "$BX" commit -qm "work on bx"
+# The swapper: rename `reviews` aside, stand a symlink to a victim tree in its
+# place, rip anything a racing write left in the stash across to the victim,
+# put it back, again. It runs for the whole of the drive below.
+rm -f "$TMP/bx-stop"
+(
+  i=0
+  while [ ! -e "$TMP/bx-stop" ] && [ "$i" -lt 4000 ]; do
+    i=$((i+1))
+    mv "$BX/.agents/reviews" "$BX/.agents/reviews-stash" 2>/dev/null \
+      && ln -s "$BXV" "$BX/.agents/reviews" 2>/dev/null
+    # shellcheck disable=SC2086  # the glob is the point: whatever landed there
+    mv "$BX/.agents/reviews-stash"/.loom-place.* "$BXV/" 2>/dev/null
+    [ -L "$BX/.agents/reviews" ] && rm -f "$BX/.agents/reviews"
+    mv "$BX/.agents/reviews-stash" "$BX/.agents/reviews" 2>/dev/null
+  done
+) & bx_swapper=$!
+for _ in 1 2 3 4 5; do
+  LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0093-bx > /dev/null 2>&1 || true
+done
+: > "$TMP/bx-stop"
+wait "$bx_swapper" 2>/dev/null || true
+[ -L "$BX/.agents/reviews" ] && rm -f "$BX/.agents/reviews"
+[ -d "$BX/.agents/reviews-stash" ] && [ ! -d "$BX/.agents/reviews" ] \
+  && mv "$BX/.agents/reviews-stash" "$BX/.agents/reviews"
+rm -rf "$BX/.agents/reviews-stash"
+mkdir -p "$BX/.agents/reviews"
+want_eq "(bx) nothing loom wrote reached the victim tree across the swap race" \
+        "$(find "$BXV" -mindepth 1 2>/dev/null | tr '\n' ' ')" ""
+"$LOOM" drop 0093-bx > /dev/null 2>&1 || true
+
+# --- (by) $TMPDIR is pinned exactly like the OPENCODE_* set -----------------
+# `${TMPDIR:-/tmp}` is the parent of every temp loom makes, and those temps are
+# the AUTHORITATIVE copies on their way to the operator's state directory: the
+# gate log fed back into the next attempt's prompt, the patch a reviewer is
+# handed. `.agents/loom.env` is `.`-sourced shell from a tracked path an agent
+# can write, under `set -a`, so one `TMPDIR=` line moved all of them into a
+# directory the agent owns. It is snapshotted before either env file is sourced
+# and restored after both — a caller who exports it still wins.
+mkdir -p "$TMP/by-agent-tmp"
+printf 'TMPDIR=%s\n' "$TMP/by-agent-tmp" > .agents/loom.env
+out="$("$LOOM" new 0094-by 2>&1)"; rc=$?
+want_eq "(by) setup: a task, with a loom.env that redirects TMPDIR" "$rc" "0"
+want_in "(by) loom says the env file's TMPDIR is ignored"           "$out" "env file set TMPDIR — ignored"
+out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 "$LOOM" run 0094-by 2>&1)"; rc=$?
+want_eq "(by) ... and the run still reaches a green gate"           "$rc" "0"
+want_in "(by) the launched model recorded the TMPDIR it was handed" \
+        "$(cat "$TMP/called-claude.log")" "TMPDIR="
+want_not_in "(by) ... and it is never the directory loom.env named" \
+        "$(cat "$TMP/called-claude.log")" "TMPDIR=$TMP/by-agent-tmp"
+want_eq "(by) ... with no loom temp left in that directory either" \
+        "$(find "$TMP/by-agent-tmp" -mindepth 1 2>/dev/null | tr '\n' ' ')" ""
+rm -f .agents/loom.env
+"$LOOM" drop 0094-by > /dev/null 2>&1 || true
 
 # --- (j)/(t) doctor lists the profiles, and touches no network ------------
 out="$(timeout 180 "$LOOM" doctor 2>&1 || true)"
