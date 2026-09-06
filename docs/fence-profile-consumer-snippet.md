@@ -247,6 +247,46 @@ loom check <other-unprofiled-task> --fence-profile codex
 rm "${XDG_CONFIG_HOME:-$HOME/.config}/loom/repos/"*"/tasks/<some-task>"
 loom check <some-task> --fence-profile codex      # must STILL die, telling you to
                                                 # loom drop && loom new the task
+
+# --- the two `loom scout` refusals -----------------------------------------
+# `loom scout` has no task, so it is judged against the REPOSITORY baseline —
+# and its mirror is a working-tree update, which is what runs a planted smudge.
+git config filter.probe.smudge /bin/true
+loom scout "anything"                             # must die: "+ filter.probe.smudge="
+                                                # and name `loom pin-config --accept-config`
+git config --unset filter.probe.smudge
+loom pin-config --accept-config                   # re-record the removal
+
+# ... and the mirror's OWN worktree scope, which no baseline can cover:
+git -C "$(dirname "$PWD")/.loom-worktrees/$(basename "$PWD")/_scout" \
+    config --worktree core.hooksPath /tmp/probe   # adjust for your LOOM_WORKTREES
+loom scout "anything"                             # must die naming the key AND the
+                                                # config.worktree file it lives in
+git -C .../_scout config --worktree --unset core.hooksPath
+
+# --- the worktree is proved to be OURS before anything reads it ------------
+# `<worktree>/.git` is a one-line FILE the agent owns. Rewrite it and every
+# `git -C <worktree> …` afterwards reads a repository of the writer's choosing
+# — and a decoy with the same branch name answers the branch question
+# correctly, so "is this tree on its branch" is not the check that catches it.
+cp <worktree>/.git /tmp/gitfile.bak
+echo "gitdir: /tmp/not-this-repo/.git/worktrees/x" > <worktree>/.git
+loom check <some-task> --fence-profile codex      # must die: "does not belong to
+                                                # this repository", naming the path
+loom drop  <some-task>                            # must ALSO die, and must NOT say
+                                                # "dropped" over a directory that is
+                                                # still there
+cp /tmp/gitfile.bak <worktree>/.git               # and now the drop goes through
+
+# --- loom's own writes into the worktree are resolved, not spelled out -----
+# `.agents/reviews` is where the review PATCH is written, and the patch carries
+# the content of every path in the diff — released paths included.
+rm -rf <worktree>/.agents/reviews
+ln -s /tmp/elsewhere <worktree>/.agents/reviews
+loom check <some-task> --fence-profile codex      # must die naming /tmp/elsewhere
+loom land  <some-task> --fence-profile codex      # must die: dirty worktree
+rm -f <worktree>/.agents/reviews                  # (the same must hold with
+                                                # `.agents` itself symlinked)
 ```
 
 The record is a file you own, not a git object: `loom new` writes it, `loom check`
@@ -328,7 +368,19 @@ or up to date. Two consequences worth knowing before you rely on it:
   - `loom` writes config on your behalf in exactly two places, and both re-pin
     themselves: the first `git sparse-checkout init` in a repository (which adds
     `extensions.worktreeConfig` locally and `core.sparseCheckout` at worktree
-    scope), and `loom land --pr`'s `--set-upstream-to`.
+    scope), and `loom land --pr`'s `--set-upstream-to`;
+  - those two re-pins also re-record the **repository** baseline, and they now
+    print the `-`/`+` delta rather than doing it quietly
+    (`loom: repository config baseline moved:`). If the delta **adds** a key
+    that names a program git runs, `loom new` refuses outright (it takes no
+    `--accept-config`) and tells you to run `loom pin-config --accept-config`
+    first; `land --pr` refuses the re-pin *after* the push and says so. In a
+    consuming repo the common way to meet this is your own `git config` edit
+    landing between two loom commands — read the diff, then
+    `loom pin-config --accept-config`;
+  - the WARN block that names programs also names the keys **inside** a file
+    your config includes, tagged `[include:<path>]`, and an included file's
+    bytes are pinned up to 64 KiB (past that: digest and size only).
 * **The remote is pinned to the task: the URL *and* `remote.origin.fetch`.**
   Both are recorded at `loom new` and refused when changed. The refspec matters
   because it decides which local ref a fetch updates at all — pointed at

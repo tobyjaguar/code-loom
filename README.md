@@ -363,7 +363,24 @@ part of the branch that still changes your runs:
   work: what the reviewer read and what the merge would carry have come apart.
   `.agents/reviews/` is excluded, because that is where `loom check` and `loom diff`
   write the review patch themselves — **gitignore that directory** in a
-  consuming repo.
+  consuming repo. The exclusion applies only while `.agents/reviews` really is
+  that directory (see the next bullet): a symlink in its place counts as dirty,
+  and landing refuses.
+- **The review directory is RESOLVED before loom writes into it.**
+  `.agents/reviews` is the one place loom writes on the agent's side of the
+  fence — the review **patch** (which carries the content of every path in the
+  diff, released paths included), the gate log, and the review text — and it is
+  a directory the agent can replace with a symlink. `mkdir -p` on a path that
+  already resolves to a directory succeeds silently, so a swap redirected all
+  three, and the obvious target is another task's worktree: an *unprofiled*
+  tree, under the other root, that a provider this profile does not allow is
+  about to run in. `loom` now resolves it physically before every write and
+  refuses anything outside the worktree, at **two** levels — `.agents` (checked
+  *before* the `mkdir`, which would otherwise create the directory at the far
+  end of the link) and `.agents/reviews` (the stealth variant, with `.agents`
+  left intact) — and writes to what it resolved to rather than re-deriving the
+  path. The same rule applies to the `--add-dir` sandbox root an implementer is
+  granted.
 - **`loom rebase` will not bury ANY upstream commits under your base without
   your word.** A rebase is the one command that moves a recorded base, and
   everything between the old base and the new one stops being the branch's work
@@ -470,12 +487,18 @@ part of the branch that still changes your runs:
 
   Both worktree scopes are live whenever `extensions.worktreeConfig` is on —
   which loom's own `git sparse-checkout init` turns on — and **neither shows up
-  in `git config --local --list`**. `loom new` records `config=<sha256 of all of
+  in `git config --local --list`**. Whether it is on is asked of git
+  (`git config --local --type=bool --get`), not string-matched: git reads that
+  key with `git_config_bool`, which is case-insensitive and treats a *valueless*
+  key as true, so `True`, `ON` and a bare `worktreeConfig` line each read as
+  "off" to a `true|yes|on|1` list while git went on reading both scopes. `loom new` records `config=<sha256 of all of
   that, sorted>` in the operator record, with the full list beside it as
   `<task>.gitconfig` (each entry tagged with its scope, plus one
   `include:<path>:<sha256>` record per included file — carrying the target's
-  own **bytes**, so an edit to it is a `-`/`+` content diff and not a pair of
-  digests) so a mismatch is shown as a diff that names the scope. Every
+  own **bytes**, capped at 64 KiB, so an edit to it is a `-`/`+` content diff
+  and not a pair of digests; past the cap the value half reads
+  `(<N> bytes, sha256 <hex>)` and the digest still does the change check) so a
+  mismatch is shown as a diff that names the scope. Every
   `includeIf.<cond>.path` target is pinned **whatever the condition says**:
   `loom` does not evaluate `gitdir:` / `onbranch:` / `hasconfig:`, which
   over-refuses on purpose. It is recomputed and compared **before the first
@@ -492,8 +515,12 @@ part of the branch that still changes your runs:
   `credential.*`, `core.askPass`, `filter.*`, `merge.*.driver`,
   `diff.*.textconv`/`.command`, `gpg.program`, `pager.*`, `core.attributesFile`,
   `core.sshCommand`, `include.*`/`includeIf.*` — values escaped, tagged with the
-  scope each came from. Those keys are what the pin ADOPTS as the baseline, and
-  this is the one moment an operator is shown them. `loom` writes config on your
+  scope each came from, and **including the keys inside an included file**,
+  tagged `[include:<path>]` (`--list` shows an include as a pointer and never
+  the keys it brings, so a `core.hooksPath` one `include.path` away from
+  `.git/config` was pinned in full and named nowhere). Those keys are what the
+  pin ADOPTS as the baseline, and this is the one moment an operator is shown
+  them. `loom` writes config on your
   behalf in exactly two places and both re-pin themselves (`loom new`'s first
   `sparse-checkout init`, which adds `extensions.worktreeConfig` locally and
   `core.sparseCheckout` at worktree scope; and `land --pr`'s
@@ -527,6 +554,19 @@ part of the branch that still changes your runs:
   `loom scout` reads it before it touches the mirror, `loom plan` before the
   architect runs, and `run_role` before every task-less launch. `loom drop` does
   not remove it — it is the repository's fact, not a task's.
+- **...and that baseline never moves silently.** It is re-recorded as a *side
+  effect* of pinning a task — at `loom new`, and at `land --pr` after its own
+  `--set-upstream-to` — i.e. in places where loom expects to be adopting its
+  **own** writes. "Expects" is not "checked", so every such re-record prints the
+  `-`/`+` delta first (`loom: repository config baseline moved:`), and where the
+  delta **adds** a key that names a program git runs it is refused instead:
+  `loom new` cannot weigh it (it takes no `--accept-config`, being the command
+  that pins), so it names the key, points at `loom pin-config --accept-config`
+  and unwinds the half-built task; `land --pr` refuses the re-pin *after* the
+  push and says so — the branch is on origin, the baseline is not moved, and
+  the next task-less role keeps refusing until you have read the lines. A
+  program key *going away* is not refused: that would make "put it back" a
+  refusal of its own.
 - **The scout mirror is disposable.** It is shared by every task and every
   provider, so `loom scout` `git clean -xdff`s it before every reset (a
   `reset --hard` never removes an untracked file, so one run's scratch was the

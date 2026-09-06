@@ -348,7 +348,12 @@ record is `include:<path>:<sha256>` plus the target's own bytes, so the same
 change renders as a `-`/`+` **content** diff. Path and bytes are escaped on the
 way *in*, with the escaper values are rendered with, because the sidecar is
 NUL-framed with a newline between a record's halves and an included config file
-may contain both.
+may contain both. The bytes are **capped at 64 KiB** per target — an include
+target is a config file and a config file is small, so a bigger one is either a
+mistake or a way to bloat the sidecar and drown a refusal in it. Past the cap
+the value half reads `(<N> bytes, sha256 <hex>)`: the digest is what the change
+check runs on either way, so the refusal still fires and still names the file,
+it just says how big it is rather than showing it.
 
 Both `config.worktree` files are live whenever `extensions.worktreeConfig` is
 enabled — which **loom itself enables**, on the first `git sparse-checkout init`
@@ -399,9 +404,14 @@ program git runs** — `core.hooksPath`, `credential.*`, `core.askPass`,
 `filter.*`, `merge.*.driver`, `diff.*.textconv`/`.command`, `gpg.program`,
 `pager.*`, `core.attributesFile`, `core.sshCommand`,
 `include.*`/`includeIf.*` — values escaped, tagged with the scope each came
-from. That list is residual 1 below, printed at the one moment it is being
+from, and **including the keys inside an included file**, tagged
+`[include:<path>]`. That last part is not a nicety: `--list` shows an include as
+a *pointer* and never the keys it brings, so a `core.hooksPath` one
+`include.path` away from `.git/config` was pinned in full and named nowhere.
+That list is residual 1 below, printed at the one moment it is being
 adopted; an operator who is never shown it has no way to know they accepted it.
-`loom pin-config` prints both blocks too. **`loom drop` deliberately does not
+`loom pin-config` prints both blocks too (saying "pinned to this baseline",
+since what it pins outlives every task). **`loom drop` deliberately does not
 check the pin at all**: it runs no model, publishes nothing, and removes the
 worktree, the branch and the record — refusing to clean up because the config
 moved would strand released paths on disk, which is the opposite of what the
@@ -487,10 +497,42 @@ baseline move whenever any task's worktree gained a sparse rule.
   about a task, and a `loom scout` after the last task was dropped still has to
   be judged against something.
 
+**And it never moves silently.** `config_repin` re-records the repository
+baseline as a *side effect* of pinning a task — at `loom new`, and at
+`land --pr` after its own `--set-upstream-to`. Both are places where loom
+expects to be adopting its **own** writes (`extensions.worktreeConfig`;
+`branch.<br>.remote`/`.merge`), and "expects" is not "checked": anything else
+that moved in the same window became the baseline the next `loom scout` and
+`loom plan` are judged against, with nothing printed. Every such re-record now
+prints the `-`/`+` delta first, prefixed
+`loom: repository config baseline moved:` — and where the delta **adds** a key
+that names a program git runs, it is refused rather than adopted:
+
+- **`loom new`** takes no `--accept-config` (it is the command that *pins*), so
+  it cannot weigh such a move at all: it prints the delta, names the key, points
+  at `loom pin-config --accept-config`, and unwinds the half-built task. A move
+  that names no program is adopted, with its diff printed.
+- **`land --pr`** refuses the re-pin *after* the push, and says so — the branch
+  is on origin and nothing about that is undone. What has not happened is the
+  re-pin, so the baseline still says what it said and the next task-less role
+  keeps refusing until the operator has read the lines and run
+  `loom pin-config --accept-config`.
+
+**Additions only.** A program key *going away* is not the danger, and refusing
+that would turn "put it back" — the escape every one of these refusals names —
+into a refusal of its own. A changed *value* is a `-` and a `+` together, so it
+is still caught.
+
 `git config --worktree` is an **alias for `--local`** when
 `extensions.worktreeConfig` is off, so the two worktree scopes are read only
 when git would read them. That is fail-closed, not a relaxation: turning the
 extension on is itself a write to the local scope, which this same pin refuses.
+**Whether it is on is asked of git**, with
+`git config --local --type=bool --get`, and not string-matched: git decides with
+`git_config_bool`, which is case-insensitive and treats a *valueless* key as
+true, so `True`, `ON` and a bare `worktreeConfig` line each read as "off" to a
+`true|yes|on|1` list while git went on reading both scopes — a `core.hooksPath`
+in `config.worktree`, live and unpinned.
 
 `scout_root` re-pins the repository baseline after **creating** the mirror, for
 the same reason `loom new` re-pins after its own worktree setup — the first
@@ -510,7 +552,12 @@ anything that survives a call a channel between them.
   it. `loom` **refuses** a mirror whose private scope holds anything but the
   sparse keys git's own `sparse-checkout` writes. Refusing rather than
   deleting-and-recreating the scope is deliberate: both neutralise the plant,
-  only one tells the operator that something wrote there.
+  only one tells the operator that something wrote there. The refusal names the
+  file by asking git for it (`git -C <mirror> rev-parse --git-dir`, plus
+  `/config.worktree`) rather than spelling out `worktrees/_scout`: that name is
+  git's to choose, and a refusal that tells the operator to `rm -f` a path that
+  is not the one being complained about is one that gets ignored — or, worse,
+  obeyed.
 - `reset --hard` never touches an **untracked** file, so a previous run's
   scratch — or a copy of a fenced path made with `git show HEAD:core/lib.rs >
   notes.txt`, which the index never sees — sat in the mirror for the next

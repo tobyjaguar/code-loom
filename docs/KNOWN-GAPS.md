@@ -1,11 +1,12 @@
 # Known gaps
 
-Holes an adversarial review found in the harness. Two of the six are **closed
-on this branch** (gaps 1 and 5) and are kept here because each closure has a
-cost or a residual worth naming; the rest are **not fixed**, and are written
-down so that the fence-profile work is not mistaken for closing them and so
-they are not re-discovered from scratch. Gap 6 is round 7's, narrowed again in
-round 8: it is a residual by construction rather than a hole nobody got to.
+Holes an adversarial review found in the harness. Four of the eight are
+**closed on this branch** (gaps 1, 5, 7 and 8) and are kept here because each
+closure has a cost or a residual worth naming; the rest are **not fixed**, and
+are written down so that the fence-profile work is not mistaken for closing
+them and so they are not re-discovered from scratch. Gap 6 is round 7's,
+narrowed again in rounds 8 through 11: it is a residual by construction rather
+than a hole nobody got to.
 
 None of them is *caused* by fence profiles — but gap 4's consequence is
 **widened** by profiles, because a worktree under a profile holds paths the
@@ -362,7 +363,9 @@ matter slightly more than they did.
 
 **Status: narrowed in round 7, pinned in round 8, widened to every scope git
 actually reads in round 9, extended in round 10 to the roles that have no task
-(and to the one scope no task pin could reach), and a residual by
+(and to the one scope no task pin could reach), tightened in round 11 (the
+extension is read as a BOOL, an include's own keys are named, and a repository
+baseline no longer moves silently), and a residual by
 construction.** This one cannot be
 closed from outside git; what follows is the boundary, drawn honestly.
 
@@ -443,7 +446,12 @@ worktree can write two of them:
 Both `config.worktree` files are live whenever `extensions.worktreeConfig` is
 enabled, and **loom itself enables it** on the first `git sparse-checkout init`
 in a repository (measured, git 2.34). Neither appears in
-`git config --local --list`. Nor do the keys an **include** brings: `--list`
+`git config --local --list`. **Whether it is enabled is asked of git**
+(`git config --local --type=bool --get`) rather than string-matched: git decides
+with `git_config_bool`, which is case-insensitive and reads a *valueless* key as
+true, so `True`, `ON` and a bare `worktreeConfig` line each turned both worktree
+scopes **off in the pin** while git went on reading them — a `core.hooksPath` in
+`config.worktree`, live and unpinned (`tests/fence-profiles.sh` (bt)). Nor do the keys an **include** brings: `--list`
 prints `include.path=<file>` and `includeIf.<cond>.path=<file>` as *pointers*,
 and only the full all-scopes `git config --list` shows the `core.hooksPath` the
 target pulled in (measured, git 2.34.1) — so a pointer pinned once buys the
@@ -468,11 +476,38 @@ WARN naming every pinned key that names a **program git runs** —
 `core.hooksPath`, `credential.*`, `core.askPass`, `filter.*`, `merge.*.driver`,
 `diff.*.textconv`/`.command`, `gpg.program`, `pager.*`, `core.attributesFile`,
 `core.sshCommand`, `include.*`/`includeIf.*` — values escaped, tagged with the
-scope each came from. That is residual 1 below, printed at the one moment it is
-being adopted. `loom pin-config` prints both blocks too.
+scope each came from, and **including the keys inside an included file**, tagged
+`[include:<path>]`: `--list` shows an include as a pointer and never the keys it
+brings, so a `core.hooksPath` one `include.path` away from `.git/config` was
+pinned in full and named nowhere. That is residual 1 below, printed at the one
+moment it is being adopted. `loom pin-config` prints both blocks too.
 `loom drop` deliberately does not check the pin at all — it runs no model,
 publishes nothing, and removes the worktree, branch and record, so refusing to
 clean up over a moved config would strand released paths on disk.
+
+*And the REPOSITORY baseline never moves silently.* `config_repin` re-records
+the repository's baseline as a side effect of pinning a task — at `loom new`,
+and at `land --pr` after its own `--set-upstream-to`. Both are places where
+loom expects to be adopting its **own** writes, and "expects" is not "checked":
+anything else that moved in the same window became the baseline the next
+`loom scout` and `loom plan` are judged against, with nothing printed. Every
+such re-record now prints the `-`/`+` delta first
+(`loom: repository config baseline moved:`), and where the delta **adds** a key
+that names a program git runs it is refused rather than adopted:
+
+- **`loom new`** takes no `--accept-config` — it is the command that pins — so
+  it cannot weigh such a move at all. It prints the delta, names the key, and
+  points at `loom pin-config --accept-config`, which is the command that can.
+  The half-built task is unwound.
+- **`land --pr`** refuses the re-pin *after* the push, and says so: the branch
+  is on origin and nothing about that is undone. What has not happened is the
+  re-pin, so the next task-less role still refuses until the operator has read
+  the lines and run `loom pin-config --accept-config`.
+
+Additions only: a program key *going away* is not the danger, and refusing that
+would turn "put it back" — the escape every one of these refusals names — into
+a refusal of its own. A changed *value* is a `-` and a `+` together, so it is
+still caught (`tests/fence-profiles.sh` (bs)).
 
 *The include closure carries BYTES, and `includeIf` conditions are not
 evaluated.* A digest alone made an edit to an included file print
@@ -481,7 +516,14 @@ nothing in it to read, in the one case where the changed bytes are in no file
 `git config --list` will show. The record now carries the target's own bytes
 beside its sha, so the change is a `-`/`+` **content** diff; path and bytes are
 escaped on the way in, because the sidecar is NUL-framed with a newline between
-a record's halves and a config file may contain both. And **every**
+a record's halves and a config file may contain both. The bytes are **capped at
+64 KiB** per target: an include target is a config file and a config file is
+small, so a bigger one is either a mistake or a way to bloat the sidecar and
+drown a refusal in it. Past the cap the value half reads
+`(<N> bytes, sha256 <hex>)` — the digest is what the change check runs on
+either way, so the refusal still fires and still names the file; it just says
+how big it is rather than showing it, and its own keys are not listed. And
+**every**
 `includeIf.<cond>.path` target is pinned whatever `<cond>` says: `loom` does not
 test `gitdir:` / `onbranch:` / `hasconfig:`. That **over-refuses** by design, and
 that is the direction to be wrong in — the conditions are evaluated against
@@ -557,6 +599,30 @@ re-point it under a running task without the next command refusing.
 top of the pin, because "the remote was re-aimed" is a clearer message than "the
 config changed".
 
+**AVAILABILITY, and the one thing loom cannot help with.** The pin is an
+INTEGRITY check; it does not make git available. `include.path` names a file
+git *opens and reads*, and git does that with no timeout — so
+`git config --local include.path /path/to/a/fifo` (a FIFO with no writer, or
+any other path that blocks on open) **wedges git itself**. Every git command in
+that repository hangs, from `git status` to `git config --list` — including the
+`git config --list --null` the pin takes its snapshot with, and including the
+`git config --unset` you would type to undo it. Measured shape: the process
+sits in `open()`, `Ctrl-C` kills the one command and nothing else changes.
+`loom` cannot refuse its way out of this, because every path by which it could
+notice runs git first; a check that read `.git/config` as bytes before asking
+git would still not help, since it is the *next* git command that hangs. It is
+also not a privilege escalation — nothing runs, nothing leaks — it is a
+denial of service against your own repository, available to anything that can
+write the shared `.git/config`, which is every linked worktree.
+
+**Recovery is by hand, and it does not involve git**: open
+`$GIT_COMMON_DIR/config` (that is `.git/config`, or the absolute path
+`git rev-parse --git-common-dir` printed *before* the plant) in an editor,
+delete the `include.path` / `includeIf.<cond>.path` line, and save. git works
+again on the next command, and the pin then refuses the change on its own terms
+— the delta names the include that was there. Worth knowing before you meet it,
+because the failure looks like a hung terminal rather than an attack.
+
 **The cost, stated.** `loom diff` no longer pages by default — `core.pager` is
 pinned to `cat` and `GIT_PAGER` to `cat`, so a pager is operator-side now
 (`export LOOM_DIFF_CMD="less -R"`). `core.sshCommand` is pinned to the value in
@@ -575,3 +641,89 @@ is as far as a *change* check goes. The honest answer for a repository whose
 existing `.gitattributes` and filter drivers you would not want to run is the
 same as caveat 1's answer to exfiltration: give the agent a separate clone, not
 a sparse checkout.
+
+---
+
+## 7. A worktree was taken on trust — CLOSED
+
+**Status: fixed on this branch (round 10), kept here with its residual.** The
+narrative and the three checks live in ARCHITECTURE.md § 5 ("A worktree is
+judged only once it is proved to be ours"); this entry exists so that the gap
+list is the list, and so the trap is written down where the other traps are.
+
+**Where.** `require_wt_is_ours` (`bin/loom:1643`), called from
+`require_wt_on_branch` (which covers `require_worktree`, `loom run` and
+`loom loop`), from `cmd_drop` before `git worktree remove`, and from
+`scout_root` for the shared mirror.
+
+**What it was.** Every check in this harness reads a worktree through
+`git -C "$wt" …`, and *which repository that answers for* is decided by one
+line of text in a file the agent owns: `$wt/.git` in a linked worktree is not a
+directory, it is a file holding `gitdir: <path>`. Rewrite it and the directory
+stops being this repository's worktree — every later `git -C "$wt" …` reads a
+git directory of the writer's choosing, with its config (`filter.<d>.clean`,
+`core.hooksPath`, `credential.helper`), its hooks, its refs and its objects,
+while the path, the task id and the branch name go on reading exactly as they
+did.
+
+**Why nothing caught it.** A decoy repository built with the **same branch
+name** answers `git -C "$wt" symbolic-ref HEAD` with `refs/heads/agent/<task>`
+(measured) — so `require_wt_on_branch`, the check whose whole job is "is this
+tree the branch's tree", passed it. `loom drop` could not clean up afterwards
+either: git refuses to remove a worktree it does not own, the removal was
+written `|| true`, and the command printed `dropped` over a directory that was
+still there with the released paths still in it.
+
+**What closes it.** Three facts, each asked of git and compared against a path
+this process resolved at startup, realpath'd on both sides (so a repo under a
+symlinked `/tmp` cancels out while a symlink planted at one of them does not):
+`--git-common-dir` is this repository's shared `.git`; `--show-toplevel` is the
+directory we asked about; `--git-dir` is under `$GIT_COMMON_DIR/worktrees/`,
+i.e. git knows it as a linked worktree **of this repository**. And `loom drop`
+no longer prints `dropped` on faith — the directory is asserted **gone** before
+the record and the branch are touched (`tests/fence-profiles.sh` (bq)).
+
+**The residual.** Nothing is done to a foreign worktree automatically: loom
+refuses, names the git directory it found, and leaves both the directory and
+the operator record standing, because the record is the only thing that says
+what that directory is. Cleaning it up is the operator's, by hand.
+
+---
+
+## 8. `.agents/reviews` is loom's write into a tree the agent owns — CLOSED
+
+**Status: fixed on this branch (round 11).** Kept here because the shape
+generalises: it is the only directory in this system that loom writes to on the
+agent's side of the fence.
+
+**Where.** `reviews_dir` (`bin/loom:2936`), the write sites in `cmd_run`
+(gate log), `cmd_check` (patch + review), `cmd_diff` (patch) and `cmd_loop`
+(the review text it appends to the task spec), the `--add-dir` sandbox root in
+`run_headless` (`bin/loom:1808`), and the pathspec in `wt_dirty`.
+
+**What it was.** `reviews_dir` was `mkdir -p "$wt/.agents/reviews"` and nothing
+else, and every caller then spelled the path out again. `mkdir -p` on a path
+that already resolves to a directory succeeds silently, so a symlink there —
+`.agents/reviews`, with `.agents` itself left intact and tracked — redirected
+loom's own writes out of the worktree. The review **patch** is the one that
+matters: it carries the full content of every path in the diff, released paths
+included, so a profiled task's patch could be written into an *unprofiled*
+worktree under the other root, which a provider that profile does not allow is
+about to run in. `wt_dirty` excluded `.agents/reviews` by pathspec, so the
+status lines that would have shown the swap were excluded too, and `loom land`
+carried on.
+
+**What closes it.** The directory is resolved physically before every write and
+refused unless the resolved path is inside the resolved worktree, at **two**
+levels — `.agents` (checked *before* the `mkdir`, which would otherwise create
+the directory at the far end of a link) and `.agents/reviews` (the stealth
+variant every `.agents`-level check walks past) — and the callers write to what
+it resolved to rather than re-deriving the path. `run_headless` applies the
+same rule to the `--add-dir` sandbox root it grants an implementer, and
+`wt_dirty` drops its exclusion whenever `.agents/reviews` is not a real
+directory inside the worktree, so the link counts as dirty and landing refuses
+(`tests/fence-profiles.sh` (br)).
+
+**The residual.** A consuming repo should still gitignore `.agents/reviews/`
+(README § The loop). And the fence itself is unchanged: this closes a redirect
+of loom's writes, not the question of what an agent may read.
