@@ -1112,9 +1112,26 @@ config_repin() { # config_repin <task>
 # The git config a task was created against — all three scopes and the include
 # closure — must still be the git config it runs, fetches, pushes, merges and
 # lands against.
+#
+# WHERE THIS IS CALLED FROM IS PART OF THE CHECK. Every command puts it BEFORE
+# its first fence operation, because `fence_reconcile` -> `fence_apply` ->
+# `git sparse-checkout set` is a WORKING-TREE UPDATE: git materialises every
+# path the new pattern list admits, and materialising a path runs the SMUDGE
+# side of whatever `filter.<d>` a `.gitattributes` in that worktree selects.
+# The `.gitattributes` is a file the agent writes (uncommitted is enough) and
+# `filter.<d>.smudge` is one `git config` away — so with the check one line
+# later the planted program ran, as the operator, before the pin that exists to
+# refuse it ever spoke. It is called AGAIN at each of the old sites (per model
+# attempt, before the push, before the merge, before the fetch and the replay);
+# those are re-checks, not the first one.
 require_recorded_config() { # require_recorded_config <task> <command-name>
   local task="$1" cmd="$2" rec now f changed
   rec="$(state_read "$task" config)"
+  # No record AT ALL is a different fact from "a record that pins no config",
+  # and it now reaches this line first (the pin is checked before the fence
+  # operations, ahead of everything that used to speak for a missing record).
+  # Say the thing that is actually wrong, in the words written for it.
+  [ -f "$(state_file "$task")" ] || require_record "$task"
   [ -n "$rec" ] || die "the operator record for task $task pins no git config.
 That record was written by a loom from before the git config was pinned, so
 there is nothing to compare this repository's config against — and loom will not
@@ -1568,19 +1585,26 @@ run_role() { # run_role <role> <workdir> <prompt> [<logfile>]
     # invisible here, and always will be: that is the exfiltration class, and
     # the answer to it is a separate repository, not a check (ARCHITECTURE.md
     # § 5, caveat 1).
+    #
+    # The config comes FIRST, above the reconcile, and the order is the point:
+    # `fence_reconcile` calls `fence_apply`, whose `git sparse-checkout set` is
+    # a WORKING-TREE UPDATE. That runs the smudge side of every `filter.<d>`
+    # a `.gitattributes` in the worktree selects — so a `filter.<d>.smudge`
+    # planted by attempt 1 (or by anything else in that tree) executed as the
+    # operator while loom was still deciding whether to refuse. The same
+    # argument as the reconcile, one line earlier: the git config is in the
+    # shared .git and in the worktree's own config.worktree, both writable from
+    # the tree attempt 1 just ran in, and a `git config filter.x.clean
+    # '!sh -c …'` planted there is a program running in your session before
+    # attempt 2 (or the operator's next command). Re-read per attempt, not once
+    # per command, and NOT gated on in_task_worktree: the config is the
+    # REPOSITORY's, whatever directory this role runs in.
+    if [ -n "$CONFIG_TASK" ]; then
+      require_recorded_config "$CONFIG_TASK" "$CONFIG_CMD"
+    fi
     if in_task_worktree "$wd"; then
       fence_reconcile "$wd" "$FENCE_PROFILE"
       profile_provider_guard "$role"
-    fi
-    # ... and the same argument for the repository's git config, which is in the
-    # shared .git and in the worktree's own config.worktree, both writable from
-    # the tree attempt 1 just ran in. A `git config filter.x.clean '!sh -c …'`
-    # planted by attempt 1 would otherwise be a program running in your session
-    # before attempt 2 (or the operator's next command) — so it is re-read here,
-    # per attempt, not once per command. Not gated on in_task_worktree: the
-    # config is the REPOSITORY's, whatever directory this role runs in.
-    if [ -n "$CONFIG_TASK" ]; then
-      require_recorded_config "$CONFIG_TASK" "$CONFIG_CMD"
     fi
     tried="yes"
     echo "loom: [$role] running on $m (tier $TIER)"
@@ -3015,6 +3039,14 @@ cmd_run() {
   # its branch point — which is the ordinary state of a task `loom run` is about
   # to implement — so the record's existence is checked on its own, here.
   require_record "$task"
+  # BEFORE the first fence operation, which is the whole of this line's
+  # placement: `fence_reconcile` -> `fence_apply` -> `git sparse-checkout set`
+  # updates the WORKING TREE, and that runs planted smudge filters. See
+  # require_recorded_config.
+  # (It is here rather than one line above `require_fence_flag` because the
+  # branch above may have just called `cmd_new`, which is the command that PINS:
+  # for a task loom created a moment ago there is nothing yet to compare.)
+  require_recorded_config "$task" run
   # Re-apply and verify, and refuse outright if what is on disk and what the
   # operator asserted do not line up. The tree cannot authorise anything; it
   # can only contradict the flag, and a contradiction is a dead stop.
@@ -3070,6 +3102,11 @@ cmd_check() {
   local task="${FLAG_ARGS[0]:?usage: loom check <task-id> [--fence-profile <name>]}"
   local wt base review log pnote=""
   require_fence_flag "$task" check
+  # BEFORE the first fence operation, which is the whole of this line's
+  # placement: `fence_reconcile` -> `fence_apply` -> `git sparse-checkout set`
+  # updates the WORKING TREE, and that runs planted smudge filters. See
+  # require_recorded_config.
+  require_recorded_config "$task" check
   wt="$(require_worktree "$task")"
   profile_provider_guard reviewer         # no-op without a profile
   # BEFORE the patch is written: the patch carries the content of every path in
@@ -3147,7 +3184,6 @@ cmd_loop() {
   refuse_cross_root "$task"
   [ -d "$wt" ] || cmd_new "$task" ${passthru[0]+"${passthru[@]}"} > /dev/null
   require_wt_on_branch "$task" "$wt"
-  fence_reconcile "$wt" "$FENCE_PROFILE"
   # require_record, NOT security_base. security_base also refuses a branch with
   # nothing past its branch point — which is the ordinary state of the fresh
   # task `loom loop` exists to implement, so `loom loop <new-task>` died on
@@ -3161,8 +3197,17 @@ cmd_loop() {
   # of theirs surfaces as "the implementer never reached a green gate". The
   # config pin is checked here as a plain statement so the refusal is the loop's
   # own, with its own message. (Both of them check again, per launch.)
+  #
+  # And it is ABOVE the reconcile, for the reason every other command gives:
+  # `fence_reconcile` -> `fence_apply` -> `git sparse-checkout set` updates the
+  # working tree, which runs the smudge side of a planted `filter.<d>` before
+  # the pin has had a chance to refuse it. It sits here rather than beside
+  # `require_fence_flag` because the line above may have just called `cmd_new`,
+  # the command that PINS — for a task loom created a moment ago there is
+  # nothing yet to compare.
   FLAG_ACCEPT_CONFIG="$accept_cfg"
   require_recorded_config "$task" loop
+  fence_reconcile "$wt" "$FENCE_PROFILE"
 
   implement() { # one implementer pass, with cmd_run's exit codes named
     local rc=0
@@ -3222,6 +3267,11 @@ cmd_diff() {
   local task="${FLAG_ARGS[0]:?usage: loom diff <task-id> [--fence-profile <name>]}"
   local wt base patch
   require_fence_flag "$task" diff
+  # BEFORE the first fence operation, which is the whole of this line's
+  # placement: `fence_reconcile` -> `fence_apply` -> `git sparse-checkout set`
+  # updates the WORKING TREE, and that runs planted smudge filters. See
+  # require_recorded_config.
+  require_recorded_config "$task" diff
   wt="$(require_worktree "$task")"
   # Same order as `loom check`, for the same reason: the patch this writes carries
   # the content of every path in it, so the tree AND the history are judged
@@ -3276,6 +3326,20 @@ cmd_land() {
   [ -n "$task" ] || die "usage: loom land <task-id> [--fence-profile <name>] [--pr|--merge] [--force]"
   case "$mode" in merge|pr) ;; *) die "LOOM_LAND must be 'merge' or 'pr' (got '$mode')" ;; esac
   require_fence_flag "$task" land
+  # The remote first, and only in --pr mode, because a re-aimed URL / refspec /
+  # push-url has its own, clearer message and must not surface as "the config
+  # changed" — every one of those settings lives in the config the next line
+  # pins. (Both are checked again lower down, immediately before the push and
+  # the merge; these are the copies that run before anything is touched.)
+  if [ "$mode" = pr ]; then
+    git remote get-url origin >/dev/null 2>&1 || die "no 'origin' remote — PR-mode landing needs one"
+    require_recorded_origin "$task" "push"
+  fi
+  # BEFORE the first fence operation, which is the whole of this line's
+  # placement: `fence_reconcile` -> `fence_apply` -> `git sparse-checkout set`
+  # updates the WORKING TREE, and that runs planted smudge filters. See
+  # require_recorded_config.
+  require_recorded_config "$task" land
   wt="$(require_worktree "$task")"; br="$(branch_of "$task")"
   fence_reconcile "$wt" "$FENCE_PROFILE"
   # Uncommitted work in the worktree is not the branch's work: the reviewer read
@@ -3497,6 +3561,16 @@ refresh what it replays onto first:
       fi ;;
   esac
   require_fence_flag "$task" rebase   # a rebase must not silently change the fence
+  # The remote first, for the reason `loom land` gives: a re-aimed URL, refspec
+  # or push-url is a change to the config the next line pins, and "the remote is
+  # not the one this task was created against" is the clearer of the two
+  # messages. Both are checked again below, before the fetch and the replay.
+  require_recorded_origin "$task" "rebase"
+  # BEFORE the first fence operation, which is the whole of this line's
+  # placement: `fence_reconcile` -> `fence_apply` -> `git sparse-checkout set`
+  # updates the WORKING TREE, and that runs planted smudge filters. See
+  # require_recorded_config.
+  require_recorded_config "$task" rebase
   wt="$(require_worktree "$task")"; br="$(branch_of "$task")"
   fence_reconcile "$wt" "$FENCE_PROFILE"
   # A rebase rewrites these commits onto a new base and re-points the recorded
