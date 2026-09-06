@@ -113,6 +113,13 @@ printf 'TMPDIR=%s\n' "${TMPDIR:-(unset)}" >> "${LOOM_TEST_TMP:?}/called-claude.l
 if [ -n "${LOOM_TEST_HAND_EDIT:-}" ]; then
   printf '#!/usr/bin/env bash\n# edited by the stub implementer\nexit 0\n' > "$LOOM_TEST_HAND_EDIT"
 fi
+# An implementer that MOVES a [hand] path out of its zone, for (cn). `git mv`
+# stages both sides, and with git's default rename detection `git diff --cached
+# --name-only` names only the destination — so the path leaving [hand] was
+# invisible to both `loom run` and the pre-commit guard.
+if [ -n "${LOOM_TEST_HAND_MV:-}" ]; then
+  git mv .agents/gate.sh backend/gate.sh > /dev/null 2>&1 || true
+fi
 # An implementer must be able to write; prove the stub ran by leaving a file.
 echo "written by the stub implementer" > backend/from-implementer.txt
 echo "stub claude done"
@@ -4155,6 +4162,46 @@ want_in     "(cm) ... naming it"                                    "$out" "ios/
 want_not_in "(cm) ... and not 'has been widened'"                   "$out" "has been widened"
 rm -rf "$CM2/ios"
 "$LOOM" drop 0120-cm2 > /dev/null 2>&1 || true
+
+# --- (cn) a rename OUT of the hand zone --------------------------------------
+# `git mv .agents/gate.sh backend/gate.sh` stages a delete and an add, but git's
+# rename detection (on by default since 2.9) reports it as ONE path — the
+# destination — so `git diff --cached --name-only` never named the [hand] path
+# LEAVING the zone. `loom run` committed the rename and the pre-commit guard let
+# it through; only `loom check`'s history leg caught it, because history_paths
+# already spelled --no-renames. Both of the other two now do as well.
+cn_hook="$(git rev-parse --git-path hooks/pre-commit)"
+case "$cn_hook" in /*) ;; *) cn_hook="$REPO/$cn_hook" ;; esac
+want_absent "(cn) setup: no pre-commit hook yet"                    "$cn_hook"
+out="$("$LOOM" new 0121-cn 2>&1)"; rc=$?
+want_eq "(cn) setup: a task"                                        "$rc" "0"
+CN="$WTU/0121-cn"
+cn_head="$(git -C "$CN" rev-parse HEAD)"
+out="$(LOOM_TEST_HAND_MV=1 LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 \
+       "$LOOM" run 0121-cn 2>&1)"; rc=$?
+want_fail "(cn) loom run refuses to commit a rename out of [hand]"  "$rc"
+want_in   "(cn) ... naming the path that LEFT the zone"             "$out" ".agents/gate.sh"
+want_in   "(cn) ... as a hand-zone path"                            "$out" "hand-zone paths"
+want_eq   "(cn) ... with nothing committed"                         "$(git -C "$CN" rev-parse HEAD)" "$cn_head"
+"$LOOM" drop 0121-cn > /dev/null 2>&1 || true
+# ... and the hook, which runs in the agent's own context, says the same.
+ln -sf "$LOOM" "$TMP/stubs/loom"          # the hook calls `loom guard` by name
+out="$("$LOOM" install-hooks 2>&1)"; rc=$?
+want_eq   "(cn) setup: the hook installs"                           "$rc" "0"
+want_file "(cn) ... and it is there"                                "$cn_hook"
+out="$("$LOOM" new 0122-cn2 2>&1)"; rc=$?
+want_eq "(cn) setup: a second task"                                 "$rc" "0"
+CN2="$WTU/0122-cn2"
+cn2_head="$(git -C "$CN2" rev-parse HEAD)"
+out="$( { cd "$CN2" && git mv .agents/gate.sh backend/gate.sh \
+          && git commit -qm "agent(0122-cn2): a rename past the guard"; } 2>&1 )"; rc=$?
+want_fail "(cn) loom guard BLOCKS the same rename at commit time"   "$rc"
+want_in   "(cn) ... naming the path that left the zone"             "$out" ".agents/gate.sh"
+want_eq   "(cn) ... with nothing committed"                         "$(git -C "$CN2" rev-parse HEAD)" "$cn2_head"
+git -C "$CN2" reset -q --hard
+"$LOOM" drop 0122-cn2 > /dev/null 2>&1 || true
+rm -f "$cn_hook" "$TMP/stubs/loom"
+want_absent "(cn) the hook is removed again"                        "$cn_hook"
 
 # --- (j)/(t)/(cg) doctor lists the profiles, touches no network, and counts -
 # (cg): `local pname pprov prel role m mp bad` inside the [fence_profiles] loop

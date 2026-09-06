@@ -3864,7 +3864,12 @@ hand_reconcile_staged() { # hand_reconcile_staged <worktree> <task>
   # file, exactly as history_paths does. The temp is swept by cfg_cleanup, so
   # the refusals below do not remove it inline (which would be a write into
   # the file this loop is reading).
-  git -C "$wt" diff --no-ext-diff --no-textconv --cached -z --name-only > "$out" 2>/dev/null \
+  # --no-renames, for the reason history_paths gives: with rename detection ON
+  # (git's default since 2.9) `git mv .agents/gate.sh backend/gate.sh` reports
+  # only the DESTINATION, so the hand-zone path being moved out never appears
+  # and `loom run` committed the rename. Off, git reports a delete plus an add,
+  # which is both sides.
+  git -C "$wt" diff --no-ext-diff --no-textconv --cached -z --no-renames --name-only > "$out" 2>/dev/null \
     || die "cannot read what is staged in $wt — refusing to commit what loom cannot judge"
   while IFS= read -r -d '' f; do
     [ -n "$f" ] || continue
@@ -3961,6 +3966,10 @@ cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
       exit 1
     fi
   fi
+  # --no-renames: a `git mv` out of the hand zone reports only the DESTINATION
+  # with rename detection on (git's default since 2.9), and the path being moved
+  # out is the one this guard exists to see. Off, git reports a delete plus an
+  # add, which is both sides — the same spelling history_paths uses.
   local violations="" file z
   while IFS= read -r file; do
     [ -n "$file" ] || continue
@@ -3969,7 +3978,7 @@ cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
       violations="$violations
   $file"
     fi
-  done < <(git -C "$INVOKED_ROOT" diff --no-ext-diff --no-textconv --cached --name-only)
+  done < <(git -C "$INVOKED_ROOT" diff --no-ext-diff --no-textconv --cached --no-renames --name-only)
   if [ -n "$violations" ]; then
     echo "BLOCKED: agent branch '$branch' touches hand-zone paths:$violations" >&2
     echo "" >&2
