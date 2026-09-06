@@ -36,7 +36,7 @@ your environment.
 
 **What closes it.** `bin/loom:159` (`ROOT="$(cd "$(dirname "$_common")" …)"`,
 from `git rev-parse --git-common-dir` at `bin/loom:155`) and `bin/loom:184`
-(`AGENTS_DIR="$ROOT/.agents"`); the guard's own reads are `bin/loom:3320`
+(`AGENTS_DIR="$ROOT/.agents"`); the guard's own reads are `bin/loom:3332`
 onward. `$ROOT` is now the **main checkout** for every command:
 `git rev-parse --git-common-dir` answers `.git` from the main checkout and the
 absolute path of the main `.git` from a linked worktree, so its parent is the
@@ -82,7 +82,7 @@ own. That is not worth plugging: the entire hook is dominated by `git commit
 
 ## 2. `loom plan` runs the architect unfenced, in your own tree
 
-**Where.** `bin/loom:5276`, in `cmd_plan` (`bin/loom:5249`):
+**Where.** `bin/loom:5386`, in `cmd_plan` (`bin/loom:5359`):
 `run_role architect "$ROOT" "$prompt"` (and the
 interactive leg, `claude --append-system-prompt … "$prompt"`, likewise in
 `$ROOT`). The architect's chain at every tier ends in cheap third-party
@@ -245,7 +245,7 @@ that one form or the README changes with it.
 used to read "granted for the whole worktree root". It is not that any more;
 what is left is a confirmation.
 
-**Where.** `bin/loom:2366`, in `run_headless` (`bin/loom:2261`), the opencode leg:
+**Where.** `bin/loom:2378`, in `run_headless` (`bin/loom:2273`), the opencode leg:
 
 ```sh
 perm="$(printf '{"external_directory":{"%s/*":"allow","%s/**":"allow"}}' "$wd" "$wd")"
@@ -315,7 +315,7 @@ OPENCODE_CONFIG=$ROOT/.opencode/opencode.json     # (and OPENCODE_CONFIG_DIR)
 OPENCODE_DISABLE_PROJECT_CONFIG=1
 ```
 
-`run_headless`'s opencode leg (`bin/loom:2399`) sets the **disable
+`run_headless`'s opencode leg (`bin/loom:2411`) sets the **disable
 unconditionally**, on every opencode invocation — implementer, reviewer, scout
 and architect alike — and names the operator's config only when one exists.
 That is a round-4 correction: the disable used to be conditional on
@@ -373,16 +373,16 @@ baseline no longer moves silently), and a residual by
 construction.** This one cannot be
 closed from outside git; what follows is the boundary, drawn honestly.
 
-**Where.** `bin/loom:436` (the `GIT_CONFIG_PARAMETERS` export) and
-`bin/loom:446` (`GIT_PAGER=cat`); `bin/loom:795` onward (the task pin:
+**Where.** `bin/loom:447` (the `GIT_CONFIG_PARAMETERS` export) and
+`bin/loom:458` (`GIT_PAGER=cat`); `bin/loom:807` onward (the task pin:
 `config_sidecar`, `config_py`, `config_snapshot`, `config_wt`,
-`config_summary`, `config_programs` at `bin/loom:1530`,
-`require_recorded_config`); `bin/loom:1641` onward (the REPOSITORY baseline:
+`config_summary`, `config_programs` at `bin/loom:1542`,
+`require_recorded_config`); `bin/loom:1653` onward (the REPOSITORY baseline:
 `repo_config_file`, `repo_config_read`, `repo_config_write`,
-`repo_config_repin`, and `require_recorded_config_repo` at `bin/loom:1851`),
-read from `scout_root` (`bin/loom:5343`) and `cmd_plan`, written by
-`cmd_pin_config` (`bin/loom:5145`); `scout_mirror_config_check`
-(`bin/loom:5303`) for the one scope neither pin can cover; and the
+`repo_config_repin`, and `require_recorded_config_repo` at `bin/loom:1863`),
+read from `scout_root` (`bin/loom:5453`) and `cmd_plan`, written by
+`cmd_pin_config` (`bin/loom:5255`); `scout_mirror_config_check`
+(`bin/loom:5413`) for the one scope neither pin can cover; and the
 `--no-ext-diff` / `--upload-pack=` / `--receive-pack=` spelled out at the diff,
 fetch and push call sites.
 
@@ -674,7 +674,7 @@ narrative and the three checks live in ARCHITECTURE.md § 5 ("A worktree is
 judged only once it is proved to be ours"); this entry exists so that the gap
 list is the list, and so the trap is written down where the other traps are.
 
-**Where.** `require_wt_is_ours` (`bin/loom:2096`), called from
+**Where.** `require_wt_is_ours` (`bin/loom:2108`), called from
 `require_wt_on_branch` (which covers `require_worktree`, `loom run` and
 `loom loop`), from `cmd_drop` before `git worktree remove`, and from
 `scout_root` for the shared mirror.
@@ -719,10 +719,10 @@ what that directory is. Cleaning it up is the operator's, by hand.
 generalises: it is the only directory in this system that loom writes to on the
 agent's side of the fence.
 
-**Where.** `reviews_dir` (`bin/loom:3470`), the write sites in `cmd_run`
+**Where.** `reviews_dir` (`bin/loom:3482`), the write sites in `cmd_run`
 (gate log), `cmd_check` (patch + review), `cmd_diff` (patch) and `cmd_loop`
 (the review text it appends to the task spec), the `--add-dir` sandbox root in
-`run_headless` (`bin/loom:2261`), and the pathspec in `wt_dirty`.
+`run_headless` (`bin/loom:2273`), and the pathspec in `wt_dirty`.
 
 **What it was.** `reviews_dir` was `mkdir -p "$wt/.agents/reviews"` and nothing
 else, and every caller then spelled the path out again. `mkdir -p` on a path
@@ -766,12 +766,66 @@ Neither step is the lock. `place_file` closes the write path and
 `wt_dirty` is what stops `loom land` publishing over a tree somebody has been
 playing with.
 
+**Round 15 — the alarm's own blind spots.** A review pass went at the tripwire
+itself rather than at what it watches, and found three ways to make it answer
+"clean" without touching a single file it looks at. All three are measured on
+git 2.34.1 and closed on this branch.
+
+1. **An unreadable directory read as a clean one.** `.agents/reviews` at mode
+   `0300` (`-wx------`) still answers `cd` and `pwd -P`, but a shell glob over
+   it matches NOTHING — so `reviews_entries_plain` walked an empty list,
+   answered "all plain", the `:(exclude).agents/reviews` pathspec stayed on, and
+   everything planted inside was excluded from the one command meant to see it.
+   Dropping the exclusion would not have saved it: `git status --porcelain -- .`
+   over a tree with an unreadable directory prints
+   `warning: could not open directory '.agents/reviews/': Permission denied` on
+   STDERR, exits 0, and lists nothing from inside — the same for `.agents`
+   itself at `0300`, where untracked entries under it vanish while
+   modifications to tracked files still show. `wt_dirty` now refuses on the MODE
+   of either directory before it asks anything else, `reviews_entries_plain`
+   refuses a directory it can neither read nor search, and — the general form,
+   which covers an unreadable directory ANYWHERE in the tree — both `git status`
+   calls capture stderr and any of it at all is a refusal
+   (`tests/fence-profiles.sh` (bz)).
+2. **A swallowed `fatal:`, and the config key that provokes it.** With
+   `status.showUntrackedFiles=no` in any scope, step one prints nothing for
+   untracked files and step two dies `fatal: Unsupported combination of ignored
+   and untracked-files arguments`, rc=128 — which
+   `2>/dev/null | grep '^!! ' || true` swallowed whole, so both halves of the
+   tripwire reported a clean tree. Step two now runs into a variable with its
+   own `|| die` before the grep, both calls spell out
+   `--untracked-files=normal`, and `'status.showUntrackedFiles=normal'` joins
+   `'core.untrackedCache=false'` in `GIT_CONFIG_PARAMETERS` (gap 6). The config
+   pin is no defence here by itself: the key can sit in `--global`, a scope the
+   pin does not read, and it can be the baseline the pin ADOPTS at `loom new`
+   — which is the shape the test drives (`tests/fence-profiles.sh` (ca)). A
+   `core.excludesFile` (or `.git/info/exclude`) of `*` blinds step one the same
+   way, but step two's `--ignored=matching` still lists the plant as
+   `!! .agents/reviews/<name>`, so the tripwire already held there; noted, not
+   changed.
+3. **The message named a directory where the operator needed a file.** git names
+   an individual entry only when a TRACKED file inside the directory makes it
+   descend. In the shape this file asks a consumer for — `.agents/reviews/`
+   gitignored, nothing tracked inside — `--ignored=matching` collapses to the
+   single line `!! .agents/reviews/`, with and without `-uall`; the assertion in
+   (bw) that reads a name only reads one because the harness repo tracks
+   `.agents/reviews/.gitkeep`. The refusal fires either way, so this is
+   legibility rather than a bypass. `reviews_entries_plain` now records WHICH
+   entry it refused on and why, and `wt_dirty` appends one line of its own,
+   `!! .agents/reviews/<name>  (not loom's plain scratch: <why>)`, keeping the
+   `!! ` prefix (`tests/fence-profiles.sh` (cb)).
+
 **The residual.** A consuming repo should still gitignore `.agents/reviews/`
 (README § The loop) — the tripwire now holds either way, but an unignored
 scratch directory makes every task's diff noisy. And the fence itself is
 unchanged: this closes a redirect of loom's writes, not the question of what an
 agent may read. It also closed the DIRECTORY and nothing below it — the FILE is
-gap 9.
+gap 9. Round 15's config parameter is **one key, not the class**:
+`GIT_CONFIG_PARAMETERS` outranks every config file, `--global` included, so
+`status.showUntrackedFiles` is now closed against both a planted `--global` and
+an adopted baseline — but the pin behind it still trusts whatever was recorded
+at `loom new` and still never reads `--global` at all. The general form of that
+is gap 6's residual, and it is unchanged.
 
 ---
 
@@ -781,10 +835,10 @@ gap 9.
 asking the same question one level lower.
 
 **Where.** `place_file`, `resolve_under_wt`, `probe_agent_file`, `link_count`
-and `reviews_entries_plain` (`bin/loom:3518`), the write sites in `cmd_run`
+and `reviews_entries_plain` (`bin/loom:3530`), the write sites in `cmd_run`
 (the gate log, and the `-blocked.md` probe), `cmd_check` (patch + review),
 `cmd_diff` (patch) and `cmd_loop` (the append to `.agents/tasks/<task>.md`),
-the artifact copies at `state_artifact` (`bin/loom:1932`), and the pathspec in
+the artifact copies at `state_artifact` (`bin/loom:1944`), and the pathspec in
 `wt_dirty`.
 
 **What it was.** Gap 8 resolved the DIRECTORY before every write and had each
@@ -854,8 +908,8 @@ cost one `ln -s`.
 the shape recurs: loom keeps directories of its own beside the task worktrees
 under `$LOOM_WORKTREES`, and a task id is a directory name there.
 
-**Where.** `state_file` (`bin/loom:525`), asked by `cmd_new` before anything is
-created (`bin/loom:4070`).
+**Where.** `state_file` (`bin/loom:537`), asked by `cmd_new` before anything is
+created (`bin/loom:4180`).
 
 **What it was.** `_scout` is the shared scout mirror — one directory, reset,
 `clean -xdff`'d and re-fenced on every `loom scout`, deliberately under the
