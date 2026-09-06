@@ -68,6 +68,7 @@
 #       tasks/<task>               base=<commit> profile=<name> branch=<br>
 #                                  created=<iso> reviewed=<sha> origin=<url>
 #                                  fetch=<remote.origin.fetch>
+#                                  pushurl=<the push URL of origin>
 #
 # `loom new` writes it, `loom rebase` re-points its base, `loom check` stamps the tip
 # it had reviewed, `loom drop` deletes it, and every security check (and `loom ls`)
@@ -418,8 +419,8 @@ state_file() { # state_file <task>  -> the path of that task's record
 # and it is not the same list by accident: `reviewed` deliberately precedes the
 # two config-derived fields, so that even a reader which took the first match
 # for a duplicated key would take the honest one.
-STATE_KEYS="base profile branch created origin fetch reviewed"
-STATE_ORDER="base profile branch created reviewed origin fetch"
+STATE_KEYS="base profile branch created origin fetch pushurl reviewed"
+STATE_ORDER="base profile branch created reviewed origin fetch pushurl"
 
 # One field of a task's record, or "". A missing record is "" here on purpose:
 # the callers that must refuse it say so themselves, with their own message.
@@ -495,9 +496,9 @@ state_arg() { # state_arg <key> <key>=<value>...
 }
 
 # The only writer, and the only validator of what goes in. Arguments are
-# `<key>=<value>`, in any order: threading seven positional fields through three
+# `<key>=<value>`, in any order: threading eight positional fields through three
 # call sites is how a field gets silently dropped, and a key that is not a field
-# is now a refusal rather than a seventh positional argument nobody notices.
+# is now a refusal rather than an eighth positional argument nobody notices.
 #
 # The fields beyond the base and the profile all exist to pin something an agent
 # could otherwise move under the operator:
@@ -512,6 +513,16 @@ state_arg() { # state_arg <key> <key>=<value>...
 #                   same treatment: pointed at `refs/remotes/decoy/*` it leaves
 #                   a forged `refs/remotes/origin/main` standing through a
 #                   fetch that looks like it worked.
+#   pushurl=<url>   where a push actually GOES, which is not `origin` above:
+#                   `remote.origin.pushurl` overrides the URL for pushes only,
+#                   and a `url.<decoy>.pushInsteadOf = <the real origin>`
+#                   rewrite does the same with the pushurl key left empty. Both
+#                   live in the shared .git/config, both leave `git remote
+#                   get-url origin` answering the honest URL, and `loom land
+#                   --pr` is the one command in this system that publishes an
+#                   agent's commits to a host. Recorded as
+#                   `git remote get-url --push origin`, which is the effective
+#                   answer after both.
 #   reviewed=<sha>  the branch tip `loom check` last handed to a reviewer.
 #                   `loom land` refuses a tip that is not this one.
 state_put() { # state_put <task> <key>=<value>...
@@ -574,29 +585,44 @@ origin_fetch() {
   printf '%s' "$out"
 }
 
+# Where a push to `origin` actually goes, as git resolves it NOW, or "" when
+# there is no origin. `--push` is the whole point: it applies
+# `remote.origin.pushurl` AND any `url.<x>.pushInsteadOf` rewrite, so it answers
+# the question `git remote get-url origin` cannot — both of those redirect a
+# push while leaving the fetch URL reading exactly as it was recorded.
+origin_pushurl() { git remote get-url --push origin 2>/dev/null || true; }
+
 # The origin a task was created against must still be the origin it lands
 # against — the URL AND the refspec. Called by `loom rebase` (before the fetch it
 # would replay onto) and by `loom land --pr` (before the push).
 require_recorded_origin() { # require_recorded_origin <task> <command-name>
-  local task="$1" cmd="$2" rec now what="'remote.origin.url'"
-  rec="$(state_read "$task" origin)"
-  now="$(origin_url)"
-  if [ "$rec" = "$now" ]; then
-    what="'remote.origin.fetch'"
-    rec="$(state_read "$task" fetch)"
-    now="$(origin_fetch)"
-    [ "$rec" = "$now" ] && return 0
-  fi
-  die "the 'origin' remote is not the one task $task was created against:
+  local task="$1" cmd="$2" field rec now what
+  # THREE facts, not one, and each of them is separately writable from a
+  # worktree while the other two keep reading exactly as they were recorded.
+  for field in url fetch pushurl; do
+    case "$field" in
+      url)     what="'remote.origin.url'"
+               rec="$(state_read "$task" origin)";  now="$(origin_url)" ;;
+      fetch)   what="'remote.origin.fetch'"
+               rec="$(state_read "$task" fetch)";   now="$(origin_fetch)" ;;
+      pushurl) what="the PUSH url of 'origin' ('remote.origin.pushurl', or a 'url.<x>.pushInsteadOf' rewrite)"
+               rec="$(state_read "$task" pushurl)"; now="$(origin_pushurl)" ;;
+    esac
+    [ "$rec" = "$now" ] && continue
+    die "the 'origin' remote is not the one task $task was created against:
   $what recorded at loom new: ${rec:-(none)}
   $what configured now:       ${now:-(none)}
-Both live in the shared .git/config, which every linked worktree can write. The
-URL re-aims the fetch a rebase replays onto and the push a --pr landing
-performs; the refspec decides which local ref a fetch updates at all, so one
-pointed at refs/remotes/decoy/* leaves a forged refs/remotes/origin/<branch>
-standing through a fetch that looks like it worked. loom will not $cmd against a
-remote it cannot vouch for. Put it back, or start clean:
+All three live in the shared .git/config, which every linked worktree can write.
+The URL re-aims the fetch a rebase replays onto; the refspec decides which local
+ref a fetch updates at all, so one pointed at refs/remotes/decoy/* leaves a
+forged refs/remotes/origin/<branch> standing through a fetch that looks like it
+worked; and the PUSH url is where 'loom land --pr' actually publishes this
+branch — 'remote.origin.pushurl' and 'url.<decoy>.pushInsteadOf' both redirect
+it while 'git remote get-url origin' goes on answering the honest URL. loom will
+not $cmd against a remote it cannot vouch for. Put it back, or start clean:
   loom drop $task && loom new $task"
+  done
+  return 0
 }
 
 state_rm() { rm -f "$(state_file "$1")"; }
@@ -2336,11 +2362,16 @@ fenced paths into this worktree. Confirm it on the command line:
   # .git/config, which every linked worktree can write, and a config value can
   # carry a newline: refused HERE, before this command creates a worktree, a
   # branch or a record, rather than only when the record is written.
-  local neworigin newfetch
+  local neworigin newfetch newpushurl
   neworigin="$(origin_url)"
   newfetch="$(origin_fetch)"
+  # Where a push GOES, recorded separately from where a fetch comes from: a
+  # `remote.origin.pushurl`, or a `url.<decoy>.pushInsteadOf` rewrite, moves the
+  # first without touching the second.
+  newpushurl="$(origin_pushurl)"
   require_one_line "'remote.origin.url'" "$neworigin"
   require_one_line "'remote.origin.fetch'" "$newfetch"
+  require_one_line "the push URL of 'origin'" "$newpushurl"
   NEW_WT="$wt"
   # $NEW_BR before the add, on purpose: the add CREATES the branch and can then
   # fail on the path, and the check above observed that this branch did not
@@ -2355,7 +2386,8 @@ fenced paths into this worktree. Confirm it on the command line:
   NEW_STATE="$task"
   state_put "$task" "base=$newbase" "profile=$prof" "branch=$br" \
             "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            "origin=$neworigin" "fetch=$newfetch" "reviewed="
+            "origin=$neworigin" "fetch=$newfetch" "pushurl=$newpushurl" \
+            "reviewed="
   if has_fence; then
     fence_apply "$wt"
     git -C "$wt" checkout >&2
