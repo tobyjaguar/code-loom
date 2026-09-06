@@ -4103,6 +4103,59 @@ want_not_in "(cl) ... and the trunk's link is not named"            "$out" "back
 git rm -q --cached backend/hostname > /dev/null; rm -f backend/hostname
 git commit -qm "(cl) and the trunk's link removed"
 
+# --- (cm) the widening discriminator, fail-CLOSED on a base with no [fence] --
+# `_bd.get("fence", {}).get("paths", [])` yields `[]` — a perfectly good list —
+# for a base whose zones.toml has no [fence] table, so `base_fence` stopped being
+# the None sentinel and EVERY current pattern read as "added since the base". The
+# bash half wrote an EMPTY FILE when `git show` failed, which parses to the same
+# thing. Measured: an agent's `git sparse-checkout disable` came back as
+# "[fence] has been widened … + core/** + ios/**" and the command carried on.
+cm_zones_orig="$(cat .agents/zones.toml)"
+# The profiles go with it: [fence_profiles.<n>].release may only name patterns
+# that [fence] actually has, so a zones.toml with profiles and no fence is not a
+# readable document at all.
+python3 - << 'PYCM'
+p = ".agents/zones.toml"
+s = open(p).read()
+open(p, "w").write(s[:s.index("[fence]")] + s[s.index("[hand]"):])
+PYCM
+want_eq "(cm) setup: the base commit's zones.toml declares no [fence]" \
+        "$(grep -c '^\[fence\]$' .agents/zones.toml)" "0"
+git add .agents/zones.toml
+git commit -qm "(cm) a base whose zones.toml declares no fence"
+out="$("$LOOM" new 0119-cm 2>&1)"; rc=$?
+want_eq   "(cm) setup: a task cut from it"                          "$rc" "0"
+CM="$WTU/0119-cm"
+want_file "(cm) setup: nothing was fenced when it was built"        "$CM/core/lib.rs"
+printf '%s\n' "$cm_zones_orig" > .agents/zones.toml
+git add .agents/zones.toml
+git commit -qm "(cm) and the fence back in the operator's file"
+want_in "(cm) setup: the fence is live again"                       "$("$LOOM" zone core/lib.rs 2>&1)" "fenced"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0119-cm 2>&1)"; rc=$?
+want_fail   "(cm) a base with no [fence] cannot read as widening"   "$rc"
+want_in     "(cm) ... it is the ordinary refusal"                   "$out" "fenced paths are present"
+want_in     "(cm) ... naming what is on disk"                       "$out" "core/lib.rs"
+want_not_in "(cm) ... and never 'has been widened'"                 "$out" "has been widened"
+"$LOOM" drop 0119-cm > /dev/null 2>&1 || true
+# The bash half: a base that does not TRACK zones.toml at all, so `git show`
+# fails. The temp is no longer created, so there is no empty file to misread.
+git rm -q --cached .agents/zones.toml > /dev/null
+git commit -qm "(cm) a base that does not track zones.toml"
+out="$("$LOOM" new 0120-cm2 2>&1)"; rc=$?
+want_eq "(cm) setup: a task cut from that one"                      "$rc" "0"
+CM2="$WTU/0120-cm2"
+git add .agents/zones.toml
+git commit -qm "(cm) and zones.toml tracked again"
+mkdir -p "$CM2/ios"
+echo "// materialised by hand" > "$CM2/ios/App.swift"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0120-cm2 2>&1)"; rc=$?
+want_fail   "(cm) a base with no zones.toml at all cannot read as widening" "$rc"
+want_in     "(cm) ... the ordinary refusal again"                   "$out" "fenced paths are present"
+want_in     "(cm) ... naming it"                                    "$out" "ios/App.swift"
+want_not_in "(cm) ... and not 'has been widened'"                   "$out" "has been widened"
+rm -rf "$CM2/ios"
+"$LOOM" drop 0120-cm2 > /dev/null 2>&1 || true
+
 # --- (j)/(t)/(cg) doctor lists the profiles, touches no network, and counts -
 # (cg): `local pname pprov prel role m mp bad` inside the [fence_profiles] loop
 # re-declared the function's own FAILURE COUNTER (`local ok=0 warn=0 bad=0`).

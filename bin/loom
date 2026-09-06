@@ -2959,6 +2959,16 @@ elif mode in ("fence-since", "fence-added"):
     # No file, an unparseable one, or one with no [fence] at all: every current
     # pattern counts as pre-existing, so nothing can read as widening. Fail
     # closed, like everything else here.
+    #
+    # `_bd.get("fence", {}).get("paths", [])` was NOT that, and that was the
+    # hole. A base with no [fence] table — or an empty zones.toml, which is what
+    # the bash side wrote when `git show` failed — yielded `[]`, a perfectly
+    # good list, so base_fence stopped being the None sentinel and EVERY current
+    # pattern read as ADDED. Measured: an agent's `git sparse-checkout disable`
+    # came back as "[fence] has been widened … + core/** + ios/**" and the
+    # command carried on (fence_enforce still re-fenced, so nothing was released
+    # — but the tripwire and the message were both wrong). The sentinel now
+    # survives unless [fence].paths is actually THERE.
     fence_sanity()
     basef, paths = (args[0] if args else ""), args[1:]
     base_fence = None
@@ -2968,10 +2978,12 @@ elif mode in ("fence-since", "fence-added"):
                 _bd = tomllib.load(_bf)
         except Exception as e:
             die("cannot read the base copy of zones.toml (%s): %s" % (basef, e))
-        _v = _bd.get("fence", {}).get("paths", [])
-        if not isinstance(_v, list) or not all(isinstance(g, str) for g in _v):
-            die("%s: [fence].paths must be a list of glob strings" % basef)
-        base_fence = _v
+        _tbl = _bd.get("fence")
+        if isinstance(_tbl, dict) and "paths" in _tbl:
+            _v = _tbl["paths"]
+            if not isinstance(_v, list) or not all(isinstance(g, str) for g in _v):
+                die("%s: [fence].paths must be a list of glob strings" % basef)
+            base_fence = _v
     if base_fence is None:
         base_fence = list(fence)
     if mode == "fence-since":
@@ -3692,14 +3704,20 @@ It was not created under that profile, and a profile cannot be introduced after
         || die "cannot create a temporary file for the base copy of zones.toml"
       tmp_track "$basezones"
       # A base commit with no zones.toml is not an error here; it is the
-      # fail-closed case, and the empty file makes zones_py read it as one.
-      git -C "$ROOT" show "$FENCE_BASE:.agents/zones.toml" > "$basezones" 2>/dev/null \
-        || : > "$basezones"
+      # fail-closed case. The EMPTY FILE that used to stand in for it is not: an
+      # empty file is a readable TOML document with no [fence] table, and the
+      # discriminator above read that as "the base fenced nothing", i.e. every
+      # pattern is new. A file loom never creates cannot be misread at all — so
+      # a `git show` that failed leaves NO temp and no path, and zones_py counts
+      # every current pattern pre-existing.
+      if ! git -C "$ROOT" show "$FENCE_BASE:.agents/zones.toml" > "$basezones" 2>/dev/null; then
+        rm -f "$basezones"; basezones=""
+      fi
       preexisting="$(zones_py fence-since "$basezones" "${pres[@]}")" \
         || die "cannot tell which of these paths were already fenced when task's base was recorded — refusing to guess"
       added="$(zones_py fence-added "$basezones" "${pres[@]}")" \
         || die "cannot tell which fence patterns are new since this task's base — refusing to guess"
-      rm -f "$basezones"
+      [ -z "$basezones" ] || rm -f "$basezones"
     fi
     if [ -n "$added" ] && [ -z "$preexisting" ]; then
       echo "loom: note — [fence] has been widened since this task's base:" >&2
