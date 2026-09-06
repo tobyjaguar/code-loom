@@ -3387,16 +3387,25 @@ cmd_drop() {
   # the destruction rather than instead of it.
   state_file "$task" > /dev/null
   wt="$(wt_path "$task")"; br="$(branch_of "$task")"
-  git worktree remove "$wt" --force 2>/dev/null || true
-  # The operator record goes with the worktree, --keep-branch or not: it names
-  # a base and a profile for a task that no longer has a tree, and the next
-  # `loom new <task>` writes a fresh one. A kept branch keeps its commits, not
-  # its record — `loom check` on it says so and points at `loom new`.
-  state_rm "$task"
+  # --keep-branch asks origin whether the kept branch is already there, and that
+  # `git ls-remote` is a NETWORK CALL to whatever `origin` says now. Whether that
+  # is the remote the task was created against is a question only the OPERATOR
+  # RECORD can answer — and `state_rm` below deletes it. So the question is asked
+  # HERE, before anything is removed; the old order deleted the record and then
+  # reached out to a remote nothing could vouch for.
+  #
+  # A remote that does not match is not a reason to refuse the DROP, though.
+  # `loom drop && loom new` is the fix this whole system points at, including for
+  # a re-aimed origin, so a drop that died on one would be a trap with no way
+  # out. require_recorded_origin runs in a subshell: its refusal is printed and
+  # the remote is simply not contacted.
+  local where="" vouch=""
   if [ -n "$keep" ]; then
-    local where
     if ! git remote get-url origin >/dev/null 2>&1; then
       where="(no 'origin' remote)"
+    elif ! vouch="$( require_recorded_origin "$task" "ask origin about" 2>&1 )"; then
+      printf '%s\n' "$vouch" | sed 's/^/loom: /' >&2
+      where="(NOT asked: the 'origin' remote is not the one this task was created against)"
     elif ! rem="$(git ls-remote --upload-pack=git-upload-pack --heads origin "$br" 2>/dev/null)"; then
       where="(could not reach origin to check)"
     elif [ -n "$rem" ]; then
@@ -3404,6 +3413,15 @@ cmd_drop() {
     else
       where="— NOT on origin yet: git push -u origin $br"
     fi
+  fi
+  git worktree remove "$wt" --force 2>/dev/null || true
+  # The operator record goes with the worktree, --keep-branch or not: it names
+  # a base, a profile and a pinned git config for a task that no longer has a
+  # tree, and the next `loom new <task>` writes a fresh one. A kept branch keeps
+  # its commits, not its record — `loom check` on it says so and points at
+  # `loom new`.
+  state_rm "$task"
+  if [ -n "$keep" ]; then
     echo "loom: dropped worktree for $task and its operator record — branch $br kept $where"
   else
     git branch -D "$br" 2>/dev/null || true
