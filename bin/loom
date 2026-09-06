@@ -433,7 +433,19 @@ for _c in add branch checkout commit config diff fetch log ls-files ls-remote \
           show show-ref sparse-checkout status symbolic-ref update-ref worktree; do
   _pagers="$_pagers 'pager.$_c=cat'"
 done
+# core.untrackedCache sits beside core.fsmonitor because it is the same class of
+# knob: neither changes what is on disk, both change what `status` REPORTS about
+# untracked files, and a stale cache is a silent lie about a directory nobody
+# rescanned. status.showUntrackedFiles is the third and the loudest — measured,
+# git 2.34.1: `=no` in ANY config scope empties step one of `wt_dirty` (an
+# untracked plant reads as a clean tree) and makes step two die outright,
+# `fatal: Unsupported combination of ignored and untracked-files arguments`,
+# rc=128. GIT_CONFIG_PARAMETERS outranks every config FILE, `--global` included
+# — and `--global` is a scope the config pin does not read at all, so for this
+# one key the parameter is the only lever that reaches it. (One key, not the
+# class: see the residual in KNOWN-GAPS 6.)
 export GIT_CONFIG_PARAMETERS="'core.pager=cat' 'core.fsmonitor=false' \
+'core.untrackedCache=false' 'status.showUntrackedFiles=normal' \
 'protocol.ext.allow=never' 'core.sshCommand=$_ssh' \
 'remote.origin.uploadpack=git-upload-pack' 'remote.origin.receivepack=git-receive-pack' \
 'core.editor=true' 'sequence.editor=true'${_pagers}"
@@ -3709,23 +3721,75 @@ branch_ref() { echo "refs/heads/agent/$1"; }
 # IGNORED path, and no pathspec makes `git status` mention it. So whenever the
 # exclusion is dropped, `wt_dirty` asks the same directory a second time with
 # `--ignored=matching` and appends the `!!` lines. See wt_dirty.
+#
+# ... and when the answer is no BECAUSE OF AN ENTRY, which entry it was, and
+# why. git will not always say: `--ignored=matching` names individual entries
+# only when a TRACKED file inside the directory forces it to descend, and in the
+# shape the README asks a consumer for — `.agents/reviews/` gitignored, nothing
+# tracked inside — it collapses to the single line `!! .agents/reviews/`
+# (measured, git 2.34.1, with and without `-uall`). The refusal still fires, but
+# the operator is told a directory rather than a file. loom knows which entry it
+# refused on, so it says so itself; `wt_dirty` appends the line.
+REVIEWS_NOT_PLAIN=""       # the basename of the entry that failed, or ""
+REVIEWS_NOT_PLAIN_WHY=""   # symlink | not a regular file | link count N
 reviews_entries_plain() { # reviews_entries_plain <resolved-dir>
-  local d="$1" e
+  local d="$1" e n
+  REVIEWS_NOT_PLAIN=""; REVIEWS_NOT_PLAIN_WHY=""
+  # A directory loom can neither READ nor SEARCH cannot be enumerated, and a
+  # walk that enumerates nothing is not a walk that found nothing plain: at mode
+  # 0300 the glob below matches NOTHING (measured, git 2.34.1 / bash 5.1), so
+  # every check in the loop is skipped and the old code answered "all plain".
+  # Belt and braces — `wt_dirty` refuses on the mode before it gets here.
+  { [ -r "$d" ] && [ -x "$d" ]; } || return 1
   for e in "$d"/* "$d"/.*; do
     case "${e##*/}" in .|..) continue ;; esac
     # An unmatched glob comes back as the pattern itself.
     { [ -e "$e" ] || [ -L "$e" ]; } || continue
-    if [ -L "$e" ] || [ ! -f "$e" ]; then return 1; fi
-    [ "$(link_count "$e")" = "1" ] || return 1
+    if [ -L "$e" ]; then
+      REVIEWS_NOT_PLAIN="${e##*/}"; REVIEWS_NOT_PLAIN_WHY="symlink"; return 1
+    fi
+    if [ ! -f "$e" ]; then
+      REVIEWS_NOT_PLAIN="${e##*/}"; REVIEWS_NOT_PLAIN_WHY="not a regular file"; return 1
+    fi
+    n="$(link_count "$e")"
+    if [ "$n" != "1" ]; then
+      REVIEWS_NOT_PLAIN="${e##*/}"; REVIEWS_NOT_PLAIN_WHY="link count ${n:-unknown}"; return 1
+    fi
   done
   return 0
 }
 
 wt_dirty() { # wt_dirty <worktree>   -> the offending `git status --porcelain` lines
-  local wt="$1" rwt rdir out ign excluded=0
+  local wt="$1" rwt rdir out ign excluded=0 err werr p mode
   local -a spec=(-- .)
+  REVIEWS_NOT_PLAIN=""; REVIEWS_NOT_PLAIN_WHY=""
   rwt="$(cd "$wt" 2>/dev/null && pwd -P)" \
     || die "cannot resolve the worktree $wt — refusing to guess whether it is clean"
+  # A directory loom cannot READ and SEARCH is not a clean directory, it is an
+  # UNREADABLE one, and the difference used to be invisible from both sides.
+  # Measured, git 2.34.1: `.agents/reviews` at mode 0300 (`-wx------`) still
+  # answers `cd` and `pwd -P`, but a shell glob over it matches NOTHING — so
+  # `reviews_entries_plain` walked an empty list, answered "all plain", the
+  # `:(exclude).agents/reviews` pathspec stayed on, and everything planted
+  # inside was hidden from the one command that was supposed to see it. And
+  # dropping the exclusion would not have been enough: `git status --porcelain
+  # -- .` over a tree with an unreadable directory prints
+  # `warning: could not open directory '.agents/reviews/': Permission denied`
+  # on STDERR, exits 0, and lists nothing from inside it — the same for
+  # `.agents` itself at 0300, where untracked entries under it simply vanish.
+  # So the mode is a REFUSAL, asked before either of those questions is.
+  for p in "$wt/.agents" "$wt/.agents/reviews"; do
+    # A symlink at either is the OTHER case and has its own answer below (the
+    # exclusion is dropped and the link counts as dirty); `-r`/`-x` on a symlink
+    # would answer about its target, so it is not asked here.
+    if [ -L "$p" ] || [ ! -d "$p" ] || { [ -r "$p" ] && [ -x "$p" ]; }; then continue; fi
+    mode="$(stat -c %a "$p" 2>/dev/null || stat -f %Lp "$p" 2>/dev/null || echo '?')"
+    die "$p is mode $mode — loom can neither list it nor be told about it: a shell
+glob over an unreadable directory matches nothing and \`git status\` only warns
+on stderr and exits 0. Nothing inside it can be judged, so nothing about it can
+be called clean. Fix the mode (chmod u+rx), then re-run — refusing to guess
+whether it is clean"
+  done
   if [ ! -L "$wt/.agents" ] && [ ! -L "$wt/.agents/reviews" ] \
      && [ -d "$wt/.agents/reviews" ]; then
     rdir="$(cd "$wt/.agents/reviews" 2>/dev/null && pwd -P)" || rdir=""
@@ -3733,8 +3797,26 @@ wt_dirty() { # wt_dirty <worktree>   -> the offending `git status --porcelain` l
       spec+=(':(exclude).agents/reviews'); excluded=1
     fi
   fi
-  out="$(git -C "$wt" status --porcelain "${spec[@]}" 2>/dev/null)" \
-    || die "cannot read the state of the worktree $wt — refusing to guess whether it is clean"
+  # Never silent, in EITHER step, on stdout OR stderr. The mode check above
+  # covers the two directories loom itself writes into; git reports an
+  # unreadable directory ANYWHERE in the tree the same way — a warning on
+  # stderr and a clean exit — and `2>/dev/null` turned every one of those into
+  # "the tree is clean". So stderr goes to a file, the exit status keeps its
+  # `|| die`, and one byte of stderr is a refusal in its own right.
+  # `--untracked-files=normal` is spelled out on both calls for the same reason
+  # the value is pinned in GIT_CONFIG_PARAMETERS (see the export near the top):
+  # a `status.showUntrackedFiles=no` anywhere empties step one and makes step
+  # two exit 128. Here it is self-documenting and independent of that env block.
+  err="$(mktemp "${TMPDIR:-/tmp}/loom-wt-dirty.XXXXXX")" \
+    || die "cannot create a temporary file to read the state of the worktree $wt"
+  out="$(git -C "$wt" status --porcelain --untracked-files=normal "${spec[@]}" 2>"$err")" \
+    || { werr="$(cat "$err")"; rm -f "$err"
+         die "cannot read the state of the worktree $wt — refusing to guess whether it is clean${werr:+
+$werr}"; }
+  werr="$(cat "$err")"
+  [ -z "$werr" ] || { rm -f "$err"
+    die "git status warned while reading $wt — refusing to guess whether it is clean:
+$werr"; }
   # STEP TWO, and only when the exclusion was NOT applied — i.e. exactly when
   # something about `.agents/reviews` has already stopped being loom's own
   # plain scratch (a symlink at it or at `.agents`, a directory resolving
@@ -3757,11 +3839,39 @@ wt_dirty() { # wt_dirty <worktree>   -> the offending `git status --porcelain` l
   # ignores; this is the line that stops `loom land` publishing over a tree
   # somebody has been playing with.
   if [ "$excluded" -eq 0 ]; then
-    ign="$(git -C "$wt" status --porcelain --ignored=matching -- .agents/reviews 2>/dev/null \
-             | grep '^!! ' || true)"
+    : > "$err"
+    # git into a VARIABLE with its own `|| die`, and only then the grep. The old
+    # form piped git straight into `grep ... || true`, which threw away both
+    # halves of git's answer: `set -o pipefail` reports the pipeline, but the
+    # `|| true` swallowed that too, so the `fatal: Unsupported combination of
+    # ignored and untracked-files arguments` a planted
+    # `status.showUntrackedFiles=no` provokes (rc=128, measured on git 2.34.1)
+    # read as "no ignored entries" and landing went ahead.
+    ign="$(git -C "$wt" status --porcelain --untracked-files=normal \
+             --ignored=matching -- .agents/reviews 2>"$err")" \
+      || { werr="$(cat "$err")"; rm -f "$err"
+           die "cannot read the ignored entries under $wt/.agents/reviews — refusing to guess whether it is clean${werr:+
+$werr}"; }
+    werr="$(cat "$err")"
+    [ -z "$werr" ] || { rm -f "$err"
+      die "git status warned while reading $wt — refusing to guess whether it is clean:
+$werr"; }
+    ign="$(printf '%s\n' "$ign" | grep '^!! ' || true)"
+    # ... and the entry itself, which git names only when a TRACKED file inside
+    # the directory made it descend. In the shape this repo asks a consumer for
+    # — `.agents/reviews/` gitignored, nothing tracked inside — the listing
+    # above collapses to the single line `!! .agents/reviews/`: the refusal
+    # fires, and says a directory where the operator needs a file. loom refused
+    # on a specific entry, so loom names it, with the same `!! ` prefix the rest
+    # of this output carries.
+    if [ -n "$REVIEWS_NOT_PLAIN" ]; then
+      ign="${ign:+$ign
+}!! .agents/reviews/$REVIEWS_NOT_PLAIN  (not loom's plain scratch: $REVIEWS_NOT_PLAIN_WHY)"
+    fi
     [ -z "$ign" ] || out="${out:+$out
 }$ign"
   fi
+  rm -f "$err"
   [ -z "$out" ] || printf '%s\n' "$out"
   return 0
 }
