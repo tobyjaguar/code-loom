@@ -434,13 +434,29 @@ or up to date. Two consequences worth knowing before you rely on it:
   that directory is loom's own scratch: neither it nor `.agents` a symlink, the
   directory physically inside the worktree, and every entry in it a plain file
   with one name. And because you gitignored it, the check is two steps:
-  `git status --porcelain -- .` with the `:(exclude).agents/reviews` pathspec —
-  dropped the moment that condition fails — and then, only when it was dropped,
-  `git status --porcelain --ignored=matching -- .agents/reviews`, whose `!!`
+  `git status --porcelain --untracked-files=normal -- .` with the
+  `:(exclude).agents/reviews` pathspec — dropped the moment that condition fails
+  — and then, only when it was dropped, `git status --porcelain
+  --untracked-files=normal --ignored=matching -- .agents/reviews`, whose `!!`
   lines are appended. A link planted inside an ignored directory is an ignored
   path that step one cannot see; step two is what makes landing refuse it. Both
   are a tripwire — `place_file` (write) and `probe_agent_file` (read) close the
   paths themselves, whatever your `.gitignore` says.
+  * git names the offending ENTRY only when a tracked file inside that directory
+    makes it descend. In exactly the shape this page asks you for — the
+    directory gitignored, nothing tracked inside — `--ignored=matching`
+    collapses to the single line `!! .agents/reviews/` (measured, git 2.34.1).
+    Landing still refuses; `loom` appends the entry it refused on itself, as
+    `!! .agents/reviews/<name>  (not loom's plain scratch: <why>)`.
+  * An `.agents` or `.agents/reviews` `loom` cannot read and search is a
+    **refusal**, not a clean tree: at mode `0300` a shell glob over it matches
+    nothing and `git status` only warns on stderr and exits 0. `loom` refuses on
+    the mode, and refuses on any `git status` stderr at all — so an unreadable
+    directory anywhere in your worktree stops a landing rather than hiding
+    inside one. `status.showUntrackedFiles=normal` and `core.untrackedCache=false`
+    are pinned in `GIT_CONFIG_PARAMETERS` for the same reason: a
+    `status.showUntrackedFiles=no` (in `--global`, which the config pin does not
+    read) blinded step one and made step two exit 128.
 
 ```sh
 # the record for a task, if you ever want to read one:

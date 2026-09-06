@@ -303,9 +303,11 @@ part of the branch that still changes your runs:
   own branch is refused outright — it is not a state `loom` produces.
 - **The worktree roots are verified.** Both are normalised (a trailing `/` or
   `/.` in `$LOOM_WORKTREES` is stripped before `-profiled` is appended),
-  resolved with `pwd -P` and refused if the resolved path is not where the name
-  says — a symlink at `$WT_ROOT-profiled` would otherwise put released content
-  inside the directory unprofiled runs are pointed at. `WT_ROOT_PROFILED` is
+  resolved through the parent chain (python3 `realpath`, in `resolve_root`, so a
+  root that does not exist yet resolves without being created) and refused if
+  the resolved path is not where the name says — a symlink at
+  `$WT_ROOT-profiled` would otherwise put released content inside the directory
+  unprofiled runs are pointed at. `WT_ROOT_PROFILED` is
   derived, never taken from the environment or `loom.env`. Every `git worktree
   add` re-resolves its parent immediately before, and the created worktree
   immediately after.
@@ -377,15 +379,44 @@ part of the branch that still changes your runs:
   file with one name**. Anything else counts as dirty, and landing refuses.
 
   That check is two steps, and the second one exists **because** you gitignored
-  the directory. Step one is `git status --porcelain -- .`, with the
-  `:(exclude).agents/reviews` pathspec dropped the moment the directory stops
-  being loom's own plain scratch. In a repo that ignores `.agents/reviews/`,
-  dropping the pathspec changes nothing — a link planted inside an ignored
-  directory is an ignored path, and `git status` will not mention it either
-  way. So whenever the exclusion is dropped, `loom` asks the same directory a
-  second time with `git status --porcelain --ignored=matching --
-  .agents/reviews` and appends those `!!` lines to the dirty output. The plant
-  surfaces as `!! .agents/reviews/<name>` and landing refuses.
+  the directory. Step one is `git status --porcelain --untracked-files=normal
+  -- .`, with the `:(exclude).agents/reviews` pathspec dropped the moment the
+  directory stops being loom's own plain scratch. In a repo that ignores
+  `.agents/reviews/`, dropping the pathspec changes nothing — a link planted
+  inside an ignored directory is an ignored path, and `git status` will not
+  mention it either way. So whenever the exclusion is dropped, `loom` asks the
+  same directory a second time with `git status --porcelain
+  --untracked-files=normal --ignored=matching -- .agents/reviews` and appends
+  those `!!` lines to the dirty output. The plant surfaces as an `!!` line and
+  landing refuses.
+
+  **git names the entry only when something makes it descend.** In the shape
+  this README asks you for — `.agents/reviews/` gitignored and *nothing tracked
+  inside it* — `--ignored=matching` collapses to the single line
+  `!! .agents/reviews/` (measured, git 2.34.1, with and without `-uall`): the
+  refusal fires, but it names a directory where you need a file. git prints
+  `!! .agents/reviews/<name>` only when a tracked file in there forces it to walk
+  in. So `loom` appends the entry it refused on itself, either way, with the same
+  prefix:
+
+  ```
+  !! .agents/reviews/<name>  (not loom's plain scratch: symlink)
+  ```
+
+  (or `not a regular file`, or `link count N`).
+
+  **An unreadable directory is a refusal, not a clean tree.** `.agents` or
+  `.agents/reviews` at mode `0300` still answers `cd` and `pwd -P`, but a shell
+  glob over it matches *nothing* — so the entry walk saw an empty directory,
+  called it plain, and left the exclusion on over everything planted inside. And
+  dropping the exclusion would not have saved it: `git status` reports an
+  unreadable directory as a **warning on stderr with exit 0**, listing nothing
+  from inside it. `loom` refuses on the mode of either directory, and — the
+  general form, for an unreadable directory anywhere in the tree — refuses
+  whenever either `git status` writes anything at all to stderr. Two config keys
+  are pinned for the same reason: `status.showUntrackedFiles=normal` (a `no` in
+  any scope empties step one and makes step two exit 128) and
+  `core.untrackedCache=false`.
 
   It is a **tripwire**, not the lock. What actually closes the write path is
   `place_file` (resolve the directory, hold it as the working directory, rename
@@ -512,7 +543,10 @@ part of the branch that still changes your runs:
   included. `GIT_PAGER=cat` plus one `pager.<cmd>=cat` per subcommand loom runs
   is the lock. **Two costs:** `loom diff` no longer pages by default (`export
   LOOM_DIFF_CMD="less -R"` if you want one), and a repo-local `core.sshCommand`
-  is ignored — your global one is not.
+  is ignored — your global one is not. Two more keys are pinned there that name
+  no program at all — `core.untrackedCache=false` and
+  `status.showUntrackedFiles=normal` — because they change what `git status`
+  *reports*, which is the whole of the dirty-tree tripwire above.
 - **...and the whole git config is PINNED to the task**, because the keys that
   matter cannot be enumerated: `filter.<anything>.clean`,
   `merge.<anything>.driver`, `pager.<anything>` and `includeIf.<anything>` put

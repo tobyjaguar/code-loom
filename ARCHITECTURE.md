@@ -267,6 +267,7 @@ subprocess it spawns — including `git -C <worktree> …`, the operator's
 ```
 core.pager=cat          core.fsmonitor=false     protocol.ext.allow=never
 core.editor=true        sequence.editor=true     core.sshCommand=<your global one, or `ssh`>
+core.untrackedCache=false                        status.showUntrackedFiles=normal
 remote.origin.uploadpack=git-upload-pack         remote.origin.receivepack=git-receive-pack
 pager.<cmd>=cat         for every subcommand loom runs (see below)
 ```
@@ -309,6 +310,19 @@ enough":
   does not run today) and one `pager.<cmd>=cat` per subcommand loom runs (the
   floor). `--no-pager` on every call site also works and was rejected: ~100
   sites, and a site added later would silently have no pin.
+
+**Two of the pinned keys name no program at all.** `core.untrackedCache=false`
+and `status.showUntrackedFiles=normal` are there because they change what `git
+status` **reports**, which is the whole of the dirty-tree tripwire (§ 8 below).
+`core.untrackedCache` is `core.fsmonitor`'s sibling — a stale cache is a silent
+lie about a directory nobody rescanned. `status.showUntrackedFiles` is the loud
+one: measured, git 2.34.1, a `no` in any config scope empties step one of
+`wt_dirty` (an untracked plant reads as a clean tree) *and* makes step two die
+`fatal: Unsupported combination of ignored and untracked-files arguments`
+(rc=128). `GIT_CONFIG_PARAMETERS` outranks every config *file*, `--global`
+included — and `--global` is a scope the config pin does not read at all, so for
+this one key the parameter reaches somewhere the pin cannot. One key, not the
+class: the residual below is unchanged.
 
 **The whole git config is pinned, because the keys that matter cannot be
 enumerated.** `filter.<anything>.clean`, `merge.<anything>.driver`,
@@ -687,9 +701,10 @@ Semantics:
   `/x/wt/.-profiled`, a child); the profiled root is then derived from that and
   from nothing else, and a `WT_ROOT_PROFILED` preset in the environment or in
   `.agents/loom.env` that differs is a refusal, not a redirection. Both roots
-  are resolved with `pwd -P` (through the parent chain, so a repo under a
-  symlinked `/tmp` stays ordinary) and refused when the final component is not
-  the real directory its name claims — an agent that plants
+  are resolved through the parent chain (python3 `realpath`, in `resolve_root`
+  — so a repo under a symlinked `/tmp` stays ordinary, and a root that does not
+  exist yet resolves without being created) and refused when the final
+  component is not the real directory its name claims — an agent that plants
   `$WT_ROOT-profiled -> $WT_ROOT/T5` would otherwise have every released path
   checked out inside the directory unprofiled runs are pointed at. Neither root
   may contain the other or sit inside `$ROOT`. And because a verified directory
@@ -852,18 +867,47 @@ Semantics:
   `wt_dirty` is therefore **two steps**, and the second is there because the
   consuming repo did what this document asks and gitignored the directory:
 
-  1. `git status --porcelain -- .`, carrying `:(exclude).agents/reviews` only
-     while the condition above holds;
+  1. `git status --porcelain --untracked-files=normal -- .`, carrying
+     `:(exclude).agents/reviews` only while the condition above holds;
   2. and — **only when that exclusion was not applied** —
-     `git status --porcelain --ignored=matching -- .agents/reviews`, whose
-     `!!` lines are appended to the first step's output.
+     `git status --porcelain --untracked-files=normal --ignored=matching --
+     .agents/reviews`, whose `!!` lines are appended to the first step's output.
 
   Step one is blind exactly where the plant is: in a repo that ignores
   `.agents/reviews/`, the planted link is an IGNORED path, so dropping the
   pathspec surfaces nothing and the tripwire reported a clean tree. Step two
-  asks the same directory the one way git will answer, the plant shows up as
-  `!! .agents/reviews/<name>`, and `loom land` refuses. Only the `!!` lines are
-  taken: everything else in that listing is already in step one's output.
+  asks the same directory the one way git will answer, and `loom land` refuses.
+  Only the `!!` lines are taken: everything else in that listing is already in
+  step one's output.
+
+  **What step two does not tell you, and loom does.** git names an individual
+  entry only when a TRACKED file inside the directory makes it descend. In the
+  shape this document asks a consumer for — `.agents/reviews/` gitignored,
+  nothing tracked inside — `--ignored=matching` collapses to the single line
+  `!! .agents/reviews/` (measured, git 2.34.1, with and without `-uall`). The
+  refusal fires, but it names the directory rather than the entry. loom refused
+  on a specific entry (`reviews_entries_plain` records which, and why), so
+  `wt_dirty` appends one line of its own, carrying the same `!! ` prefix:
+  `!! .agents/reviews/<name>  (not loom's plain scratch: symlink | not a regular
+  file | link count N)`.
+
+  **An unreadable directory is a refusal, not a clean tree.** Both halves of the
+  tripwire go blind on one, in the same direction. Measured, git 2.34.1:
+  `.agents/reviews` at mode `0300` (`-wx------`) still answers `cd` and
+  `pwd -P`, but a shell glob over it matches NOTHING — so the entry walk ran
+  over an empty list, answered "all plain", kept the `:(exclude)` pathspec, and
+  hid everything planted inside. Dropping the exclusion would not have been
+  enough either: `git status --porcelain -- .` over a tree with an unreadable
+  directory prints `warning: could not open directory '.agents/reviews/':
+  Permission denied` on STDERR, exits 0, and lists nothing from inside it (the
+  same for `.agents` itself at `0300`, where untracked entries under it simply
+  vanish while modifications to tracked files still show). So `wt_dirty` refuses
+  on the MODE of `.agents` and `.agents/reviews` before it asks either question
+  — and, as the general form for an unreadable directory anywhere in the tree,
+  captures the stderr of both `git status` calls and refuses on any of it at
+  all. The exit status keeps its own `|| die`, and step two's git now runs into
+  a variable before the `grep`, so neither the pipe nor the old `|| true` can
+  swallow a `fatal:` (`tests/fence-profiles.sh` (bz), (ca), (cb)).
 
   Neither step is the lock, and it matters which is which. `place_file` closes
   the WRITE path — resolve the parent, hold it as the working directory, rename
