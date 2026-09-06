@@ -20,6 +20,13 @@
 #                                    base touches a fenced or hand-zone path
 #   loom ls                            list active agent worktrees
 #   loom gate                          run the gate here
+#   loom pin-config [--accept-config]  record (or re-record) the REPOSITORY's
+#                                    git config baseline — the one `loom plan`
+#                                    and `loom scout` are judged against, since
+#                                    neither has a task record. `loom new`
+#                                    writes it too; this is the command for a
+#                                    repository with no tasks, and for saying
+#                                    "that change is mine" deliberately.
 #   loom zone  <path>                  which zone a path belongs to
 #   loom tier  lean|standard|deep      print export line for the model tier
 #   loom doctor                        verify binaries, keys, and MODEL IDS
@@ -1106,24 +1113,44 @@ PY
 # mismatch too. Only a git that fails identically at both ends makes the pin
 # inert, and that is a repository in which nothing else works either.
 config_snapshot() { # config_snapshot [<task-worktree>] -> the path of a temp dump
-  local wt="${1:-}" f d taskgd=""
+  local wt="${1:-}" f d taskgd="" wtcfg=""
   f="$(mktemp "${TMPDIR:-/tmp}/loom-gitconfig.XXXXXX")" \
     || die "cannot create a temporary file to read this repository's git config"
   d="$(mktemp -d "${TMPDIR:-/tmp}/loom-gitconfig-scopes.XXXXXX")" \
     || die "cannot create a temporary directory to read this repository's git config"
   git -C "$ROOT" config --local    --list --null > "$d/local"         2>/dev/null || true
-  git -C "$ROOT" config --worktree --list --null > "$d/worktree-main" 2>/dev/null || true
+  : > "$d/worktree-main"
   : > "$d/worktree-task"
-  if [ -n "$wt" ] && [ -d "$wt" ]; then
+  # `git config --worktree` is an ALIAS FOR `--local` when
+  # `extensions.worktreeConfig` is off — git says so, and it means a repository
+  # where the extension has not been turned on yet dumps every local key a
+  # second time under a scope tag that is a lie, and reports "N local + N
+  # worktree entries" for a repository with no worktree scope at all.
+  #
+  # So the two worktree scopes are read only when git would READ them. That is
+  # fail-closed rather than a relaxation: turning the extension on is itself a
+  # write to the LOCAL scope (`extensions.worktreeconfig=true`), which this
+  # same pin refuses — a dormant `config.worktree` cannot be brought to life
+  # without the change that does it being caught.
+  wtcfg="$(git -C "$ROOT" config --local --get extensions.worktreeConfig 2>/dev/null || true)"
+  case "$wtcfg" in
+    true|yes|on|1) wtcfg=yes ;;
+    *)             wtcfg="" ;;
+  esac
+  [ -z "$wtcfg" ] \
+    || git -C "$ROOT" config --worktree --list --null > "$d/worktree-main" 2>/dev/null || true
+  if [ -n "$wtcfg" ] && [ -n "$wt" ] && [ -d "$wt" ]; then
     git -C "$wt" config --worktree --list --null > "$d/worktree-task" 2>/dev/null || true
     # Where that worktree's own config.worktree lives, asked of git rather than
     # spelled out: the directory name under worktrees/ is git's, not the task's.
     taskgd="$(git -C "$wt" rev-parse --git-dir 2>/dev/null || true)"
     case "$taskgd" in ""|/*) ;; *) taskgd="$wt/$taskgd" ;; esac
   fi
+  # The include closure is seeded from the SCOPE FILES, and a scope that was
+  # not read has no file to resolve a relative include against.
   config_py snapshot "$f" \
     "$d/local"         "$GITCOMMON/config" \
-    "$d/worktree-main" "$GITCOMMON/config.worktree" \
+    "$d/worktree-main" "${wtcfg:+$GITCOMMON/config.worktree}" \
     "$d/worktree-task" "${taskgd:+$taskgd/config.worktree}" \
     || { rm -rf "$d"; die "cannot read this repository's git config — refusing to guess what it says"; }
   rm -rf "$d"
@@ -1214,6 +1241,13 @@ config_repin() { # config_repin <task>
   config_write_sidecar "$1" "$f"
   rm -f "$f"
   state_update "$1" "config=$d"
+  # ... and the REPOSITORY's own baseline, which is what the roles with no task
+  # are judged against. Pinning a task and baselining the repository are the
+  # same operator act — `loom new`, `--accept-config`, and `land --pr`'s re-pin
+  # after its own `--set-upstream-to` — so they happen in the same place. If
+  # they did not, `land --pr` would leave `branch.<br>.remote` in the local
+  # scope and the next `loom scout` would refuse a change loom itself made.
+  repo_config_repin
 }
 
 # The git config a task was created against — all three scopes and the include
@@ -1286,9 +1320,146 @@ Otherwise put it back:
 or start clean:  loom drop $task && loom new $task"
 }
 
+# ------------------------------------ the REPOSITORY's own config baseline
+# The pin above answers "has this repository's config moved under task <t>".
+# Two roles never got to ask, because they have no task: `loom plan`'s
+# architect, which runs in $ROOT — YOUR checkout — and `loom scout`, which runs
+# in the shared `$WT_ROOT/_scout` mirror. Both are model launches, and the
+# scout's is a WORKTREE OPERATION as well: `fence_apply` -> `sparse-checkout
+# set`, the `reset --hard` and the `checkout` beside it are all working-tree
+# updates, and a working-tree update runs the SMUDGE side of whatever
+# `filter.<d>` a `.gitattributes` there selects. The driver is read out of the
+# SHARED `.git/config` — one `git config` from inside ANY agent's worktree — so
+# `loom scout` ran a planted program as the operator with no pin anywhere in
+# the path. `loom plan` is the same launch without the tree.
+#
+# So the REPOSITORY gets a baseline of its own, beside the task records and
+# never inside one:
+#
+#   $STATE_DIR/config            the digest, one sha256, mode 0600
+#   $STATE_DIR/config.gitconfig  the dump it was taken over, mode 0600, so a
+#                                mismatch is a diff and not two digests
+#
+# It covers the scopes that belong to the REPOSITORY — `local` and
+# `worktree-main` — and the include closure of both. The `worktree-task` scope
+# is deliberately absent: there is no task here, and folding one in would make
+# the baseline move every time any task's worktree gained a sparse rule, which
+# is a refusal per `loom new` for a change loom itself made.
+#
+# It is written wherever a task is pinned (config_repin: `loom new`,
+# `--accept-config`, `land --pr`'s re-pin) and by `loom pin-config`, which is
+# the explicit operator command — and the answer for a repository that has no
+# tasks at all. It is NOT removed by `loom drop`: it is a fact about the
+# repository, not about a task, and a `loom scout` after the last task was
+# dropped must still have something to be judged against.
+repo_config_file()    { printf '%s\n' "$STATE_DIR/config"; }
+repo_config_sidecar() { printf '%s\n' "$STATE_DIR/config.gitconfig"; }
+
+# The recorded digest, or "" when there is none. A file that is not one loom
+# wrote is a dead stop rather than a "" that reads as "never baselined" — the
+# same rule state_read applies to a task record, and for the same reason: this
+# is the one input the task-less roles have.
+repo_config_read() {
+  local f v
+  f="$(repo_config_file)"
+  [ -f "$f" ] || return 0
+  v="$(cat "$f")" || die "cannot read the repository git config baseline $f"
+  # One line of 64 hex digits. A second line, or anything else, is refused
+  # here — a newline is not a hex digit, so the pattern catches it.
+  case "$v" in
+    ""|*[!0-9a-f]*)
+      die "the repository git config baseline is not one loom wrote:
+  $f
+It holds one sha256 and nothing else. Re-record it deliberately, having looked
+at what the config now says:
+  loom pin-config --accept-config" ;;
+  esac
+  [ "${#v}" -eq 64 ] || die "the repository git config baseline is not one loom wrote:
+  $f
+It holds one sha256 (64 hex digits) and nothing else. Re-record it deliberately:
+  loom pin-config --accept-config"
+  printf '%s\n' "$v"
+}
+
+repo_config_write() { # repo_config_write <dump>
+  local f sc d
+  f="$(repo_config_file)"; sc="$(repo_config_sidecar)"
+  d="$(config_digest_of "$1")"
+  ( umask 077; mkdir -p "$STATE_DIR" ) \
+    || die "cannot create the operator state directory $STATE_DIR"
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+  ( umask 077; printf '%s\n' "$STATE_MAIN_ROOT" > "$STATE_DIR/repo" ) || true
+  # The dump first, the digest second. A crash between the two leaves a digest
+  # that no longer matches the dump beside it, which is a REFUSAL — the
+  # fail-closed half of the pair. The other order would leave a digest that
+  # matches the live config with a stale dump beside it, i.e. a pass.
+  ( umask 077; cp "$1" "$sc.tmp.$$" ) || die "cannot write the repository git config baseline $sc"
+  chmod 600 "$sc.tmp.$$" 2>/dev/null || true
+  mv "$sc.tmp.$$" "$sc" || die "cannot write the repository git config baseline $sc"
+  ( umask 077; printf '%s\n' "$d" > "$f.tmp.$$" ) || die "cannot write the repository git config baseline $f"
+  chmod 600 "$f.tmp.$$" 2>/dev/null || true
+  mv "$f.tmp.$$" "$f" || die "cannot write the repository git config baseline $f"
+}
+
+# The config as it is NOW becomes the repository's baseline. No worktree
+# argument: the task scope is not the repository's.
+repo_config_repin() {
+  local f
+  f="$(config_snapshot)"
+  repo_config_write "$f"
+  rm -f "$f"
+}
+
+# The repository's config must still be the config its baseline was recorded
+# against. Called by `loom scout` (in scout_root, BEFORE the first thing that
+# touches the mirror) and by `loom plan` (before the architect runs), and again
+# by run_role before every task-less model launch — per attempt, for the same
+# reason the task pin is re-read per attempt.
+require_recorded_config_repo() { # require_recorded_config_repo <command-name>
+  local cmd="$1" rec now f changed
+  repo_config_read > /dev/null          # judge the file's shape in THIS shell
+  rec="$(repo_config_read)"
+  [ -n "$rec" ] || die "no repository config baseline — run \`loom new\` for any task, or \`loom pin-config\`.
+This command runs a model with no task behind it, so there is no task record to
+compare this repository's git config against — and the config is where
+core.hooksPath, filter.<d>.smudge, credential.helper and include.path live, all
+of which name a program git runs in YOUR session. \`loom scout\` in particular
+updates a working tree (the shared _scout mirror), which is what runs a planted
+smudge filter. loom will not $cmd against a config it cannot vouch for:
+  loom pin-config          # record what this repository's config says now"
+  f="$(config_snapshot)"
+  now="$(config_digest_of "$f")"
+  if [ "$rec" = "$now" ]; then rm -f "$f"; return 0; fi
+  changed="$(config_py diff "$(repo_config_sidecar)" "$f" 2>&1)" \
+    || changed="  (the recorded list is unreadable: $(repo_config_sidecar))"
+  [ -n "$changed" ] \
+    || changed="  (the digest moved but the recorded list did not — the baseline was
+  written half-way. Re-record it: loom pin-config --accept-config)"
+  rm -f "$f"
+  die "this repository's git config is not the one its baseline was recorded against:
+$changed
+Each line names the SCOPE it came from. '.git/config' ([local]) is in the SHARED
+git directory, so every linked worktree can write it with one command, and
+'.git/config.worktree' ([worktree-main]) is your own checkout's scope. An
+'include:<path>:<sha256>=<bytes>' line is a file the config PULLS IN.
+None of these keys are preferences: core.hooksPath decides which hooks run,
+filter.<d>.smudge runs on every working-tree update — which is exactly what
+'loom scout' does to its mirror — and credential.helper and core.askPass are
+handed your credentials as well as being run. loom will not $cmd against a
+config it cannot vouch for.
+If that change is YOURS, record it and carry on:
+  loom pin-config --accept-config
+Otherwise put it back:
+  git config --local --list                    # the [local] lines
+  git config --worktree --list                 # the [worktree-main] lines"
+}
+
 # The record AND its config sidecar: the two are one fact, and a sidecar left
 # behind for a dropped task would be read as the baseline of the NEXT task with
 # that id if `loom new` ever failed between writing the record and writing it.
+#
+# The REPOSITORY baseline ($STATE_DIR/config) is deliberately not touched here:
+# it is not this task's.
 state_rm() { rm -f "$(state_file "$1")" "$(config_sidecar "$1")"; }
 
 # ------------------------------------------------------------ worktree roots
@@ -1793,6 +1964,13 @@ run_role() { # run_role <role> <workdir> <prompt> [<logfile>]
     # REPOSITORY's, whatever directory this role runs in.
     if [ -n "$CONFIG_TASK" ]; then
       require_recorded_config "$CONFIG_TASK" "$CONFIG_CMD"
+    else
+      # A role with no task — `loom plan`'s architect, `loom scout`. It has no
+      # task record to be compared against, and it used to be compared against
+      # nothing at all. The REPOSITORY's baseline answers for it, per attempt,
+      # for the same reason the task pin is re-read per attempt: attempt 1 can
+      # plant a config and hit a rate limit.
+      require_recorded_config_repo "${CONFIG_CMD:-run a model}"
     fi
     if in_task_worktree "$wd"; then
       fence_reconcile "$wd" "$FENCE_PROFILE"
@@ -4025,6 +4203,68 @@ re-run:  loom drop $task"
   fi
 }
 
+# The explicit operator command for the REPOSITORY's config baseline — the one
+# `loom plan` and `loom scout` are judged against, and the one a repository with
+# no tasks at all would otherwise never have.
+#
+# The grammar is the same consent shape as everywhere else in this file:
+#
+#   loom pin-config                  no baseline  -> record one, and say what
+#                                                   was recorded
+#                                    unchanged    -> say so, exit 0
+#                                    changed      -> print the diff and REFUSE
+#   loom pin-config --accept-config  changed      -> print the diff and re-record
+#
+# So the flag means what it means everywhere else: loom shows you what moved and
+# you, not loom, decide it is yours. `--fence-profile` means nothing here (there
+# is no task and no worktree) and is refused rather than ignored.
+cmd_pin_config() {
+  scan_fence_flag "$@"
+  local a f now rec changed
+  for a in ${FLAG_ARGS[0]+"${FLAG_ARGS[@]}"}; do
+    die "loom pin-config: unexpected argument '$a' — usage: loom pin-config [--accept-config]"
+  done
+  [ -z "$FLAG_PROFILE" ] || die "loom pin-config: --fence-profile means nothing here. This command records the
+REPOSITORY's git config baseline, which is not a task's and not a worktree's."
+  repo_config_read > /dev/null            # a malformed baseline dies here
+  rec="$(repo_config_read)"
+  f="$(config_snapshot)"
+  now="$(config_digest_of "$f")"
+  if [ -n "$rec" ] && [ "$rec" = "$now" ]; then
+    rm -f "$f"
+    echo "loom: this repository's git config baseline is already current" >&2
+    echo "  $(repo_config_file)"
+    return 0
+  fi
+  if [ -n "$rec" ]; then
+    changed="$(config_py diff "$(repo_config_sidecar)" "$f" 2>&1)" \
+      || changed="  (the recorded list is unreadable: $(repo_config_sidecar))"
+    [ -n "$changed" ] || changed="  (the digest moved but the recorded list did not)"
+    if [ -z "$FLAG_ACCEPT_CONFIG" ]; then
+      rm -f "$f"
+      die "this repository's git config is not the one its baseline was recorded against:
+$changed
+Read those lines before you accept them: core.hooksPath, filter.<d>.clean/.smudge,
+merge.<d>.driver, credential.helper, core.askPass, gpg.program, pager.<cmd>,
+core.attributesFile and include.path/includeIf.* each name a PROGRAM git runs in
+your session. Then re-record it deliberately:
+  loom pin-config --accept-config"
+    fi
+    {
+      echo "loom: --accept-config: this repository's git config is not the one its"
+      echo "loom: baseline was recorded against. What changed:"
+      printf '%s\n' "$changed"
+      echo "loom: re-recording it as the baseline. loom vouches for none of it — you do."
+    } >&2
+  fi
+  repo_config_write "$f"
+  rm -f "$f"
+  echo "loom: recorded this repository's git config baseline" >&2
+  echo "  $(repo_config_file)"
+  config_summary  "$(repo_config_sidecar)"
+  config_programs "$(repo_config_sidecar)"
+}
+
 # Each agent worktree, annotated with the fence profile in its OPERATOR RECORD
 # — a reminder of the flag every command for that task needs, not a claim about
 # what is on disk (`loom run` reconciles the tree; the record only ever refuses).
@@ -4073,6 +4313,14 @@ cmd_plan() {
   local headless="" topic
   [ "${1:-}" = "-p" ] && { headless=yes; shift; }
   topic="${*:?usage: loom plan [-p] \"<topic>\"}"
+  # BEFORE the architect runs, and in THIS shell so the refusal is the
+  # command's own. The architect runs in $ROOT — your own checkout — and it is
+  # a model launch with no task behind it, so there is no task pin to read; the
+  # REPOSITORY's baseline is what it is judged against. The `claude` leg below
+  # is launched directly rather than through run_role, so this cannot live only
+  # in run_role.
+  CONFIG_CMD="plan"
+  require_recorded_config_repo plan
   mkdir -p "$AGENTS_DIR/plans" "$AGENTS_DIR/tasks" "$AGENTS_DIR/reviews" "$AGENTS_DIR/decisions"
   local prompt="Design: $topic. For codebase questions run 'loom scout \"<question>\"' \
 in the shell instead of reading source files yourself, and treat uncited scout \
@@ -4099,12 +4347,74 @@ file outside .agents/."
 # task and always carries the full fence, and nothing that runs against it —
 # including opencode, whose external_directory grant is this workdir — may be
 # given a directory that contains a profiled worktree.
+# The ONE scope the repository baseline cannot cover, and the mirror's own:
+# `$GITCOMMON/worktrees/_scout/config.worktree`. It is in the shared .git like
+# every other worktree's, and `git -C <the mirror> config --worktree <k> <v>`
+# writes it — one command from anything that has ever run with the mirror as
+# its cwd, which is every scout run there has ever been.
+#
+# FAIL-CLOSED, and the choice is deliberate. The other option was to delete and
+# recreate the scope on every call, which neutralises the plant just as well and
+# tells nobody that something wrote there. loom REFUSES instead: a scout mirror
+# whose private scope has grown a key is a fact about this repository the
+# operator has to see, and silent self-healing is the shape that hides it.
+#
+# The allowlist is what git's own sparse-checkout machinery writes at worktree
+# scope across the versions loom supports — `core.sparseCheckout` (measured,
+# git 2.34), plus the cone and index keys newer git adds beside it. Nothing
+# else; loom writes nothing else there.
+scout_mirror_config_check() { # scout_mirror_config_check <mirror>
+  local wt="$1" rec k bad=""
+  while IFS= read -r -d '' rec; do
+    k="${rec%%$'\n'*}"
+    case "$k" in
+      core.sparsecheckout|core.sparsecheckoutcone|index.sparse) ;;
+      "") ;;
+      *) bad="$bad
+  $k" ;;
+    esac
+  done < <(git -C "$wt" config --worktree --list --null 2>/dev/null || true)
+  [ -z "$bad" ] || die "the scout mirror has keys in its OWN worktree-scope config that loom
+did not write:$bad
+  $wt
+  $GITCOMMON/worktrees/_scout/config.worktree
+That scope is read for every git command run in the mirror and for nothing
+else, so it is invisible to the repository config baseline — and the mirror is
+where 'loom scout' does a working-tree update (sparse-checkout, clean, reset),
+which is what runs a planted filter.<d>.smudge. loom writes only
+core.sparseCheckout there. Read it, then clear it:
+  git -C $wt config --worktree --list
+  rm -f $GITCOMMON/worktrees/_scout/config.worktree
+or remove the mirror entirely and let the next scout rebuild it:
+  git worktree remove --force $wt"
+}
+
 scout_root() {
   local wt="$WT_ROOT/_scout" head
+  # BEFORE the mirror is touched at all, and before the `has_fence` shortcut,
+  # because both legs end in a model launch. `fence_apply` -> `sparse-checkout
+  # set`, the `clean` and the `reset --hard`/`checkout` below are WORKING-TREE
+  # UPDATES, and a working-tree update runs the SMUDGE side of whatever
+  # `filter.<d>` a `.gitattributes` in the mirror selects — with the driver
+  # read out of the SHARED .git/config, one `git config` from inside any
+  # agent's worktree. The scout has no task, so the REPOSITORY's baseline is
+  # what answers here.
+  require_recorded_config_repo scout
   has_fence || { echo "$ROOT"; return 0; }
   head="$(git rev-parse HEAD)"
   mkdir -p "$(dirname "$wt")"
   if [ -d "$wt" ]; then
+    require_wt_is_ours "$wt"
+    scout_mirror_config_check "$wt"
+    # The mirror is DISPOSABLE, and it is shared by every task and every
+    # provider — which is the whole reason it must not carry anything across a
+    # call. `reset --hard` does not touch an untracked file, so a previous
+    # run's scratch, or a copy of a fenced file made with
+    # `git show HEAD:core/lib.rs > notes.txt`, simply sat there for the next
+    # provider to read. Clean first (`-x` ignored files too, `-ff` a nested
+    # git dir), then reset, then re-apply the fence.
+    git -C "$wt" clean -xdff >&2 \
+      || die "cannot clean the scout mirror $wt — remove it and retry"
     fence_apply "$wt"
     git -C "$wt" reset --hard "$head" >&2 \
       || die "scout mirror is wedged: remove $wt and retry"
@@ -4113,8 +4423,23 @@ scout_root() {
     assert_wt_parent "$wt" "$WT_ROOT"
     git worktree add --detach --no-checkout "$wt" "$head" >&2
     assert_wt_under "$wt" "$WT_ROOT"
+    require_wt_is_ours "$wt"
     fence_apply "$wt"
     git -C "$wt" checkout >&2
+    # Creating the mirror is the one thing `loom scout` writes to the SHARED
+    # config on your behalf: the first `git sparse-checkout init` in a
+    # repository adds `extensions.worktreeConfig` to `.git/config` (measured,
+    # git 2.34). That is a local-scope change, so without this line the very
+    # next `loom scout` would refuse a change loom itself made — the same
+    # re-pin, for the same reason, that `loom new` does at the end of its own
+    # worktree setup.
+    #
+    # It is safe to sit here and nowhere else: the baseline was CHECKED at the
+    # top of this function, before anything was created, so a config an agent
+    # moved is refused above and never reaches this line. Only loom's own
+    # writes (and, in the narrow window between the two, a concurrent process —
+    # the same window `loom new` has) are re-recorded.
+    repo_config_repin
   fi
   fence_verify "$wt"
   echo "$wt"
@@ -4126,6 +4451,10 @@ cmd_scout() {
   # it stays at the FULL fence, and the profile's provider rule therefore never
   # has to cover the (repo-wide, cheap) scout chain.
   FENCE_PROFILE=""; FENCE_RELEASED=""; unset LOOM_FENCE_PROFILE
+  # No task, so run_role's per-attempt check is the REPOSITORY baseline's; this
+  # is the name its refusal uses. scout_root reads the baseline first, before
+  # it touches the mirror at all.
+  CONFIG_CMD="scout"
   local wd; load_fence; wd="$(scout_root)"
   run_role scout "$wd" "$q$(fence_note)"
 }
@@ -4380,6 +4709,7 @@ case "${1:-}" in
   scout)  shift; cmd_scout "$@" ;;
   gate)   shift; cmd_gate "$@" ;;
   zone)   shift; cmd_zone "$@" ;;
+  pin-config) shift; cmd_pin_config "$@" ;;
   tier)   shift; cmd_tier "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;
   guard)  shift; cmd_guard "$@" ;;
