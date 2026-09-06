@@ -4111,6 +4111,14 @@ out="$("$LOOM" land 0117-cl 2>&1)"; rc=$?
 want_eq   "(cl) and loom land lands it"                             "$rc" "0"
 out="$(timeout 180 "$LOOM" doctor 2>&1)"
 want_in   "(cl) doctor warns about the trunk's link"                "$out" "trunk symlink points OUTSIDE the tree: backend/hostname"
+# The SCOUT MIRROR is a model-facing tree too, and `run_role`'s per-attempt
+# reconcile runs on it — so without a base of its own it would both materialise
+# the doorway and refuse `loom scout` outright.
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
+       "$LOOM" scout "where is main" 2>&1)"; rc=$?
+want_eq   "(cl) loom scout proceeds on a trunk that carries one"    "$rc" "0"
+want_gone "(cl) ... and the mirror does not carry the link either"  "$WTU/_scout/backend/hostname"
+want_file "(cl) ... while the mirror's working surface is there"    "$WTU/_scout/backend/main.go"
 # The agent's OWN link, on the same trunk, is still refused — and the refusal no
 # longer offers `loom drop`, which was never the fix for either case.
 out="$("$LOOM" new 0118-cl2 2>&1)"; rc=$?

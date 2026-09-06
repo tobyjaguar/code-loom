@@ -6384,6 +6384,15 @@ cmd_scout() {
   # is the name its refusal uses. scout_root reads the baseline first, before
   # it touches the mirror at all.
   CONFIG_CMD="scout"
+  # The mirror's base, for the SYMLINK rules, and set HERE rather than in
+  # scout_root because that runs in a command substitution and would lose it.
+  # Without it the trunk's own escaping links are neither excluded from the
+  # mirror — which is a model-facing tree like any other — nor counted as
+  # inherited, and `run_role`'s per-attempt `fence_reconcile` runs on this
+  # directory too, so an unset base would REFUSE `loom scout` outright in a
+  # repository whose trunk carries one. The mirror is reset to HEAD, so HEAD is
+  # the right base for both questions.
+  FENCE_BASE="$(git rev-parse HEAD 2>/dev/null || true)"
   local wd; load_fence; wd="$(scout_root)"
   run_role scout "$wd" "$q$(fence_note)"
 }

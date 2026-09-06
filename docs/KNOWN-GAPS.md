@@ -1054,6 +1054,13 @@ disk. `loom new` and `loom attach` print one WARN naming them, `loom doctor` a
 warn line, and the refusal for an agent-introduced link names it as the
 branch's own and no longer offers `loom drop`. `(cl)`, `(cp)`.
 
+The scout mirror is in this too, and it needed saying separately: `loom scout`
+resolves `scout_root` inside a command substitution, so a base set there is lost
+before `run_role`'s per-attempt `fence_reconcile` ever sees it. `cmd_scout` sets
+it. Without that the mirror both materialised the doorway — it is a model-facing
+tree like any other — and refused `loom scout` outright in a repository whose
+trunk carries such a link. `(cl)`.
+
 **The non-blocking items, all in.**
 
 * **N1 — the widening discriminator failed OPEN on a base with no `[fence]`.**
