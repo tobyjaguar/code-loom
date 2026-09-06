@@ -216,7 +216,8 @@ for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p \
          0054-az 0055-az2 0056-az3 0057-ba 0058-bb 0059-bc 0060-bd 0061-ba2 0062-bf \
          0063-bh 0064-bi 0065-bj \
          0066-bk 0067-bk2 0068-bk3 0069-bk4 0070-bl 0071-bl2 \
-         0072-bm 0073-bn 0074-bo 0075-bp 0076-bq 0077-bq2; do mk_task "$t"; done
+         0072-bm 0073-bn 0074-bo 0075-bp 0076-bq 0077-bq2 \
+         0078-br 0079-br2 0080-bs 0081-bs2 0083-bs3; do mk_task "$t"; done
 mk_task 0040-ar  codex
 mk_task 0042-as  codex
 mk_task 0005-f codex
@@ -2398,6 +2399,11 @@ HOOK
 chmod +x "$TMP/bn-hooks/pre-commit"
 printf '[core]\n\tquotePath = false\n' > "$TMP/bn/inc.cfg"      # benign, for now
 git config include.path "$TMP/bn/inc.cfg"                       # planted by task A
+# `include.path` names a PROGRAM channel, so the repository baseline has moved
+# in a way `loom new` will not adopt on its own (it takes no --accept-config).
+# The operator baselines it deliberately first — which is what the refusal says
+# to do, and (bs) is the case that proves the refusal.
+"$LOOM" pin-config --accept-config > /dev/null 2>&1
 out="$("$LOOM" new 0073-bn 2>&1)"; rc=$?
 want_eq "(bn) setup: a task created while an include is present" "$rc" "0"
 want_in "(bn) loom new prints what it pinned"             "$out" "loom: pinned "
@@ -2497,6 +2503,10 @@ chmod +x "$TMP/bp-prog.sh"
 # The pin is a CHANGE check, so this is adopted as the baseline and trusted from
 # here on — which the operator has to be told once, at the moment it happens.
 git config gpg.program "$TMP/bp-prog.sh"
+# ... and, since the REPOSITORY baseline already exists and this moved it in a
+# way that names a program, the operator records that deliberately before
+# `loom new` will touch it. See (bs).
+"$LOOM" pin-config --accept-config > /dev/null 2>&1
 out="$("$LOOM" new 0075-bp 2>&1)"; rc=$?
 want_eq   "(bp) setup: a task, which baselines the REPOSITORY too" "$rc" "0"
 want_file "(bp) ... at \$STATE_DIR/config"                "$STATE/config"
@@ -2731,6 +2741,225 @@ want_eq     "(bq) ... and once it can be removed, it is"  "$rc" "0"
 want_in     "(bq) ... saying so"                          "$out" "loom: dropped"
 want_absent "(bq) ... with the released path gone with it" "$BQ2W"
 want_absent "(bq) ... and the operator record too"        "$(state_of 0077-bq2)"
+
+# ==========================================================================
+# ROUND-11 fixes. Every case below FAILS against the pre-fix bin/loom (2b3ec1b).
+# ==========================================================================
+
+# --- (br) the review directory is RESOLVED before loom writes into it -------
+# `.agents/reviews` is the one place loom writes INTO a tree the agent owns:
+# the review PATCH (which carries the content of every path in the diff,
+# released paths included), the gate log, and the review text. The directory is
+# the agent's to replace, and `reviews_dir` was `mkdir -p` and nothing else — a
+# symlink there redirected all three, silently, because `mkdir -p` on a path
+# that already resolves to a directory simply succeeds. The obvious target is
+# another task's worktree: an UNPROFILED tree, under the other root, that a
+# provider this profile does not allow is about to run in.
+out="$("$LOOM" new 0078-br 2>&1)"; rc=$?
+want_eq "(br) setup: an unprofiled task — the redirect's target"  "$rc" "0"
+out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MODELS_reviewer="codex-sub" \
+       "$LOOM" new 0079-br2 --fence-profile codex 2>&1)"; rc=$?
+want_eq   "(br) setup: a profiled task, holding released paths"   "$rc" "0"
+BRT="$WTU/0078-br"; BRP="$WTP/0079-br2"
+want_file "(br) setup: ... core/ really is released into it"      "$BRP/core/lib.rs"
+echo "// released work" >> "$BRP/core/lib.rs"
+git -C "$BRP" add core/lib.rs
+git -C "$BRP" commit -qm "released work on br2"
+# The stealth variant: `.agents` intact and tracked, one directory inside it
+# swapped. Every check written at the `.agents` level walks straight past it.
+rm -rf "$BRP/.agents/reviews"
+ln -s "$BRT/.agents/reviews" "$BRP/.agents/reviews"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0079-br2 --fence-profile codex 2>&1)"; rc=$?
+want_eq     "(br) loom check refuses a symlinked .agents/reviews"  "$rc" "1"
+want_in     "(br) ... naming the path it RESOLVES to"              "$out" "$BRT/.agents/reviews"
+want_in     "(br) ... and the worktree that is not inside"         "$out" "$BRP"
+want_absent "(br) ... with no patch written through the link"      "$BRT/.agents/reviews/0079-br2.patch"
+want_absent "(br) ... nor a review"                                "$BRT/.agents/reviews/0079-br2-review.md"
+out="$("$LOOM" diff 0079-br2 --fence-profile codex 2>&1)"; rc=$?
+want_eq     "(br) loom diff refuses it the same way"               "$rc" "1"
+want_in     "(br) ... naming the resolved path"                    "$out" "$BRT/.agents/reviews"
+want_absent "(br) ... and writes no patch either"                  "$BRT/.agents/reviews/0079-br2.patch"
+# `wt_dirty` excludes `.agents/reviews` by pathspec so that loom's own review
+# scratch does not make a task unlandable. The exclusion is for loom's scratch
+# and for nothing else: a symlink in its place is not that directory, the
+# pathspec is dropped, and landing refuses.
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" land 0079-br2 --fence-profile codex 2>&1)"; rc=$?
+want_eq     "(br) loom land refuses it, because the exclusion no longer applies" "$rc" "1"
+want_in     "(br) ... as uncommitted work"                         "$out" "uncommitted changes"
+want_in     "(br) ... naming the link itself"                      "$out" ".agents/reviews"
+# ... and the tree the link points AT goes on working, with nothing of the
+# other task's in it.
+out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 "$LOOM" run 0078-br 2>&1)"; rc=$?
+want_eq     "(br) the redirect's target runs normally"             "$rc" "0"
+want_in     "(br) ... reaching a green gate"                       "$out" "gate green"
+want_file   "(br) ... writing its OWN gate log"                    "$BRT/.agents/reviews/0078-br-gate.log"
+want_absent "(br) ... and never the other task's patch"            "$BRT/.agents/reviews/0079-br2.patch"
+# The coarse variant: `.agents` itself. It must be caught BEFORE the `mkdir -p`,
+# which would otherwise create the directory at the far end of the link — a
+# write outside the worktree by the call that is supposed to be checking.
+rm -f "$BRP/.agents/reviews"
+mv "$BRP/.agents" "$TMP/br-agents"
+ln -s "$TMP/br-agents" "$BRP/.agents"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0079-br2 --fence-profile codex 2>&1)"; rc=$?
+want_eq "(br) the coarse variant — .agents itself — is refused too" "$rc" "1"
+want_in "(br) ... naming .agents rather than the directory under it" "$out" ".agents resolves to"
+want_in "(br) ... and where it points"                             "$out" "$TMP/br-agents"
+rm -f "$BRP/.agents"
+mv "$TMP/br-agents" "$BRP/.agents"
+"$LOOM" drop 0079-br2 > /dev/null 2>&1 || true
+"$LOOM" drop 0078-br  > /dev/null 2>&1 || true
+
+# --- (bs) a repository baseline never moves silently ------------------------
+# `config_repin` re-records the REPOSITORY baseline as a side effect of pinning
+# a task — at `loom new`, and again at `land --pr` after its own
+# `--set-upstream-to`. Both are places where loom expects to be adopting its
+# OWN writes, and "expects" is not "checked": anything else that moved in the
+# same window became the baseline the next `loom scout` and `loom plan` are
+# judged against, with nothing printed.
+cat > "$TMP/bs-smudge.sh" << SM
+#!/usr/bin/env bash
+: > "$TMP/bs-smudge-ran"
+exec cat
+SM
+chmod +x "$TMP/bs-smudge.sh"
+git config filter.evil.smudge "$TMP/bs-smudge.sh"
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
+       "$LOOM" scout "where is main" 2>&1)"; rc=$?
+want_eq "(bs) setup: the operator's scout refuses the planted key" "$rc" "1"
+want_in "(bs) ... naming it"                              "$out" "+ filter.evil.smudge="
+# The agent's next move is a `loom new`, which used to re-record that key as the
+# baseline and hand the scout a config nobody had read.
+bs_base="$(cat "$STATE/config")"
+out="$("$LOOM" new 0080-bs 2>&1)"; rc=$?
+want_eq     "(bs) loom new REFUSES a baseline move that names a program" "$rc" "1"
+want_in     "(bs) ... printing the delta first"           "$out" "repository config baseline moved:"
+want_in     "(bs) ... naming the key"                     "$out" "+ filter.evil.smudge="
+want_in     "(bs) ... and saying it is a program git runs" "$out" "names a PROGRAM git runs"
+want_in     "(bs) ... pointing at the command that CAN weigh it" \
+            "$out" "loom pin-config --accept-config"
+want_eq     "(bs) ... with the baseline left exactly as it was" "$(cat "$STATE/config")" "$bs_base"
+want_absent "(bs) ... and the half-built task unwound"    "$WTU/0080-bs"
+want_absent "(bs) ... record and all"                     "$(state_of 0080-bs)"
+out="$("$LOOM" pin-config --accept-config 2>&1)"; rc=$?
+want_eq "(bs) ... loom pin-config --accept-config is the way through" "$rc" "0"
+out="$("$LOOM" new 0080-bs 2>&1)"; rc=$?
+want_eq "(bs) ... and then loom new goes ahead"           "$rc" "0"
+"$LOOM" drop 0080-bs > /dev/null 2>&1 || true
+git config --unset filter.evil.smudge
+"$LOOM" pin-config --accept-config > /dev/null 2>&1
+# A move that names NO program is adopted — but never silently.
+git config loom.probe "a value"
+out="$("$LOOM" new 0081-bs2 2>&1)"; rc=$?
+want_eq "(bs) a move that names no program is adopted"    "$rc" "0"
+want_in "(bs) ... with the delta printed rather than swallowed" \
+        "$out" "repository config baseline moved:"
+want_in "(bs) ... naming the key"                         "$out" "+ loom.probe="
+want_in "(bs) ... and saying who vouches for it"          "$out" "loom vouches for none of it"
+"$LOOM" drop 0081-bs2 > /dev/null 2>&1 || true
+git config --unset loom.probe
+"$LOOM" pin-config --accept-config > /dev/null 2>&1
+# ... and the same rule at `land --pr`'s post-push re-pin, where the window is
+# the push itself. The plant arrives from git's own pre-push hook — no config
+# change of its own, so nothing before the push can see it coming.
+git init -q --bare "$TMP/origin-bs.git"
+git remote add origin "$TMP/origin-bs.git"
+git push -q origin main
+out="$("$LOOM" new 0083-bs3 2>&1)"; rc=$?
+want_eq "(bs) setup: a task against a real origin"        "$rc" "0"
+BS3W="$WTU/0083-bs3"
+echo "benign" > "$BS3W/backend/bs.txt"
+git -C "$BS3W" add backend/bs.txt
+git -C "$BS3W" commit -qm "benign work on bs3"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0083-bs3 2>&1)"; rc=$?
+want_eq "(bs) setup: it is reviewed"                      "$rc" "0"
+cat > "$TMP/bs-prog.sh" << PROG
+#!/usr/bin/env bash
+: > "$TMP/bs-prog-ran"
+exec cat
+PROG
+chmod +x "$TMP/bs-prog.sh"
+cat > "$REPO_REAL/.git/hooks/pre-push" << HOOK
+#!/usr/bin/env bash
+git config --local filter.pushwindow.clean "$TMP/bs-prog.sh"
+exit 0
+HOOK
+chmod +x "$REPO_REAL/.git/hooks/pre-push"
+bs_base="$(cat "$STATE/config")"
+out="$("$LOOM" land 0083-bs3 --pr 2>&1)"; rc=$?
+want_eq "(bs) land --pr refuses to re-pin a baseline that moved during the push" "$rc" "1"
+want_in "(bs) ... printing the delta"                     "$out" "repository config baseline moved:"
+want_in "(bs) ... including loom's own two writes"        "$out" "+ branch.agent/0083-bs3.remote="
+want_in "(bs) ... and the key that rode in under them"    "$out" "+ filter.pushwindow.clean="
+want_in "(bs) ... called what it is"                      "$out" "names a PROGRAM git runs"
+want_in "(bs) ... saying the push already happened"       "$out" "THE PUSH ALREADY HAPPENED"
+want_in "(bs) ... and where to go next"                   "$out" "loom pin-config --accept-config"
+want_eq "(bs) ... with the baseline NOT re-recorded"      "$(cat "$STATE/config")" "$bs_base"
+want_ne "(bs) ... while the branch really is on origin, as it says" \
+        "$(git -C "$TMP/origin-bs.git" rev-parse --verify --quiet refs/heads/agent/0083-bs3 || echo GONE)" "GONE"
+rm -f "$REPO_REAL/.git/hooks/pre-push"
+git config --unset filter.pushwindow.clean
+"$LOOM" drop 0083-bs3 > /dev/null 2>&1 || true
+git remote remove origin
+"$LOOM" pin-config --accept-config > /dev/null 2>&1
+
+# --- (bt) extensions.worktreeConfig is read the way git reads it ------------
+# git decides whether the two worktree scopes are live with its own
+# `git_config_bool`: case-insensitive, and a VALUELESS key is true. The
+# snapshot matched the string against `true|yes|on|1`, so `True`, `ON` and the
+# valueless form turned the worktree scopes OFF in the pin while git went on
+# reading them — a `core.hooksPath` in `config.worktree` live and unpinned.
+#
+# The REPOSITORY baseline is the route these forms survive on: every task
+# command reaches `fence_apply` -> `git sparse-checkout init`, and git rewrites
+# `extensions.worktreeConfig` to its own lowercase `true` on the way past
+# (measured, git 2.34.1). `loom pin-config` and `loom scout`'s refusal both read
+# the config without touching a worktree, so the odd form is still standing when
+# they look. (`worktree-task` is deliberately not in the repository baseline —
+# there is no task here; (bm) is the case that covers that scope.)
+BTCFG="$REPO_REAL/.git/config"
+bt_set() { # bt_set <literal>   ("" writes the valueless form)
+  python3 - "$BTCFG" "$1" << 'PY'
+import re, sys
+p, val = sys.argv[1], sys.argv[2]
+out, skip = [], False
+for ln in open(p).read().splitlines(True):
+    if re.match(r'^\s*\[', ln):
+        skip = re.match(r'^\s*\[extensions\]', ln, re.I) is not None
+        if skip:
+            continue
+    if skip:
+        continue
+    out.append(ln)
+out.append("[extensions]\n")
+out.append("\tworktreeConfig\n" if val == "" else "\tworktreeConfig = %s\n" % val)
+open(p, "w").writelines(out)
+PY
+}
+for form in True ON ""; do
+  label="${form:-<valueless>}"
+  # The MAIN checkout's own scope — not the local one, and not any task's.
+  git config --worktree core.hooksPath "$TMP/bt-hooks"
+  bt_set "$form"
+  want_eq "(bt) setup: git reads '$label' as true" \
+          "$(git config --local --type=bool --get extensions.worktreeConfig 2>/dev/null || echo NONE)" "true"
+  want_eq "(bt) setup: ... and the file really says '$label'" \
+          "$(git config --local --get extensions.worktreeConfig 2>/dev/null || true)" "$form"
+  out="$("$LOOM" pin-config --accept-config 2>&1)"; rc=$?
+  want_eq     "(bt) the baseline records with extensions.worktreeConfig = $label" "$rc" "0"
+  want_not_in "(bt) ... and does not report zero worktree entries"  "$out" "+ 0 worktree config entries"
+  want_in     "(bt) ... with the main checkout's own scope really in it" \
+              "$(tr '\0' '\n' < "$STATE/config.gitconfig")" "worktree-main:core.hookspath"
+  # ... and a change to that scope is a refusal for the roles judged against it.
+  git config --worktree core.hooksPath "$TMP/bt-hooks-2"
+  out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
+         "$LOOM" scout "where is main" 2>&1)"; rc=$?
+  want_eq "(bt) ... a core.hooksPath planted in config.worktree is refused" "$rc" "1"
+  want_in "(bt) ... named in the diff"     "$out" "+ core.hookspath=$TMP/bt-hooks-2"
+  want_in "(bt) ... tagged with its scope" "$out" "[worktree-main]"
+  git config --worktree --unset core.hooksPath
+done
+bt_set true
+"$LOOM" pin-config --accept-config > /dev/null 2>&1
 
 # --- (j)/(t) doctor lists the profiles, and touches no network ------------
 out="$(timeout 180 "$LOOM" doctor 2>&1 || true)"
