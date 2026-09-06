@@ -3621,6 +3621,12 @@ branch_ref() { echo "refs/heads/agent/$1"; }
 # `place_file`, which renames a fresh file onto the target and refuses to leave
 # anything but a one-link plain file behind, so this cannot fire on loom's own
 # scratch.)
+#
+# ... and dropping the pathspec is only half of it in the repo the README asks
+# for, which GITIGNORES `.agents/reviews/`: there the planted link is an
+# IGNORED path, and no pathspec makes `git status` mention it. So whenever the
+# exclusion is dropped, `wt_dirty` asks the same directory a second time with
+# `--ignored=matching` and appends the `!!` lines. See wt_dirty.
 reviews_entries_plain() { # reviews_entries_plain <resolved-dir>
   local d="$1" e
   for e in "$d"/* "$d"/.*; do
@@ -3634,7 +3640,7 @@ reviews_entries_plain() { # reviews_entries_plain <resolved-dir>
 }
 
 wt_dirty() { # wt_dirty <worktree>   -> the offending `git status --porcelain` lines
-  local wt="$1" rwt rdir
+  local wt="$1" rwt rdir out ign excluded=0
   local -a spec=(-- .)
   rwt="$(cd "$wt" 2>/dev/null && pwd -P)" \
     || die "cannot resolve the worktree $wt — refusing to guess whether it is clean"
@@ -3642,11 +3648,40 @@ wt_dirty() { # wt_dirty <worktree>   -> the offending `git status --porcelain` l
      && [ -d "$wt/.agents/reviews" ]; then
     rdir="$(cd "$wt/.agents/reviews" 2>/dev/null && pwd -P)" || rdir=""
     if [ "$rdir" = "$rwt/.agents/reviews" ] && reviews_entries_plain "$rdir"; then
-      spec+=(':(exclude).agents/reviews')
+      spec+=(':(exclude).agents/reviews'); excluded=1
     fi
   fi
-  git -C "$wt" status --porcelain "${spec[@]}" 2>/dev/null \
+  out="$(git -C "$wt" status --porcelain "${spec[@]}" 2>/dev/null)" \
     || die "cannot read the state of the worktree $wt — refusing to guess whether it is clean"
+  # STEP TWO, and only when the exclusion was NOT applied — i.e. exactly when
+  # something about `.agents/reviews` has already stopped being loom's own
+  # plain scratch (a symlink at it or at `.agents`, a directory resolving
+  # outside this worktree, or an entry inside it that is not a one-link plain
+  # file).
+  #
+  # Dropping the pathspec is what makes the swap VISIBLE, and it stops being
+  # enough in the repo the README asks for: one that GITIGNORES
+  # `.agents/reviews/`. There, the planted link is an ignored path, `git status`
+  # says nothing about it with or without the exclusion, and the tripwire that
+  # was supposed to make `loom land` refuse reported a clean tree instead. So
+  # the same directory is asked again with `--ignored=matching`, and those `!!`
+  # lines are appended to the dirty output. Only the `!!` lines: everything
+  # else in that listing is already in $out, and the point is the entry the
+  # first command could not see.
+  #
+  # This is a TRIPWIRE, not the lock. The write path is closed by `place_file`
+  # (resolve, hold the directory, rename onto the target, assert what is left)
+  # and the read path by `probe_agent_file`, both regardless of what any repo
+  # ignores; this is the line that stops `loom land` publishing over a tree
+  # somebody has been playing with.
+  if [ "$excluded" -eq 0 ]; then
+    ign="$(git -C "$wt" status --porcelain --ignored=matching -- .agents/reviews 2>/dev/null \
+             | grep '^!! ' || true)"
+    [ -z "$ign" ] || out="${out:+$out
+}$ign"
+  fi
+  [ -z "$out" ] || printf '%s\n' "$out"
+  return 0
 }
 
 # --- ONE base, and it is the operator's ------------------------------------
