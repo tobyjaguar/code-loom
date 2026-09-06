@@ -229,6 +229,26 @@ for _v in $GIT_HOOK_VARS; do
 done
 unset _v
 
+# --- and $TMPDIR, which is where loom's OWN scratch lands -------------------
+# Snapshotted HERE, before EITHER env file is sourced, and restored after both.
+# Same carve-out shape as $OC_VARS and $GIT_HOOK_VARS: what was in the
+# environment when `loom` started survives; what a file in the tree sets does
+# not.
+#
+# `${TMPDIR:-/tmp}` is the parent of every `mktemp` loom makes — the gate log,
+# the review patch, the reviewer's transcript, the config dumps — and those
+# temps are the AUTHORITATIVE copies on their way to the operator's state
+# directory: the gate log `loom run` feeds back into the next attempt's prompt
+# is read from one, and the patch a reviewer is handed is written from one. One
+# `TMPDIR=.agents/scratch` line in a landed `.agents/loom.env` (a tracked path
+# an agent can write, KNOWN-GAPS 3, `.`-sourced under `set -a`) would move all
+# of them into a directory the agent owns, where they can be read, edited or
+# replaced between the write and the read. So it is pinned exactly as the
+# OPENCODE_* set is: a CALLER who exports $TMPDIR still wins, untouched — a
+# file in the tree does not get to.
+TMPDIR_SNAP=()
+if [ -n "${TMPDIR+x}" ]; then TMPDIR_SNAP=("1" "$TMPDIR"); else TMPDIR_SNAP=("0" ""); fi
+
 # Provider keys live in one file outside every repo (chmod 600). Sourced here
 # so loom and everything it launches (opencode included) see them without the
 # keys ever entering a repo or a shell profile.
@@ -241,9 +261,11 @@ if [ -f "$LOOM_ENV" ]; then set -a; . "$LOOM_ENV"; set +a; fi
 # is measured from is the OPERATOR RECORD (see the state directory below), a
 # file outside every repo; this file only ever picks models and keys.
 #
-# Two carve-outs, both because this file is `.`-sourced shell from a tracked
+# Three carve-outs, all because this file is `.`-sourced shell from a tracked
 # path an agent can write (KNOWN-GAPS 3). The first is $WT_ROOT_PROFILED, dealt
-# with further down. The second is the OPENCODE_* set, snapshotted here and
+# with further down. The third is $TMPDIR — snapshotted further up, before
+# EITHER env file, and restored just below, because it decides where loom's own
+# scratch lands. The second is the OPENCODE_* set, snapshotted here and
 # restored immediately after: those five variables decide which config opencode
 # loads, and the config decides `provider.<name>.options.baseURL` — the provider
 # IDENTITY a fence profile's `providers` list is built on — and the role prompt.
@@ -269,6 +291,20 @@ for _v in $OC_VARS; do
   fi
 done
 unset _v _oc_i _oc_was _oc_val OC_SNAP
+# ... and $TMPDIR back to whatever it held on entry. Sourcing is over — both
+# files have been read — so from here on loom's own scratch lands where the
+# OPERATOR's environment says, never where a file in the tree said. See
+# $TMPDIR_SNAP.
+if [ "${TMPDIR_SNAP[0]}" = 1 ]; then
+  [ "${TMPDIR-}" = "${TMPDIR_SNAP[1]}" ] \
+    || echo "loom: WARN: an env file set TMPDIR — ignored (it decides where loom's own scratch files land); the value you exported is kept" >&2
+  export TMPDIR="${TMPDIR_SNAP[1]}"
+else
+  [ -z "${TMPDIR+x}" ] \
+    || echo "loom: WARN: an env file set TMPDIR — ignored (it decides where loom's own scratch files land, and .agents/loom.env is agent-writable)" >&2
+  unset TMPDIR
+fi
+unset TMPDIR_SNAP
 # git's own environment, cleared once BOTH env files have been sourced. Every
 # one of these re-aims a git subprocess at a different repository, index or
 # object store — GIT_DIR and GIT_WORK_TREE obviously, GIT_INDEX_FILE and
