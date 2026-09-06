@@ -4772,25 +4772,42 @@ new_abort() {
 # test`, `go test` or `npm test` executes the repository's build, and the
 # repository's build is what the agent has just been editing. It used to
 # inherit the operator's whole environment — measured by the external review:
-# 56 variables, `ZHIPU_API_KEY` among them. So every variable whose NAME looks
-# like a credential is dropped for the length of the gate.
+# 56 variables, `ZHIPU_API_KEY` among them. So a variable whose NAME MATCHES ONE
+# OF THE PATTERNS BELOW is dropped for the length of the gate.
+#
+# That is the honest statement, and this comment used to make a bigger one
+# ("every variable whose NAME looks like a credential"). It is a NAME-SHAPE
+# filter and nothing more: a credential in a variable the patterns do not
+# describe — `NETRC_BODY`, `GH_ENTERPRISE`, a bare `SLACK_HOOK` — still reaches
+# the gate, as does one in any file the gate can read. KNOWN-GAPS § 3 has always
+# said so; this comment now says the same thing.
 #
 # The list is built from the environment itself (`compgen -e`, the exported
-# names) and matched by pattern, so a provider variable added later is covered
-# without an edit here. It is `env -u`, deliberately, and never `env -i`: a
-# build needs PATH, HOME, GOPATH, CARGO_HOME, LANG and a dozen more, and a gate
-# that cannot find its toolchain is a gate nobody keeps.
+# names) and matched CASE-INSENSITIVELY, so a provider variable added later, and
+# a lowercase `openai_api_key`, are covered without an edit here. `nocasematch`
+# is set inside the subshell that does the matching and NOWHERE else — it is a
+# shell-wide option and `case` is how half this file decides things.
+# It is `env -u`, deliberately, and never `env -i`: a build needs PATH, HOME,
+# GOPATH, CARGO_HOME, LANG and a dozen more, and a gate that cannot find its
+# toolchain is a gate nobody keeps.
 run_gate() { # run_gate <worktree> [<logfile>]
   local wt="$1" log="${2:-}" n rc=0
   local -a strip=()
   while IFS= read -r n; do
     [ -n "$n" ] || continue
-    case "$n" in
-      *_API_KEY|*_TOKEN|*_SECRET|*_PASSWORD|\
-      ANTHROPIC_*|OPENAI_*|CODEX_*|OPENCODE_*|ZAI_*|ZHIPU_*|DEEPSEEK_*|MOONSHOT_*)
-        strip+=(-u "$n") ;;
-    esac
-  done < <(compgen -e 2>/dev/null || true)
+    strip+=(-u "$n")
+  done < <(
+    shopt -s nocasematch
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      case "$n" in
+        *api_key*|*token*|*secret*|*password*|*passwd*|*auth*|*credential*|\
+        *access_key*|*key_id*|\
+        aws_*|anthropic_*|openai_*|codex_*|opencode_*|zai_*|zhipu_*|deepseek_*|moonshot_*)
+          printf '%s\n' "$n" ;;
+      esac
+    done < <(compgen -e 2>/dev/null || true)
+  )
   if [ -n "$log" ]; then
     ( cd "$wt" && env ${strip[0]+"${strip[@]}"} "$STATE_MAIN_ROOT/.agents/gate.sh" > "$log" 2>&1 ) || rc=$?
   else

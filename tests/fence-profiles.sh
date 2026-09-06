@@ -3688,6 +3688,9 @@ CE="$WTU/0100-ce"
 : > "$TMP/ce-gate-env.log"
 out="$(ZHIPU_API_KEY=FAKE-KEY DEEPSEEK_API_KEY=FAKE-KEY MY_SECRET=FAKE-KEY \
        GITHUB_TOKEN=FAKE-KEY ADMIN_PASSWORD=FAKE-KEY \
+       AWS_SECRET_ACCESS_KEY=FAKE-KEY AWS_ACCESS_KEY_ID=FAKE-KEY \
+       NPM_CONFIG__AUTH=FAKE-KEY DOCKER_AUTH_CONFIG=FAKE-KEY PGPASSWORD=FAKE-KEY \
+       GOOGLE_APPLICATION_CREDENTIALS=FAKE-KEY openai_api_key=FAKE-KEY \
        LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 \
        "$LOOM" run 0100-ce 2>&1)"; rc=$?
 want_eq "(ce) loom run reaches a green gate"                        "$rc" "0"
@@ -3698,6 +3701,17 @@ want_not_in "(ce) run: no DEEPSEEK_API_KEY either"                  "$ce_run" "D
 want_not_in "(ce) run: nor a *_SECRET of the operator's"            "$ce_run" "MY_SECRET="
 want_not_in "(ce) run: nor a *_TOKEN"                               "$ce_run" "GITHUB_TOKEN="
 want_not_in "(ce) run: nor a *_PASSWORD"                            "$ce_run" "ADMIN_PASSWORD="
+# The measured survivors of the old `*_API_KEY|*_TOKEN|*_SECRET|*_PASSWORD`
+# suffix list: a name that CONTAINS the word rather than ending in it, an AWS
+# pair, and a lowercase spelling. All of them are ordinary ways to hold a
+# credential, and every one of them reached the gate.
+want_not_in "(ce) run: nor AWS_SECRET_ACCESS_KEY"                   "$ce_run" "AWS_SECRET_ACCESS_KEY="
+want_not_in "(ce) run: nor AWS_ACCESS_KEY_ID"                       "$ce_run" "AWS_ACCESS_KEY_ID="
+want_not_in "(ce) run: nor NPM_CONFIG__AUTH"                        "$ce_run" "NPM_CONFIG__AUTH="
+want_not_in "(ce) run: nor DOCKER_AUTH_CONFIG"                      "$ce_run" "DOCKER_AUTH_CONFIG="
+want_not_in "(ce) run: nor PGPASSWORD"                              "$ce_run" "PGPASSWORD="
+want_not_in "(ce) run: nor GOOGLE_APPLICATION_CREDENTIALS"          "$ce_run" "GOOGLE_APPLICATION_CREDENTIALS="
+want_not_in "(ce) run: nor a LOWERCASE openai_api_key"              "$ce_run" "openai_api_key="
 want_in     "(ce) run: PATH is still there — this is env -u, not env -i" "$ce_run" "PATH="
 want_in     "(ce) run: and HOME"                                    "$ce_run" "HOME="
 out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0100-ce 2>&1)"; rc=$?
@@ -3705,6 +3719,7 @@ want_eq "(ce) setup: it is reviewed"                                "$rc" "0"
 : > "$TMP/ce-gate-env.log"
 out="$(ZHIPU_API_KEY=FAKE-KEY DEEPSEEK_API_KEY=FAKE-KEY MY_SECRET=FAKE-KEY \
        GITHUB_TOKEN=FAKE-KEY ADMIN_PASSWORD=FAKE-KEY \
+       AWS_SECRET_ACCESS_KEY=FAKE-KEY PGPASSWORD=FAKE-KEY openai_api_key=FAKE-KEY \
        "$LOOM" land 0100-ce 2>&1)"; rc=$?
 want_eq "(ce) loom land runs the gate and lands"                    "$rc" "0"
 ce_land="$(cat "$TMP/ce-gate-env.log")"
@@ -3714,6 +3729,9 @@ want_not_in "(ce) land: no DEEPSEEK_API_KEY either"                 "$ce_land" "
 want_not_in "(ce) land: nor a *_SECRET of the operator's"           "$ce_land" "MY_SECRET="
 want_not_in "(ce) land: nor a *_TOKEN"                              "$ce_land" "GITHUB_TOKEN="
 want_not_in "(ce) land: nor a *_PASSWORD"                           "$ce_land" "ADMIN_PASSWORD="
+want_not_in "(ce) land: nor AWS_SECRET_ACCESS_KEY"                   "$ce_land" "AWS_SECRET_ACCESS_KEY="
+want_not_in "(ce) land: nor PGPASSWORD"                             "$ce_land" "PGPASSWORD="
+want_not_in "(ce) land: nor a LOWERCASE openai_api_key"             "$ce_land" "openai_api_key="
 want_in     "(ce) land: PATH is still there"                        "$ce_land" "PATH="
 want_in     "(ce) land: and HOME"                                   "$ce_land" "HOME="
 printf '%s\n' "$ce_gate_orig" > .agents/gate.sh
