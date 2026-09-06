@@ -33,9 +33,9 @@ new t5` fenced the new task with the agent's `zones.toml` (an emptied one means
 no fence at all) and `.`-sourced the agent's `.agents/loom.env` as shell, in
 your environment.
 
-**What closes it.** `bin/loom:122` (`ROOT="$(cd "$(dirname "$_common")" …)"`,
-from `git rev-parse --git-common-dir` at `bin/loom:118`) and `bin/loom:138`
-(`AGENTS_DIR="$ROOT/.agents"`); the guard's own reads are `bin/loom:1872`
+**What closes it.** `bin/loom:137` (`ROOT="$(cd "$(dirname "$_common")" …)"`,
+from `git rev-parse --git-common-dir` at `bin/loom:133`) and `bin/loom:153`
+(`AGENTS_DIR="$ROOT/.agents"`); the guard's own reads are `bin/loom:2153`
 onward. `$ROOT` is now the **main checkout** for every command:
 `git rev-parse --git-common-dir` answers `.git` from the main checkout and the
 absolute path of the main `.git` from a linked worktree, so its parent is the
@@ -46,7 +46,7 @@ profiles), `loom.env`, `.opencode/`, and `.agents/gate.sh`.
 One thing still comes from the invoking tree, and only one: **`loom guard`'s
 subject.** The commit is happening in that worktree, so the branch, the staged
 file list and the tree the reconciler inspects are read from `$INVOKED_ROOT`
-(`bin/loom:114`)
+(`bin/loom:129`)
 while the zones they are judged by come from `$ROOT`. `loom` says so in one line
 whenever the two differ. `tests/fence-profiles.sh` (av) asserts both halves:
 `loom new` from inside a worktree with an emptied `zones.toml` still applies the
@@ -81,7 +81,7 @@ own. That is not worth plugging: the entire hook is dominated by `git commit
 
 ## 2. `loom plan` runs the architect unfenced, in your own tree
 
-**Where.** `bin/loom:3110`, in `cmd_plan` (`bin/loom:3091`):
+**Where.** `bin/loom:3503`, in `cmd_plan` (`bin/loom:3484`):
 `run_role architect "$ROOT" "$prompt"` (and the
 interactive leg, `claude --append-system-prompt … "$prompt"`, likewise in
 `$ROOT`). The architect's chain at every tier ends in cheap third-party
@@ -103,7 +103,7 @@ say so out loud.
 
 ## 3. `.agents/loom.env` is sourced as shell
 
-**Where.** `bin/loom:212`:
+**Where.** `bin/loom:227`:
 
 ```sh
 if [ -f "$ROOT/.agents/loom.env" ]; then set -a; . "$ROOT/.agents/loom.env"; set +a; fi
@@ -240,7 +240,7 @@ that one form or the README changes with it.
 used to read "granted for the whole worktree root". It is not that any more;
 what is left is a confirmation.
 
-**Where.** `bin/loom:944`, in `run_headless` (`bin/loom:857`), the opencode leg:
+**Where.** `bin/loom:1215`, in `run_headless` (`bin/loom:1128`), the opencode leg:
 
 ```sh
 perm="$(printf '{"external_directory":{"%s/*":"allow","%s/**":"allow"}}' "$wd" "$wd")"
@@ -310,7 +310,7 @@ OPENCODE_CONFIG=$ROOT/.opencode/opencode.json     # (and OPENCODE_CONFIG_DIR)
 OPENCODE_DISABLE_PROJECT_CONFIG=1
 ```
 
-`run_headless`'s opencode leg (`bin/loom:975`) sets the **disable
+`run_headless`'s opencode leg (`bin/loom:1246`) sets the **disable
 unconditionally**, on every opencode invocation — implementer, reviewer, scout
 and architect alike — and names the operator's config only when one exists.
 That is a round-4 correction: the disable used to be conditional on
@@ -364,11 +364,11 @@ matter slightly more than they did.
 construction.** This one cannot be closed from outside git; what follows is the
 boundary, drawn honestly.
 
-**Where.** `bin/loom:315` (the `GIT_CONFIG_PARAMETERS` export and
-`GIT_PAGER=cat`), `bin/loom:707` (the config pin: `config_snapshot`,
-`config_py`, `require_recorded_config`), and the `--no-ext-diff` /
-`--upload-pack=` / `--receive-pack=` spelled out at the diff, fetch and push
-call sites.
+**Where.** `bin/loom:366` (the `GIT_CONFIG_PARAMETERS` export) and
+`bin/loom:376` (`GIT_PAGER=cat`); `bin/loom:752` onward (the config pin:
+`config_sidecar`, `config_py`, `config_snapshot`, `require_recorded_config`);
+and the `--no-ext-diff` / `--upload-pack=` / `--receive-pack=` spelled out at
+the diff, fetch and push call sites.
 
 **What it is.** A linked worktree shares the git directory with the main
 checkout, so `.git/config` is writable from inside an agent's tree with one
