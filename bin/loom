@@ -69,10 +69,25 @@
 #                                  created=<iso> reviewed=<sha> origin=<url>
 #                                  fetch=<remote.origin.fetch>
 #                                  pushurl=<the push URL of origin>
+#                                  config=<sha256 of the repo's LOCAL git config>
+#       tasks/<task>.gitconfig     that config in full, so a mismatch can be
+#                                  shown as a diff rather than two digests
 #
 # `loom new` writes it, `loom rebase` re-points its base, `loom check` stamps the tip
 # it had reviewed, `loom drop` deletes it, and every security check (and `loom ls`)
 # reads it. Mode 0700/0600.
+#
+#   --accept-config                  accepted by run, check, loop, diff, rebase
+#                                    and land. The repository's LOCAL git config
+#                                    is pinned at `loom new` and re-checked
+#                                    before every model launch, fetch, push,
+#                                    merge, replay and review patch; a change is
+#                                    a refusal, and this flag prints what changed
+#                                    and re-records it as the new baseline. loom
+#                                    itself never writes local config on your
+#                                    behalf, so an agent's `git config user.name`
+#                                    in its worktree WILL trip this. That is the
+#                                    intended shape: .git/config is shared.
 #
 # Anthropic policy: subscription only, on purpose. The architect runs through
 # the `claude` CLI (your Claude Code login). There is no ANTHROPIC_API_KEY
@@ -440,6 +455,12 @@ STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/loom/repos/$STATE_KEY"
 state_file() { # state_file <task>  -> the path of that task's record
   case "$1" in
     ""|.|..|*/*) die "'$1' is not a usable task id (no '/', '.' or '..')" ;;
+    # The pinned git config lives beside the record as `<task>.gitconfig`, so a
+    # task literally called `x.gitconfig` would have its record written over
+    # task `x`'s config sidecar (and read back as one). Refuse the name.
+    *.gitconfig) die "'$1' is not a usable task id: a task's pinned git config is
+recorded beside its operator record as '<task>.gitconfig', so an id ending in
+'.gitconfig' would collide with another task's. Rename the task." ;;
   esac
   printf '%s\n' "$STATE_DIR/tasks/$1"
 }
@@ -459,11 +480,12 @@ state_file() { # state_file <task>  -> the path of that task's record
 # worktree. state_put refuses the value; state_read refuses the file.
 #
 # STATE_KEYS is the allowlist. STATE_ORDER is the order fields are WRITTEN in,
-# and it is not the same list by accident: `reviewed` deliberately precedes the
-# two config-derived fields, so that even a reader which took the first match
-# for a duplicated key would take the honest one.
-STATE_KEYS="base profile branch created origin fetch pushurl reviewed"
-STATE_ORDER="base profile branch created reviewed origin fetch pushurl"
+# and it is not the same list by accident: `reviewed` deliberately precedes
+# every config-derived field — `origin`, `fetch`, `pushurl` and `config`, all
+# four of which are read out of .git/config — so that even a reader which took
+# the first match for a duplicated key would take the honest one.
+STATE_KEYS="base profile branch created origin fetch pushurl config reviewed"
+STATE_ORDER="base profile branch created reviewed origin fetch pushurl config"
 
 # One field of a task's record, or "". A missing record is "" here on purpose:
 # the callers that must refuse it say so themselves, with their own message.
@@ -566,6 +588,18 @@ state_arg() { # state_arg <key> <key>=<value>...
 #                   agent's commits to a host. Recorded as
 #                   `git remote get-url --push origin`, which is the effective
 #                   answer after both.
+#   config=<sha256> the whole of the repository's LOCAL git config, digested.
+#                   `.git/config` is in the shared git directory, so every
+#                   linked worktree can write it, and the keys that matter are
+#                   not ones loom can name in advance: `filter.<d>.clean`,
+#                   `merge.<d>.driver`, `credential.helper`, `core.askPass`,
+#                   `gpg.program`, `pager.<cmd>`, `core.hooksPath`,
+#                   `include.path` / `includeIf.*` all name a PROGRAM (or a
+#                   whole further config file) that git runs in your session.
+#                   Pinning the individual keys is a losing game; pinning the
+#                   config is not. Recomputed and compared before every model
+#                   launch, before a fetch, a push, a merge, a replay and every
+#                   review patch. `--accept-config` is the one escape.
 #   reviewed=<sha>  the branch tip `loom check` last handed to a reviewer.
 #                   `loom land` refuses a tip that is not this one.
 state_put() { # state_put <task> <key>=<value>...
@@ -668,7 +702,193 @@ not $cmd against a remote it cannot vouch for. Put it back, or start clean:
   return 0
 }
 
-state_rm() { rm -f "$(state_file "$1")"; }
+# ------------------------------------------ the repository's LOCAL git config
+# `.git/config` is in the SHARED git directory, so `git -C <worktree> config
+# <anything> <anything>` is one command from inside an agent's tree — and that
+# file is not a preferences file. Keys in it name a PROGRAM git runs, in YOUR
+# session, the next time you type a `loom` command:
+#
+#   core.hooksPath            which hooks run — including in your checkout,
+#                             during `loom land`'s merge
+#   filter.<d>.clean/.smudge  run on checkout, `git add` and commit, selected by
+#   merge.<d>.driver          a tracked .gitattributes (a [hand] path, but the
+#   diff.<d>.textconv         guard is a seatbelt and history is what lands)
+#   credential.helper         `!<shell>` — and it is handed your credentials to
+#                             store, so it harvests as well as executes
+#   core.askPass              the same, for the interactive prompt
+#   gpg.program               under commit.gpgsign
+#   pager.<cmd>               a program for any subcommand, plumbing included
+#   include.path / includeIf.*  a whole further config file of the writer's
+#                             choosing, which brings all of the above with it
+#   core.attributesFile / core.excludesFile
+#
+# $GIT_CONFIG_PARAMETERS pins the keys `loom` can name in advance. It cannot pin
+# these, because for several of them the NAME is the attack (`filter.<anything>`,
+# `pager.<anything>`, `includeIf.<anything>`) — there is no finite list to
+# override. So the whole local config is PINNED instead: `loom new` records a
+# digest of it, plus the full list in a sidecar so a mismatch can be shown as a
+# diff, and every command that runs a model, fetches, pushes, merges, replays or
+# writes a review patch recomputes it and refuses a change.
+#
+# Be exact about what that is and is not:
+#   * it is a CHANGE check. Whatever the config already said at `loom new` is
+#     the baseline and is trusted — see ARCHITECTURE.md § 5 and KNOWN-GAPS 6;
+#   * `loom` never writes local config on your behalf except where it says so
+#     (`loom new`'s own sparse-checkout setup, `loom land --pr`'s
+#     `--set-upstream-to`), and both re-record. Everything else that changes it
+#     is you or an agent — an agent's `git config user.name` in its worktree
+#     trips this, and that is intended, because `git config user.name` and
+#     `git config credential.helper '!sh -c …'` are the same command;
+#   * `--accept-config` is the escape, and it is an operator act with the same
+#     weight as `--fence-profile`: it prints what changed and re-records.
+config_sidecar() { # config_sidecar <task> -> the path of that task's pinned config
+  printf '%s\n' "$(state_file "$1").gitconfig"
+}
+
+# The dump, the digest and the diff. python3 (already required, for zones) so
+# that the NUL-delimited form git writes is handled exactly: `--list --null`
+# emits "<key>\n<value>" per record, NUL-terminated, and a config VALUE may
+# itself contain a newline — which is precisely why the digest is taken over the
+# NUL form and not over the human-readable `--list`.
+config_py() { # config_py digest <dump> | diff <recorded> <dump>
+  python3 - "$@" << 'PY'
+import collections, hashlib, sys
+
+def records(raw):
+    return [r for r in raw.split(b"\0") if r != b""]
+
+def read(path):
+    with open(path, "rb") as fh:
+        return records(fh.read())
+
+def show(rec):
+    key, sep, val = rec.partition(b"\n")
+    out = key.decode("utf-8", "replace")
+    if sep:
+        v = val.decode("utf-8", "replace")
+        v = v.replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t")
+        v = "".join(c if c >= " " and c != "\x7f" else "\\x%02x" % ord(c) for c in v)
+        out += "=" + v
+    return out
+
+mode = sys.argv[1]
+try:
+    if mode == "digest":
+        recs = sorted(read(sys.argv[2]))
+        sys.stdout.write(hashlib.sha256(b"\0".join(recs)).hexdigest())
+    elif mode == "diff":
+        old = collections.Counter(read(sys.argv[2]))
+        new = collections.Counter(read(sys.argv[3]))
+        for r in sorted((old - new).elements()):
+            print("  - " + show(r))
+        for r in sorted((new - old).elements()):
+            print("  + " + show(r))
+    else:
+        sys.stderr.write("loom: internal error: unknown config mode '%s'\n" % mode)
+        raise SystemExit(2)
+except OSError as e:
+    sys.stderr.write("loom: cannot read a recorded git config: %s\n" % e)
+    raise SystemExit(2)
+PY
+}
+
+# The local config as it is NOW, NUL-delimited, in a temp file the caller
+# removes. A NUL stream cannot survive a command substitution, so it goes
+# through a file — the same reason history_paths uses one.
+#
+# `git config --list` exits 1 when it finds nothing, which is indistinguishable
+# from a failure, so neither is treated as fatal here. It stays fail-CLOSED
+# either way: an empty dump at `loom new` and a real one later is a mismatch,
+# and a real one at `loom new` and an empty one later is a mismatch too. Only a
+# git that fails identically at both ends makes the pin inert, and that is a
+# repository in which nothing else works either.
+config_snapshot() { # config_snapshot -> the path of a temp dump
+  local f
+  f="$(mktemp "${TMPDIR:-/tmp}/loom-gitconfig.XXXXXX")" \
+    || die "cannot create a temporary file to read this repository's git config"
+  git config --local --list --null > "$f" 2>/dev/null || true
+  printf '%s\n' "$f"
+}
+
+config_digest_of() { # config_digest_of <dump> -> its sha256
+  local out
+  out="$(config_py digest "$1")" \
+    || die "cannot digest this repository's local git config — refusing to guess what it says"
+  [ -n "$out" ] || die "cannot digest this repository's local git config — refusing to guess what it says"
+  printf '%s\n' "$out"
+}
+
+config_write_sidecar() { # config_write_sidecar <task> <dump>
+  local sc; sc="$(config_sidecar "$1")"
+  ( umask 077; mkdir -p "$STATE_DIR/tasks" ) \
+    || die "cannot create the operator state directory $STATE_DIR/tasks"
+  ( umask 077; cp "$2" "$sc.tmp.$$" ) || die "cannot write the pinned git config $sc"
+  chmod 600 "$sc.tmp.$$" 2>/dev/null || true
+  mv "$sc.tmp.$$" "$sc" || die "cannot write the pinned git config $sc"
+}
+
+# Re-pin: the config as it is NOW becomes task <task>'s baseline. Called by
+# `--accept-config`, by `loom new` once its own worktree setup has run, and by
+# `loom land --pr` after the `--set-upstream-to` it writes itself. Never called
+# from a path an agent reaches.
+config_repin() { # config_repin <task>
+  local f d
+  f="$(config_snapshot)"
+  d="$(config_digest_of "$f")" || { rm -f "$f"; return 1; }
+  config_write_sidecar "$1" "$f"
+  rm -f "$f"
+  state_update "$1" "config=$d"
+}
+
+# The local git config a task was created against must still be the local git
+# config it runs, fetches, pushes, merges and lands against.
+require_recorded_config() { # require_recorded_config <task> <command-name>
+  local task="$1" cmd="$2" rec now f changed
+  rec="$(state_read "$task" config)"
+  [ -n "$rec" ] || die "the operator record for task $task pins no git config.
+That record was written by a loom from before the local config was pinned, so
+there is nothing to compare this repository's .git/config against — and loom
+will not run, fetch, push or merge against a config it cannot vouch for. Start
+clean:
+  loom drop $task && loom new $task"
+  f="$(config_snapshot)"
+  now="$(config_digest_of "$f")"
+  if [ "$rec" = "$now" ]; then rm -f "$f"; return 0; fi
+  changed="$(config_py diff "$(config_sidecar "$task")" "$f" 2>&1)" \
+    || changed="  (the pinned list is unreadable: $(config_sidecar "$task"))"
+  rm -f "$f"
+  if [ -n "$FLAG_ACCEPT_CONFIG" ]; then
+    {
+      echo "loom: --accept-config: this repository's local git config is not the one task"
+      echo "loom: $task was created against. What changed:"
+      printf '%s\n' "$changed"
+      echo "loom: re-recording it as the baseline. loom vouches for none of it — you do."
+    } >&2
+    config_repin "$task" || die "cannot re-record the git config for task $task"
+    return 0
+  fi
+  die "this repository's local git config is not the one task $task was created against:
+$changed
+'.git/config' is in the SHARED git directory, so every linked worktree can write
+it with one command — and its keys are not preferences. core.hooksPath decides
+which hooks run (in YOUR checkout, during a merge); filter.<d>.clean,
+merge.<d>.driver and diff.<d>.textconv are programs run on checkout, 'git add',
+commit and a conflicted merge; credential.helper and core.askPass are programs
+that are ALSO handed your credentials; gpg.program, pager.<cmd> (any subcommand,
+plumbing included) and include.path/includeIf.* are more of the same. loom will
+not $cmd against a config it cannot vouch for.
+If that change is YOURS — or an agent ran 'git config user.name', which loom
+never does for you — re-record it and carry on:
+  loom $cmd $task${FLAG_PROFILE:+ --fence-profile $FLAG_PROFILE} --accept-config
+Otherwise put it back:
+  git config --local --list        # and compare with the '-' lines above
+or start clean:  loom drop $task && loom new $task"
+}
+
+# The record AND its config sidecar: the two are one fact, and a sidecar left
+# behind for a dropped task would be read as the baseline of the NEXT task with
+# that id if `loom new` ever failed between writing the record and writing it.
+state_rm() { rm -f "$(state_file "$1")" "$(config_sidecar "$1")"; }
 
 # ------------------------------------------------------------ worktree roots
 # Two roots, and `loom` must be able to say where each one physically IS before
@@ -1074,6 +1294,16 @@ run_role() { # run_role <role> <workdir> <prompt> [<logfile>]
     if in_task_worktree "$wd"; then
       fence_reconcile "$wd" "$FENCE_PROFILE"
       profile_provider_guard "$role"
+    fi
+    # ... and the same argument for the repository's local git config, which is
+    # in the shared .git and is therefore writable from the worktree attempt 1
+    # just ran in. A `git config filter.x.clean '!sh -c …'` planted by attempt 1
+    # would otherwise be a program running in your session before attempt 2 (or
+    # the operator's next command) — so it is re-read here, per attempt, not
+    # once per command. Not gated on in_task_worktree: the config is the
+    # REPOSITORY's, whatever directory this role runs in.
+    if [ -n "$CONFIG_TASK" ]; then
+      require_recorded_config "$CONFIG_TASK" "$CONFIG_CMD"
     fi
     tried="yes"
     echo "loom: [$role] running on $m (tier $TIER)"
@@ -2097,6 +2327,11 @@ wt_dirty() { # wt_dirty <worktree>   -> the offending `git status --porcelain` l
 # that sha for all of it: the history checks, the review patch, the merge and
 # the push. Whatever a worktree does to the ref afterwards, the command is
 # already talking about a commit.
+# See require_fence_flag: the task whose pinned git config every model launch in
+# this command is judged against, and the command name the refusal names.
+CONFIG_TASK=""
+CONFIG_CMD=""
+
 PINNED_TIP=""
 pin_branch_tip() { # pin_branch_tip <task>   -> sets $PINNED_TIP for this command
   local task="$1" ref; ref="$(branch_ref "$task")"
@@ -2217,16 +2452,21 @@ task_profile_nearmiss() { # task_profile_nearmiss <task>
     | grep -v -i -E '^[[:space:]]*fence-profile:' || true
 }
 
-# --- the flag ---------------------------------------------------------------
-# Pulled out of any command's argv, so every command spells it the same way and
-# an empty value is refused in one place.
-FLAG_PROFILE=""      # what the OPERATOR asserted on this command line
-FLAG_ARGS=()         # argv with --fence-profile removed
+# --- the operator's flags ---------------------------------------------------
+# Pulled out of any command's argv, so every command spells them the same way
+# and an empty value is refused in one place. Two flags, both of them consent
+# the operator gives on THIS command line and nothing infers for them:
+# --fence-profile <name> and --accept-config.
+FLAG_PROFILE=""        # what the OPERATOR asserted on this command line
+FLAG_ACCEPT_CONFIG=""  # ... and whether they re-pinned the local git config
+FLAG_ARGS=()           # argv with both removed
 scan_fence_flag() { # scan_fence_flag "$@"
-  FLAG_PROFILE=""; FLAG_ARGS=()
+  FLAG_PROFILE=""; FLAG_ACCEPT_CONFIG=""; FLAG_ARGS=()
   local seen=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      --accept-config)
+        FLAG_ACCEPT_CONFIG=yes; shift ;;
       --fence-profile|--fence-profile=*)
         [ -z "$seen" ] || die "--fence-profile given twice"
         if [ "$1" = --fence-profile ]; then
@@ -2248,6 +2488,12 @@ scan_fence_flag() { # scan_fence_flag "$@"
 require_fence_flag() { # require_fence_flag <task> <command-name>
   local task="$1" cmd="$2" rec="" flag="$FLAG_PROFILE" br
   br="$(branch_of "$task")"
+  # Which task's pinned git config `run_role` checks before each launch, and
+  # what to call the command in the refusal. Every command that runs a role in
+  # a task worktree comes through here first; the task-less roles (`loom plan`'s
+  # architect, `loom scout`) leave it empty and are not checked, because they
+  # have no record to check against.
+  CONFIG_TASK="$task"; CONFIG_CMD="$cmd"
   # The record is read half a dozen times below and downstream, almost always
   # from inside `$(…)` — where a die exits the subshell and hands the caller ""
   # instead. Judge its shape once, here, as a plain statement, so that a forged
@@ -2337,6 +2583,11 @@ cmd_new() {
     esac
   done
   [ -n "$task" ] || die "usage: loom new <task-id> [--fence-profile <name>]"
+  # `loom new` RECORDS the config; there is nothing yet to accept. Silently
+  # swallowing the flag here would read as "the config was re-pinned", which is
+  # the one thing it must not read as.
+  [ -z "$FLAG_ACCEPT_CONFIG" ] || die "loom new: --accept-config re-records a config that has already been pinned, and
+this command is the one that pins it. Drop the flag."
   local wt br
   # wt_path follows $FLAG_PROFILE, so this is the profiled root when a profile
   # was asserted and the unprofiled one otherwise. Set it before either check.
@@ -2415,6 +2666,15 @@ fenced paths into this worktree. Confirm it on the command line:
   require_one_line "'remote.origin.url'" "$neworigin"
   require_one_line "'remote.origin.fetch'" "$newfetch"
   require_one_line "the push URL of 'origin'" "$newpushurl"
+  # The whole local config, digested. It is written with the rest of the record
+  # — while the tree is still empty — and re-pinned once more at the end of this
+  # command, because `loom`'s OWN worktree setup writes to it: the first
+  # `git sparse-checkout init` in a repository adds `extensions.worktreeConfig`
+  # to the shared .git/config (measured, git 2.34). An interrupt in between
+  # leaves the earlier digest, which is a refusal, not a pass.
+  local newcfgdump newconfig
+  newcfgdump="$(config_snapshot)"
+  newconfig="$(config_digest_of "$newcfgdump")"
   NEW_WT="$wt"
   # $NEW_BR before the add, on purpose: the add CREATES the branch and can then
   # fail on the path, and the check above observed that this branch did not
@@ -2430,7 +2690,9 @@ fenced paths into this worktree. Confirm it on the command line:
   state_put "$task" "base=$newbase" "profile=$prof" "branch=$br" \
             "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             "origin=$neworigin" "fetch=$newfetch" "pushurl=$newpushurl" \
-            "reviewed="
+            "config=$newconfig" "reviewed="
+  config_write_sidecar "$task" "$newcfgdump"
+  rm -f "$newcfgdump"
   if has_fence; then
     fence_apply "$wt"
     git -C "$wt" checkout >&2
@@ -2438,6 +2700,8 @@ fenced paths into this worktree. Confirm it on the command line:
   else
     git -C "$wt" checkout >&2
   fi
+  # Re-pin, now that this command's own writes to .git/config have happened.
+  config_repin "$task" || die "cannot pin this repository's git config for task $task"
   NEW_WT=""; NEW_BR=""; NEW_STATE=""
   trap - EXIT INT TERM
   echo "$wt"
@@ -2531,6 +2795,11 @@ cmd_check() {
   pin_branch_tip "$task"
   base="$(security_base "$task")"
   fence_reconcile_history "$task" "$base" "$FENCE_PROFILE"
+  # BEFORE the patch, for the same reason the history check is: writing it runs
+  # `git diff` in this repository, and a `diff.<d>.textconv` or a
+  # `filter.<d>.clean` named by a config planted since `loom new` is a program
+  # that runs while it is written. (run_role checks again before the reviewer.)
+  require_recorded_config "$task" check
   # One base, one endpoint, and neither is read from the worktree: the patch
   # handed to the reviewer is exactly the range the history check just cleared,
   # cut against the SHA that range was cleared for.
@@ -2596,6 +2865,11 @@ cmd_loop() {
   # stays where there is a history to check — inside the loop, before each
   # review, below.
   require_record "$task"
+  # cmd_run and cmd_check are reached through `||` and `$( )` below, where a die
+  # of theirs surfaces as "the implementer never reached a green gate". The
+  # config pin is checked here as a plain statement so the refusal is the loop's
+  # own, with its own message. (Both of them check again, per launch.)
+  require_recorded_config "$task" loop
 
   implement() { # one implementer pass, with cmd_run's exit codes named
     local rc=0
@@ -2663,6 +2937,7 @@ cmd_diff() {
   pin_branch_tip "$task"
   base="$(security_base "$task")"
   fence_reconcile_history "$task" "$base" "$FENCE_PROFILE"
+  require_recorded_config "$task" diff       # same reason as `loom check`
   patch="$wt/.agents/reviews/$task.patch"
   reviews_dir "$wt"
   git -C "$ROOT" diff --no-ext-diff --no-textconv "$base" "$PINNED_TIP" > "$patch" \
@@ -2750,6 +3025,12 @@ Landing would publish commits nobody read. Re-run the review, then land:
   if [ "$mode" = pr ]; then
     git remote get-url origin >/dev/null 2>&1 || die "no 'origin' remote — PR-mode landing needs one"
     require_recorded_origin "$task" "push"
+    # AFTER the remote check, so that a re-aimed URL/refspec/push-url is still
+    # named as the remote setting it is (that is the clearer message), and
+    # BEFORE the push, which is the one transport in this system that publishes
+    # an agent's commits — and which reads `credential.helper` and
+    # `core.askPass`, both of which are programs AND are handed the credential.
+    require_recorded_config "$task" land
     # The SHA, pushed INTO the branch's ref name. Pushing the name would publish
     # whatever the ref says at push time, which is not necessarily what the gate
     # ran on and the reviewer read.
@@ -2761,7 +3042,12 @@ Landing would publish commits nobody read. Re-run the review, then land:
     # program on the far side of a push.
     git push --receive-pack=git-receive-pack origin "$PINNED_TIP:refs/heads/$br" \
       || die "push of $PINNED_TIP to origin/$br failed — nothing was published"
+    # loom's own write to .git/config (branch.<br>.remote / .merge). Re-pinned so
+    # that a later command for this task does not refuse on a change loom made
+    # itself — everything this command checks has already passed, and the push
+    # has already happened.
     git branch --set-upstream-to="origin/$br" "$br" >/dev/null 2>&1 || true
+    config_repin "$task" || true
     title="$(head -1 "$AGENTS_DIR/tasks/$task.md" 2>/dev/null | sed 's/^#[[:space:]]*//')"
     [ -n "$title" ] || title="$task"
     echo ""
@@ -2774,6 +3060,11 @@ Landing would publish commits nobody read. Re-run the review, then land:
     return 0
   fi
 
+  # The last thing before the merge, which runs IN YOUR CHECKOUT: a merge picks
+  # up `core.hooksPath` (pre-merge-commit, commit-msg, post-merge),
+  # `merge.<d>.driver` on a conflict and `gpg.program` under commit.gpgsign, and
+  # every one of those is a program named by the shared .git/config.
+  require_recorded_config "$task" land
   # The pinned SHA, not the branch name: between the checks above and this line
   # the ref is one `git update-ref` from saying something else.
   git merge --no-ff "$PINNED_TIP" -m "land($task)"
@@ -2927,6 +3218,10 @@ $(printf '%s\n' "$dirty" | sed 's/^/  /')"
   # The remote a rebase replays onto must be the remote this task was created
   # against. Checked BEFORE the fetch, so a re-aimed URL is never contacted.
   require_recorded_origin "$task" "rebase"
+  # AFTER the remote check (the remote settings get their own clearer message)
+  # and BEFORE the fetch: a fetch reads `credential.helper` / `core.askPass`,
+  # and `remote.<n>.uploadpack` is a program on the far side.
+  require_recorded_config "$task" rebase
   old_pid="$(git show --no-ext-diff --no-textconv "$old_base" | git patch-id --stable | cut -d' ' -f1)"
   # A failed fetch used to be swallowed. It must not be: the whole point of the
   # fetch is that `$upstream` is current, and replaying onto a stale ref moves
@@ -2959,6 +3254,11 @@ fetched. Fix the fetch (network, credentials, the remote URL) and re-run."
     echo "loom: refs/remotes/*, never refs/heads/*), so it is exactly as current as your" >&2
     echo "loom: own last pull of it." >&2
   fi
+  # Again, immediately before the replay. The fetch is a network round trip with
+  # a worktree standing next to it, and a rebase runs checkout and commit for
+  # every replayed commit — `filter.<d>.clean`/`.smudge`, `merge.<d>.driver` on
+  # a conflict, and whatever `core.hooksPath` points at.
+  require_recorded_config "$task" rebase
   # $up_ref, not $upstream, and $(branch_ref "$task"), not $br: every one of
   # these five reads is a REF LOOKUP, and both names resolve through the
   # ambiguous order described where $up_ref is set. `agent/<task>` has the same

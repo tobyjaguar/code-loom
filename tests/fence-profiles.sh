@@ -469,7 +469,15 @@ echo "benign" > "$WTU/0010-m/backend/m.txt"
 git -C "$WTU/0010-m" add backend/m.txt
 git -C "$WTU/0010-m" commit -qm "benign work"
 git -C "$WTU/0010-m" config branch.agent/0010-m.fenceprofile codex   # the agent forges it
+# Writing branch config is writing the SHARED .git/config, so the config pin
+# sees it and refuses before anything else looks at it. That is the pin's point,
+# not this case's — `--accept-config` is the operator saying "I have read that
+# line", and what this case asserts is what happens next: nothing. The forged
+# record is not read in either direction.
 out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0010-m 2>&1)"; rc=$?
+want_eq "(m) the config pin refuses a branch record planted from the worktree" "$rc" "1"
+want_in "(m) ... naming the key that appeared"                 "$out" "branch.agent/0010-m.fenceprofile"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0010-m --accept-config 2>&1)"; rc=$?
 want_eq "(m) a forged branch record is not read at all"        "$rc" "0"
 want_not_in "(m) ... so it cannot demand a flag"               "$out" "--fence-profile codex"
 want_absent "(m) ... and nothing was released into the worktree" "$WTU/0010-m/core/lib.rs"
@@ -856,13 +864,22 @@ echo "visible" > "$AFW/backend/af-visible.txt"
 git -C "$AFW" add backend/af-visible.txt
 git -C "$AFW" commit -qm "the commit it wants reviewed"
 git -C "$AFW" config "branch.agent/0026-af.loombase" "$af_hide"          # the agent
+# The planted key is a change to the shared .git/config, so the config pin stops
+# the command and names it — which is the pin's job, not this case's.
 out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0026-af 2>&1)"; rc=$?
+want_eq "(af) the config pin sees the planted branch record" "$rc" "1"
+want_in "(af) ... naming it as a config change"           "$out" "branch.agent/0026-af.loombase"
+# ... and with it re-pinned, the key still does nothing at all: the base is the
+# operator record, so the commit the agent wanted hidden is in the patch anyway.
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0026-af --accept-config 2>&1)"; rc=$?
 want_eq "(af) the check still succeeds"                   "$rc" "0"
 want_not_in "(af) ... with no clamp to warn about"        "$out" "ahead of the"
-want_not_in "(af) ... because branch config is not read"  "$out" "loombase"
 patch_af="$(cat "$AFW/.agents/reviews/0026-af.patch" 2>/dev/null || true)"
 want_in "(af) the review diff shows the hidden commit"    "$patch_af" "af-hidden.txt"
 want_in "(af) ... and the one it wanted reviewed"         "$patch_af" "af-visible.txt"
+want_eq "(af) ... because the base is the record, not branch config" \
+        "$(git diff --name-only "$(state_field 0026-af base)" agent/0026-af | tr '\n' ' ')" \
+        "backend/af-hidden.txt backend/af-visible.txt "
 
 # --- (ag) a symlink standing where the profiled root should be ------------
 # "$WT_ROOT-profiled" is a sibling of the unprofiled root BY NAME. An agent
@@ -1153,7 +1170,13 @@ want_eq   "(ar) ... and the branch"                       "$(state_field 0040-ar
 # the agent plants a branch record. It is not read in either direction: it can
 # neither widen the fence nor refuse an honest command.
 git -C "$WTP/0040-ar" config branch.agent/0040-ar.fenceprofile audit
+# Planting it is a write to the shared .git/config: the pin refuses, and
+# --accept-config is the operator reading the line. What this case asserts is
+# what the key does afterwards — nothing.
 out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0040-ar --fence-profile codex 2>&1)"; rc=$?
+want_eq "(ar) the config pin refuses the planted branch record" "$rc" "1"
+want_in "(ar) ... naming the key"                         "$out" "branch.agent/0040-ar.fenceprofile"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0040-ar --fence-profile codex --accept-config 2>&1)"; rc=$?
 want_eq "(ar) a planted branch record has no effect"      "$rc" "0"
 want_not_in "(ar) ... it is not read at all"              "$out" "contradicts"
 # the record itself, removed: the flag alone still cannot introduce a profile
@@ -1925,7 +1948,16 @@ cat > .agents/gate.sh << 'GATE'
 exit 0
 GATE
 chmod +x .agents/gate.sh
+# Planting those four keys IS the change the config pin exists for, so the pin
+# refuses first and names them. This case is about what happens once the
+# operator has read them and re-pinned: every one of those programs must still
+# be inert, because GIT_CONFIG_PARAMETERS and the spelled-out flags do not
+# depend on the config being unchanged.
 out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0064-bi 2>&1)"; rc=$?
+want_eq "(bi) the config pin refuses the planted keys"    "$rc" "1"
+want_in "(bi) ... naming one of them"                     "$out" "core.fsmonitor="
+want_absent "(bi) ... before any of them could run"       "$TMP/bi-fsmonitor-ran"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0064-bi --accept-config 2>&1)"; rc=$?
 want_eq "(bi) loom check still succeeds"                  "$rc" "0"
 out="$("$LOOM" diff 0064-bi 2>&1)"; rc=$?
 want_eq "(bi) loom diff still succeeds"                   "$rc" "0"
