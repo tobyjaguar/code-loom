@@ -345,6 +345,13 @@ part of the branch that still changes your runs:
   derived, never taken from the environment or `loom.env`. Every `git worktree
   add` re-resolves its parent immediately before, and the created worktree
   immediately after.
+  **The verdict is lazy, and deliberately so.** Only the commands that put a
+  worktree under a root, read one, or name one to git ask for it
+  (`require_roots`); `loom help`, `zone`, `tier`, `guard`, `install-hooks`,
+  `plan` and `pin-config` never go near a root and survive one loom cannot
+  verify — which matters most for `guard`, because that is what your own
+  pre-commit hook runs on `main`. `loom doctor` runs the check in a subshell and
+  REPORTS it as one FAIL line, then finishes its report.
 - **"Which fenced paths are present" is asked of the disk**, not just of `git
   ls-files`, so an untracked `core/copy.rs` — `git show HEAD:core/lib.rs >
   core/copy.rs` never touches the index — is a dead stop instead of an
@@ -373,8 +380,45 @@ part of the branch that still changes your runs:
   no `zones.toml` at the base, or anything unreadable: every pattern counts as
   pre-existing and the refusal stands.
 - **The history is refused in `check`, `diff`, `loop`, `rebase` and `land`**
-  when the branch's commits touch a fenced path, and `land` refuses a `[hand]`
-  path in those commits too. `--force` skips the gate, not this.
+  when the branch's commits touch a fenced path — and `check`, `diff`, `loop`
+  and `land` all refuse a `[hand]` path in those commits too, not `land` alone.
+  `--force` skips the gate, not this.
+- **`loom run` refuses a `[hand]` edit at the COMMIT**, by itself, between its
+  `git add -A` and `git commit` and whether or not the pre-commit hook is
+  installed — `loom install-hooks` is a separate step, so in a fresh clone there
+  was no guard at all and an implementer's edit to `.agents/gate.sh` was
+  committed, reviewed without comment, and only refused at `land`. Both that
+  check and the hook read `git diff --cached --no-renames`, so a `git mv` out of
+  the zone is judged on BOTH sides: with git's default rename detection the
+  destination is the only path reported, and the `[hand]` path leaving the zone
+  was invisible.
+- **The gate runs without your provider keys.** A gate that calls `make`,
+  `cargo test` or `go test` executes the repository's build, which is what the
+  agent has been editing; it used to inherit your whole environment (56
+  variables, `ZHIPU_API_KEY` among them). Both gate sites go through `run_gate`,
+  which `env -u`s every exported name matching `*api_key*`, `*token*`,
+  `*secret*`, `*password*`, `*auth*`, `*credential*`, `*access_key*`,
+  `*key_id*` or a provider prefix (`aws_`, `anthropic_`, `openai_`, …),
+  case-insensitively. It is `env -u`, never `env -i`: PATH, HOME, GOPATH and
+  the rest of a toolchain survive. It is a NAME-SHAPE filter and nothing more —
+  a credential in a variable those patterns do not describe, or in a file the
+  gate can read, still reaches it.
+- **A tracked symlink that points out of the tree is a doorway the fence cannot
+  close**, so mode-120000 entries are judged on their own: in the worktree's
+  INDEX (`fence_reconcile`, on every command) and in the tree at the pinned tip
+  (`check`, `diff`, `loop`, `rebase`, `land`). Targets are read as TEXT and
+  never followed on disk — under a fence half the tree is not checked out — but
+  they are resolved **within the tree's own link map**, so a two-hop chain
+  (`d1/d2/l1 -> ../..` plus `backend/loot -> ../d1/d2/l1/../../repo/core`, each
+  "inside" on its own) is caught, and a chain that cycles or runs past 40 hops
+  is refused as unresolvable rather than guessed at. What is JUDGED is what this
+  branch ADDED or CHANGED relative to its recorded base: a link your trunk
+  already carried is not the branch's doing and loom cannot rewrite your trunk,
+  so those are **fenced out** of every worktree loom builds (an exact path in
+  the sparse rules, verified absent, released by no profile) and warned about at
+  `loom new`, `loom attach` and `loom doctor` instead. They stay in the
+  resolution map either way, so a chain THROUGH an inherited link is still
+  caught.
 - **opencode's grant narrowed** from the whole worktree root to the role's own
   worktree, and opencode now reads *your* `.opencode/opencode.json`
   (`OPENCODE_CONFIG`/`OPENCODE_CONFIG_DIR`) with

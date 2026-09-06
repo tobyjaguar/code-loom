@@ -314,6 +314,28 @@ ln -s /tmp/elsewhere/blocked.md <worktree>/.agents/reviews/<some-task>-blocked.m
 loom run <some-task> --fence-profile codex        # must die naming the symlink,
                                                 # never "implementer reported
                                                 # blocked"
+
+# A COMMITTED symlink out of the tree is the other class, and it is judged by
+# what THIS BRANCH added. A chain counts: each hop can look "inside" on its own.
+( cd <worktree> && mkdir -p d1/d2 && ln -s ../.. d1/d2/l1 \
+  && ln -s ../d1/d2/l1/../../<your repo dir>/core backend/loot \
+  && git add -A && git commit -m "chain" )
+loom check <some-task>                            # must die naming backend/loot
+                                                # AND where it resolves to
+```
+
+**If your trunk already carries one.** `ln -s /etc/hostname backend/hostname`
+committed on `main` before any of this is not your branch's doing, and loom will
+not refuse your whole repository over it: `loom new` and `loom attach` print one
+WARN, `loom doctor` a warn line, and the exact path is excluded from every
+worktree loom builds (added to the sparse rules, released by no profile,
+verified absent). It is a **residual, not a fix** — the link is still in your
+trunk and in every clone of it, and anything that is not loom reads straight
+through it. Remove it. To check what you have:
+
+```bash
+git ls-files -s | awk '$1 == "120000"'            # every tracked symlink
+loom doctor | grep 'trunk symlink'                # the ones that leave the tree
 ```
 
 **Where the artifacts loom acts on actually live.** The patch, the review and

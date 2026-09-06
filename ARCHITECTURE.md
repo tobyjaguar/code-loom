@@ -717,6 +717,18 @@ Semantics:
   is not a promise, every `git worktree add` re-resolves the parent of the path
   it is about to create against this command's root, and re-resolves the
   worktree afterwards.
+
+  **The normalisation is at file scope; the VERDICT is not.** All of the above
+  lives in `require_roots`, called at the top of every function that puts a
+  worktree under a root, reads one, or names one to git — and by nothing else.
+  `loom help`, `zone`, `tier`, `guard`, `install-hooks`, `plan` and `pin-config`
+  never touch a root and go on working under one loom cannot verify; that
+  matters most for `guard`, which is what the operator's own pre-commit hook
+  runs on `main`, where a die means their `git commit` fails. `loom doctor` runs
+  it in a subshell and reports what it says as ONE FAIL line — one, because the
+  `die` inside `resolve_root` ends only the command substitution, so each
+  resolve is followed by an `exit` rather than being allowed to carry on with an
+  empty root and die a second time about something it invented.
 - **opencode reads the operator's config.** opencode resolves its project
   config from the cwd, which is the agent's worktree:
   `<worktree>/.opencode/opencode.json` is a tracked file the agent can rewrite,
@@ -773,6 +785,55 @@ Semantics:
   branch that does both between two commands is invisible to this check. And a
   diff says nothing about what was *read* — that is caveat 1's exfiltration
   class, and no check of this shape reaches it.
+- **A tracked symlink out of the tree is judged as well, on both legs.** A
+  symlink is a MODE, not a file: `ln -s ../../core backend/allofit` at an assist
+  path is a legal commit, and `create mode 120000` then makes `core/` readable
+  through it in every worktree built from that branch, fence or no fence — the
+  fence removes PATHS and cannot remove a doorway to one. So mode-120000 entries
+  are checked in the worktree's INDEX (`fence_reconcile`, so on every command)
+  and in the tree at `$PINNED_TIP` (`check`, `diff`, `loop`, `rebase`, `land`).
+  Targets are read as TEXT and nothing is followed on disk — under a fence half
+  the tree is not checked out, so `realpath` has nothing to resolve — but the
+  text is resolved **within the tree's own link map**: every mode-120000 entry
+  of the subject, walked component by component over a stack rooted at the tree
+  root, substituting any component (a prefix of the walked path included) that
+  is itself a link. One link's text is not enough — `d1/d2/l1 -> ../..` and
+  `backend/loot -> ../d1/d2/l1/../../repo/core` are each "inside" and compose
+  into the operator's own checkout. A chain that cycles, or runs past 40 hops,
+  is refused as unresolvable rather than guessed at.
+
+  **What is JUDGED is what the branch added or changed.** An entry whose path
+  and target match the recorded base is the TRUNK's, and loom cannot rewrite the
+  consumer's trunk — refusing every command over one made such a repository
+  permanently unusable, with `loom drop` + `loom new` no help at all. Those are
+  **fenced out** instead: their exact paths are appended to the sparse rules
+  after the profile-filtered patterns (so no profile releases them), verified
+  absent on disk by `fence_verify`, and warned about once at `loom new`, `loom
+  attach` and `loom doctor`. They remain in the resolution MAP, so a chain
+  through an inherited link is caught like any other; with no base, or one that
+  cannot be read, nothing is inherited and every entry is judged.
+- **`loom run` applies the `[hand]` rule at its own commit.** `loom
+  install-hooks` is a separate step, so a fresh clone has no pre-commit guard —
+  and there `loom run` committed an implementer's edit to `.agents/gate.sh`,
+  `loom check` handed the reviewer a diff of it without comment, and only `loom
+  land` refused. `hand_reconcile_staged` runs between `git add -A` and the
+  commit, with the same zones and the same release exemption as the guard. Both
+  it and `cmd_guard` read `git diff --cached --no-renames`, the spelling
+  `history_paths` already used: with git's default rename detection a `git mv`
+  out of `[hand]` reports only the DESTINATION, so the path leaving the zone was
+  invisible to both.
+- **The gate runs without the operator's provider keys.** The gate SCRIPT is the
+  operator's copy, but what it RUNS is the repository's build — which is what
+  the agent has been editing — and it used to inherit the operator's whole
+  environment (56 variables, `ZHIPU_API_KEY` among them). Both call sites go
+  through `run_gate`, which builds an `env -u` list from `compgen -e` and drops
+  every exported name matching `*api_key*`, `*token*`, `*secret*`, `*password*`,
+  `*auth*`, `*credential*`, `*access_key*`, `*key_id*` or a provider prefix,
+  case-insensitively (`nocasematch`, set inside the matching subshell and
+  nowhere else). Never `env -i`: a build needs PATH, HOME, GOPATH, CARGO_HOME
+  and a dozen more. It is a NAME-SHAPE filter and nothing more — a credential
+  under a name those patterns do not describe, or in a file the gate can read,
+  still reaches it (KNOWN-GAPS § 3).
 - **One base, and it is the operator's — kept outside the repo.** `<base>`
   above is `security_base <task>`: the commit `$ROOT` was checked out at when
   `loom new` created the task, read from the **operator record**
@@ -1034,7 +1095,9 @@ Semantics:
   process that can set that variable can point the lookup at a record of its
   own. That is not a hole to plug so much as the shape of the thing — the whole
   hook is dominated by `--no-verify`, which needs no environment at all.
-  `loom land`'s checks are the lock; this is the seatbelt. It is
+  `loom check`, `loom diff`, `loom loop` and `loom land` all run the `[hand]`
+  history check, and `loom run` applies the same rule at its own commit; those
+  are the lock, and this is the seatbelt. It is
   therefore allowed to read the operator record for the released set — it runs
   as the same OS user, and resolves the same state directory from inside the
   worktree — and it checks that record against the tree before trusting it: a
