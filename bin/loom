@@ -650,14 +650,22 @@ state_update() { # state_update <task> <key>=<value>...
 # against the recorded value is what refuses.
 origin_url() { git remote get-url origin 2>/dev/null || true; }
 
-# `remote.origin.fetch` as git answers it NOW: every value, joined by a space,
-# or "" when there is no origin. Multi-valued config is ordinary (a second
-# refspec for tags, say), and the values are read NUL-delimited so that a
-# newline INSIDE one is preserved into the joined string rather than flattened
-# into the join — require_one_line is what has to see it.
+# `remote.origin.fetch` as git answers it NOW, or "" when there is no origin.
+# Multi-valued config is ordinary (a second refspec for tags, say), and the
+# values are read NUL-delimited so that a newline INSIDE one is preserved into
+# the joined string rather than flattened into the join — require_one_line is
+# what has to see it.
+#
+# Each value is written `<length>:<value>`, and the join is a space. A plain
+# space-join is not INJECTIVE: the two-value list ["a", "b c"] and the two-value
+# list ["a b", "c"] both flatten to "a b c", so one could be swapped for the
+# other under a comparison that is supposed to refuse exactly that. The record
+# is one line per field (a NUL cannot go in it — require_one_line refuses every
+# control character), so length-prefixing is the shape that fits: a reader takes
+# the count, then that many characters, then expects a space or the end.
 origin_fetch() {
   local v out=""
-  while IFS= read -r -d '' v; do out="${out:+$out }$v"; done \
+  while IFS= read -r -d '' v; do out="${out:+$out }${#v}:$v"; done \
     < <(git config --get-all --null remote.origin.fetch 2>/dev/null || true)
   printf '%s' "$out"
 }

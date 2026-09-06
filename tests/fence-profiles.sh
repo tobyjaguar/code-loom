@@ -135,6 +135,9 @@ cd "$REPO" || exit 1
 REPO_REAL="$(pwd -P)"
 STATE="$XDG_CONFIG_HOME/loom/repos/$(printf '%s' "$REPO_REAL" | python3 -c 'import hashlib,sys; sys.stdout.write(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
 state_of()    { printf '%s\n' "$STATE/tasks/$1"; }
+# How `loom` records ONE remote.origin.fetch refspec: length-prefixed, because a
+# plain space-join of a multi-valued setting is not injective.
+fetchrec()    { printf '%s:%s' "${#1}" "$1"; }
 state_field() { sed -n "s/^$2=//p" "$STATE/tasks/$1" 2>/dev/null | head -1; }
 git init -q .
 # The trunk is `main` on purpose: the round-4 cases move `refs/heads/main` and
@@ -1556,7 +1559,7 @@ git push -q origin main
 out="$("$LOOM" new 0057-ba 2>&1)"; rc=$?
 want_eq "(ba) setup: a task cut against a real origin"    "$rc" "0"
 want_eq "(ba) ... with the refspec in the operator record" \
-        "$(state_field 0057-ba fetch)" "+refs/heads/*:refs/remotes/origin/*"
+        "$(state_field 0057-ba fetch)" "$(fetchrec '+refs/heads/*:refs/remotes/origin/*')"
 BAW="$WTU/0057-ba"
 echo "benign" > "$BAW/backend/ba.txt"
 git -C "$BAW" add backend/ba.txt
@@ -1582,7 +1585,7 @@ want_eq "(ba) ... nor did the branch"                     "$(git rev-parse agent
 out="$("$LOOM" new 0061-ba2 2>&1)"; rc=$?
 want_eq "(ba) setup: a task created while the refspec IS the decoy" "$rc" "0"
 want_eq "(ba) ... so the record pins the decoy, and nothing refuses it" \
-        "$(state_field 0061-ba2 fetch)" "+refs/heads/*:refs/remotes/decoy/*"
+        "$(state_field 0061-ba2 fetch)" "$(fetchrec '+refs/heads/*:refs/remotes/decoy/*')"
 BA2W="$WTU/0061-ba2"
 echo "benign" > "$BA2W/backend/ba2.txt"
 git -C "$BA2W" add backend/ba2.txt
