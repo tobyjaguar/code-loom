@@ -69,25 +69,40 @@
 #                                  created=<iso> reviewed=<sha> origin=<url>
 #                                  fetch=<remote.origin.fetch>
 #                                  pushurl=<the push URL of origin>
-#                                  config=<sha256 of the repo's LOCAL git config>
-#       tasks/<task>.gitconfig     that config in full, so a mismatch can be
-#                                  shown as a diff rather than two digests
+#                                  config=<sha256 of the repo's git config: the
+#                                  local scope, BOTH worktree scopes, and every
+#                                  file their include.path/includeIf pull in>
+#       tasks/<task>.gitconfig     that config in full — one NUL-terminated
+#                                  record per entry, each tagged with the scope
+#                                  it came from (local: / worktree-main: /
+#                                  worktree-task:) plus one
+#                                  `include:<path>:<sha256>` line per included
+#                                  file — so a mismatch can be shown as a diff
+#                                  rather than two digests
 #
 # `loom new` writes it, `loom rebase` re-points its base, `loom check` stamps the tip
 # it had reviewed, `loom drop` deletes it, and every security check (and `loom ls`)
 # reads it. Mode 0700/0600.
 #
 #   --accept-config                  accepted by run, check, loop, diff, rebase
-#                                    and land. The repository's LOCAL git config
-#                                    is pinned at `loom new` and re-checked
+#                                    and land; REFUSED by `new`, which is the
+#                                    command that pins and so has nothing to
+#                                    accept. The repository's git config — the
+#                                    local scope, both worktree scopes and the
+#                                    include closure — is pinned at `loom new`
+#                                    and re-checked BEFORE the first fence
+#                                    operation of every command, and again
 #                                    before every model launch, fetch, push,
 #                                    merge, replay and review patch; a change is
 #                                    a refusal, and this flag prints what changed
 #                                    and re-records it as the new baseline. loom
-#                                    itself never writes local config on your
-#                                    behalf, so an agent's `git config user.name`
-#                                    in its worktree WILL trip this. That is the
-#                                    intended shape: .git/config is shared.
+#                                    itself never writes config on your behalf
+#                                    beyond its own sparse-checkout setup and
+#                                    `land --pr`'s upstream, so an agent's
+#                                    `git config user.name` in its worktree WILL
+#                                    trip this. That is the intended shape:
+#                                    .git/config is shared. `loom drop` does not
+#                                    check it — see the pin's own comment.
 #
 # Anthropic policy: subscription only, on purpose. The architect runs through
 # the `claude` CLI (your Claude Code login). There is no ANTHROPIC_API_KEY
@@ -137,6 +152,15 @@ _common="$(git rev-parse --git-common-dir 2>/dev/null)" || {
 ROOT="$(cd "$(dirname "$_common")" 2>/dev/null && pwd -P)" || {
   echo "loom: cannot resolve this repository's main checkout — refusing to guess where
 the zones, the fence and the operator record live" >&2; exit 1; }
+# The SHARED git directory itself, absolute. It is where the config FILES that
+# the pin reads live: `$GITCOMMON/config` (the `--local` scope) and
+# `$GITCOMMON/config.worktree` (the `--worktree` scope of the MAIN checkout,
+# read whenever `extensions.worktreeConfig` is on — which loom's own
+# `git sparse-checkout init` turns on). A linked worktree's own
+# `config.worktree` lives under `$GITCOMMON/worktrees/<name>/`, and is reached
+# through `git -C <worktree>` rather than by spelling that path out.
+GITCOMMON="$(cd "$(dirname "$_common")" 2>/dev/null && pwd -P)/$(basename "$_common")" || {
+  echo "loom: cannot resolve this repository's shared git directory" >&2; exit 1; }
 unset _common
 cd "$ROOT"
 # The repo's PHYSICAL path, for comparing against the worktree roots below.
@@ -334,8 +358,11 @@ unset _v _g_i _g_was _g_val GIT_SNAP GIT_HOOK_VARS
 # remote, branch, worktree, ls-files, show-ref, merge-base, rev-list,
 # update-ref, add, commit, checkout, reset, diff, log, show, ls-remote,
 # symbolic-ref, sparse-checkout and patch-id all ran the planted pager; only
-# `rev-parse` and `config` did not. So a `pager.update-ref=<script>` planted
-# from a worktree is a program run in your session by a plumbing command.
+# `rev-parse` did not. `git config` splits: `config --get` does NOT page, but
+# `config --list` DOES (measured in a pty, git 2.34.1) — which is the form the
+# config pin reads with, so `pager.config=cat` below is load-bearing rather than
+# belt-and-braces. Either way a `pager.update-ref=<script>` planted from a
+# worktree is a program run in your session by a plumbing command.
 #
 # Both levers are used, and they are not redundant:
 #   * $GIT_PAGER=cat below is the COMPLETE one — it beats pager.<cmd> for every
@@ -710,7 +737,7 @@ not $cmd against a remote it cannot vouch for. Put it back, or start clean:
   return 0
 }
 
-# ------------------------------------------ the repository's LOCAL git config
+# ----------------------------------------------- the repository's git config
 # `.git/config` is in the SHARED git directory, so `git -C <worktree> config
 # <anything> <anything>` is one command from inside an agent's tree — and that
 # file is not a preferences file. Keys in it name a PROGRAM git runs, in YOUR
@@ -733,22 +760,48 @@ not $cmd against a remote it cannot vouch for. Put it back, or start clean:
 # $GIT_CONFIG_PARAMETERS pins the keys `loom` can name in advance. It cannot pin
 # these, because for several of them the NAME is the attack (`filter.<anything>`,
 # `pager.<anything>`, `includeIf.<anything>`) — there is no finite list to
-# override. So the whole local config is PINNED instead: `loom new` records a
-# digest of it, plus the full list in a sidecar so a mismatch can be shown as a
-# diff, and every command that runs a model, fetches, pushes, merges, replays or
+# override. So the whole config is PINNED instead: `loom new` records a digest
+# of it, plus the full list in a sidecar so a mismatch can be shown as a diff,
+# and every command that runs a model, fetches, pushes, merges, replays or
 # writes a review patch recomputes it and refuses a change.
+#
+# "The whole config" is THREE SCOPES and an INCLUDE CLOSURE, because
+# `git config --local --list` is not the whole of what git reads:
+#
+#   local          `.git/config`, shared by every worktree.
+#   worktree-main  `$GIT_COMMON_DIR/config.worktree` — the MAIN checkout's own
+#                  scope. A `core.hooksPath` there runs YOUR hooks, in YOUR
+#                  checkout, during `loom land`'s merge.
+#   worktree-task  `$GIT_COMMON_DIR/worktrees/<wt>/config.worktree` — the task
+#                  worktree's own scope, one `git config --worktree <k> <v>`
+#                  away from inside the agent's tree.
+#   include        every file an `include.path` / `includeIf.<cond>.path` in any
+#                  of those three pulls in, recursively, digested by its raw
+#                  bytes. `--list` prints those directives as POINTERS and never
+#                  the keys they bring, so pinning the listing alone pins the
+#                  pointer and nothing behind it.
+#
+# The two worktree scopes are live whenever `extensions.worktreeConfig` is on —
+# which loom's own `git sparse-checkout init` turns on (measured, git 2.34) —
+# and NEITHER shows up in `git config --local --list`.
 #
 # Be exact about what that is and is not:
 #   * it is a CHANGE check. Whatever the config already said at `loom new` is
 #     the baseline and is trusted — see ARCHITECTURE.md § 5 and KNOWN-GAPS 6;
-#   * `loom` never writes local config on your behalf except where it says so
-#     (`loom new`'s own sparse-checkout setup, `loom land --pr`'s
-#     `--set-upstream-to`), and both re-record. Everything else that changes it
-#     is you or an agent — an agent's `git config user.name` in its worktree
-#     trips this, and that is intended, because `git config user.name` and
-#     `git config credential.helper '!sh -c …'` are the same command;
+#   * `loom` never writes config on your behalf except where it says so
+#     (`loom new`'s own sparse-checkout setup, which writes `core.sparseCheckout`
+#     at worktree scope and `extensions.worktreeConfig` at local scope, and
+#     `loom land --pr`'s `--set-upstream-to`), and both re-record. Everything
+#     else that changes it is you or an agent — an agent's `git config user.name`
+#     in its worktree trips this, and that is intended, because
+#     `git config user.name` and `git config credential.helper '!sh -c …'` are
+#     the same command;
 #   * `--accept-config` is the escape, and it is an operator act with the same
 #     weight as `--fence-profile`: it prints what changed and re-records.
+#   * `loom drop` deliberately does NOT check it: dropping a task removes the
+#     worktree, the branch and the record, runs no model and publishes nothing,
+#     so refusing to clean up a repository because its config moved would leave
+#     the released paths on disk — the opposite of what the check is for.
 config_sidecar() { # config_sidecar <task> -> the path of that task's pinned config
   printf '%s\n' "$(state_file "$1").gitconfig"
 }
@@ -758,9 +811,31 @@ config_sidecar() { # config_sidecar <task> -> the path of that task's pinned con
 # emits "<key>\n<value>" per record, NUL-terminated, and a config VALUE may
 # itself contain a newline — which is precisely why the digest is taken over the
 # NUL form and not over the human-readable `--list`.
+#
+# A record in a loom dump is one of two shapes, and both are NUL-terminated:
+#
+#   <scope>:<key>\n<value>      one config entry, tagged with the SCOPE it was
+#                               read from — `local`, `worktree-main` or
+#                               `worktree-task` (see config_snapshot). The tag
+#                               is what lets a refusal say WHICH file gained the
+#                               key, which is not a detail: the three live in
+#                               three different files with three different
+#                               writers.
+#   include:<path>:<sha256>     one file pulled into the config by an
+#                               `include.path` / `includeIf.<cond>.path`
+#                               directive, digested. `<sha256>` is `(missing)`
+#                               when the target does not exist — recorded as
+#                               such, because "the include target appeared" is
+#                               exactly as much of a change as "its contents
+#                               changed".
 config_py() { # config_py digest <dump> | diff <recorded> <dump>
+              #         | snapshot <out> <dump> <file> <dump> <file> <dump> <file>
+              #         | summary <dump>
   python3 - "$@" << 'PY'
-import collections, hashlib, sys
+import collections, hashlib, os, subprocess, sys
+
+# The order is the order the sidecar is written in, and the order a diff names.
+SCOPES = ("local", "worktree-main", "worktree-task")
 
 def records(raw):
     return [r for r in raw.split(b"\0") if r != b""]
@@ -771,12 +846,92 @@ def read(path):
 
 def show(rec):
     key, sep, val = rec.partition(b"\n")
-    out = key.decode("utf-8", "replace")
+    k = key.decode("utf-8", "replace")
+    # An include record is one flat line and carries no value half.
+    if k.startswith("include:") and not sep:
+        return k
+    scope = ""
+    for s in SCOPES:
+        if k.startswith(s + ":"):
+            scope, k = s, k[len(s) + 1:]
+            break
+    out = k
     if sep:
         v = val.decode("utf-8", "replace")
         v = v.replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t")
         v = "".join(c if c >= " " and c != "\x7f" else "\\x%02x" % ord(c) for c in v)
         out += "=" + v
+    # AFTER the key=value, deliberately: a reader (and a test) looking for the
+    # key it planted finds "+ <key>=" where it always did, and the scope is the
+    # extra fact rather than a prefix that moves it.
+    if scope:
+        out += "   [%s]" % scope
+    return out
+
+# --- the include closure ---------------------------------------------------
+# `git config --list` prints `include.path=<file>` and
+# `includeIf.<cond>.path=<file>` as POINTERS — the keys of the included file do
+# not appear in the `--local` / `--worktree` listings at all (measured, git
+# 2.34.1: `git config --local --list` shows the pointer, `git config --list`
+# shows the pulled-in `core.hookspath`). So digesting the listings alone pins
+# the pointer and nothing it points at, and an agent who plants one benign
+# include once can edit the TARGET afterwards for free.
+#
+# The closure is therefore walked here: every pointer in the three config files,
+# resolved (relative to the directory of the file that names it, `~` expanded),
+# digested by its raw bytes, and followed recursively — an included file may
+# include another. A cycle terminates on the visited set.
+def include_values(recs):
+    out = []
+    for r in recs:
+        key, sep, val = r.partition(b"\n")
+        k = key.decode("utf-8", "replace").lower()
+        if k == "include.path" or (k.startswith("includeif.") and k.endswith(".path")):
+            out.append(val.decode("utf-8", "surrogateescape") if sep else "")
+    return out
+
+def resolve(base_dir, value):
+    p = os.path.expanduser(value)
+    if not os.path.isabs(p):
+        p = os.path.join(base_dir, p)
+    return os.path.normpath(p)
+
+def file_records(path):
+    # `git config --file <f> --list` does NOT expand that file's own includes
+    # (measured), which is what makes the recursion ours and deterministic.
+    try:
+        r = subprocess.run(["git", "config", "--file", path, "--list", "--null"],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+    if r.returncode != 0:
+        return None
+    return records(r.stdout)
+
+def closure(seeds):
+    # seeds: [(directory of the file that named it, the raw value)]
+    out, seen, queue = [], set(), list(seeds)
+    while queue:
+        base, value = queue.pop(0)
+        if value == "":
+            continue
+        path = resolve(base, value)
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            out.append(("include:%s:(missing)" % path).encode("utf-8", "surrogateescape"))
+            continue
+        out.append(("include:%s:%s" % (path, hashlib.sha256(raw).hexdigest()))
+                   .encode("utf-8", "surrogateescape"))
+        sub = file_records(path)
+        if sub is None:            # git cannot parse it, so git honours no
+            continue               # include of its either; the digest above
+        for v in include_values(sub):          # is the whole of the check
+            queue.append((os.path.dirname(path), v))
     return out
 
 mode = sys.argv[1]
@@ -791,6 +946,43 @@ try:
             print("  - " + show(r))
         for r in sorted((new - old).elements()):
             print("  + " + show(r))
+    elif mode == "snapshot":
+        out_path = sys.argv[2]
+        tagged, seeds = [], []
+        for i, scope in enumerate(SCOPES):
+            dump = sys.argv[3 + i * 2]
+            cfg = sys.argv[4 + i * 2]
+            recs = read(dump)
+            for r in recs:
+                tagged.append(scope.encode() + b":" + r)
+            # The pointers are read out of the SCOPE's listing, and resolved
+            # against the directory of the file that scope is; an empty path
+            # means loom could not name a file for that scope (no task
+            # worktree yet), so there is nothing to resolve against.
+            if cfg:
+                base = os.path.dirname(os.path.abspath(cfg))
+                for v in include_values(recs):
+                    seeds.append((base, v))
+        tagged.extend(closure(seeds))
+        with open(out_path, "wb") as fh:
+            for r in tagged:
+                fh.write(r)
+                fh.write(b"\0")
+    elif mode == "summary":
+        n_local = n_wt = 0
+        targets = []
+        for r in read(sys.argv[2]):
+            k = r.partition(b"\n")[0].decode("utf-8", "replace")
+            if k.startswith("include:") and b"\n" not in r:
+                targets.append(k[len("include:"):].rsplit(":", 1)[0])
+            elif k.startswith("local:"):
+                n_local += 1
+            elif k.startswith("worktree-main:") or k.startswith("worktree-task:"):
+                n_wt += 1
+        print(n_local)
+        print(n_wt)
+        for t in targets:
+            print(t)
     else:
         sys.stderr.write("loom: internal error: unknown config mode '%s'\n" % mode)
         raise SystemExit(2)
@@ -800,22 +992,70 @@ except OSError as e:
 PY
 }
 
-# The local config as it is NOW, NUL-delimited, in a temp file the caller
-# removes. A NUL stream cannot survive a command substitution, so it goes
+# The repository's git config as it is NOW, NUL-delimited, in a temp file the
+# caller removes. A NUL stream cannot survive a command substitution, so it goes
 # through a file — the same reason history_paths uses one.
 #
-# `git config --list` exits 1 when it finds nothing, which is indistinguishable
-# from a failure, so neither is treated as fatal here. It stays fail-CLOSED
-# either way: an empty dump at `loom new` and a real one later is a mismatch,
-# and a real one at `loom new` and an empty one later is a mismatch too. Only a
-# git that fails identically at both ends makes the pin inert, and that is a
-# repository in which nothing else works either.
-config_snapshot() { # config_snapshot -> the path of a temp dump
-  local f
+# THREE scopes, not one, because git reads three files and a linked worktree can
+# write two of them:
+#
+#   local          $GITCOMMON/config — `.git/config`, shared by every worktree.
+#   worktree-main  $GITCOMMON/config.worktree — the MAIN checkout's own scope.
+#   worktree-task  $GITCOMMON/worktrees/<wt>/config.worktree — the task
+#                  worktree's own scope, read through `git -C <worktree>`.
+#
+# The last two are live whenever `extensions.worktreeConfig` is on, and loom
+# turns it on itself: the first `git sparse-checkout init` in a repository adds
+# it (measured, git 2.34). `git config --local --list` NEVER shows a key from
+# either of them, and a `core.hooksPath` in the MAIN checkout's `config.worktree`
+# is honoured for every command run in your checkout — a merge included. So all
+# three are read, and each entry is tagged with the scope it came from.
+#
+# The only key loom itself writes at worktree scope is `core.sparseCheckout`
+# (via `fence_apply`'s `sparse-checkout init`), and `loom new` re-pins after
+# that has run, exactly as it re-pins the local scope after the same command
+# adds `extensions.worktreeConfig`.
+#
+# `git config --list` exits 1 when it finds nothing, and `--worktree --list`
+# exits 128 when the scope's file does not exist at all — both are
+# indistinguishable from a failure, so neither is treated as fatal here. It
+# stays fail-CLOSED either way: an empty dump at `loom new` and a real one later
+# is a mismatch, and a real one at `loom new` and an empty one later is a
+# mismatch too. Only a git that fails identically at both ends makes the pin
+# inert, and that is a repository in which nothing else works either.
+config_snapshot() { # config_snapshot [<task-worktree>] -> the path of a temp dump
+  local wt="${1:-}" f d taskgd=""
   f="$(mktemp "${TMPDIR:-/tmp}/loom-gitconfig.XXXXXX")" \
     || die "cannot create a temporary file to read this repository's git config"
-  git config --local --list --null > "$f" 2>/dev/null || true
+  d="$(mktemp -d "${TMPDIR:-/tmp}/loom-gitconfig-scopes.XXXXXX")" \
+    || die "cannot create a temporary directory to read this repository's git config"
+  git -C "$ROOT" config --local    --list --null > "$d/local"         2>/dev/null || true
+  git -C "$ROOT" config --worktree --list --null > "$d/worktree-main" 2>/dev/null || true
+  : > "$d/worktree-task"
+  if [ -n "$wt" ] && [ -d "$wt" ]; then
+    git -C "$wt" config --worktree --list --null > "$d/worktree-task" 2>/dev/null || true
+    # Where that worktree's own config.worktree lives, asked of git rather than
+    # spelled out: the directory name under worktrees/ is git's, not the task's.
+    taskgd="$(git -C "$wt" rev-parse --git-dir 2>/dev/null || true)"
+    case "$taskgd" in ""|/*) ;; *) taskgd="$wt/$taskgd" ;; esac
+  fi
+  config_py snapshot "$f" \
+    "$d/local"         "$GITCOMMON/config" \
+    "$d/worktree-main" "$GITCOMMON/config.worktree" \
+    "$d/worktree-task" "${taskgd:+$taskgd/config.worktree}" \
+    || { rm -rf "$d"; die "cannot read this repository's git config — refusing to guess what it says"; }
+  rm -rf "$d"
   printf '%s\n' "$f"
+}
+
+# The task worktree whose worktree-scope config belongs in this task's pin, or
+# "" when it does not exist yet (`loom new`'s first pin, before the add) or at
+# all. wt_path follows the profile flag, which is the same answer every other
+# command in this file gets.
+config_wt() { # config_wt <task>
+  local wt; wt="$(wt_path "$1")"
+  [ -d "$wt" ] || return 0
+  printf '%s\n' "$wt"
 }
 
 config_digest_of() { # config_digest_of <dump> -> its sha256
@@ -835,31 +1075,52 @@ config_write_sidecar() { # config_write_sidecar <task> <dump>
   mv "$sc.tmp.$$" "$sc" || die "cannot write the pinned git config $sc"
 }
 
+# What was pinned, said out loud, once, at `loom new`. The counts are there so
+# that "loom pinned nothing" is visible rather than silent, and the WARN is
+# there because an include is the one entry in a config that is not itself the
+# thing being pinned: it names a file somewhere else, whose bytes are now part
+# of this task's baseline and whose next edit is a refusal. The operator should
+# know that file exists before they meet the refusal.
+config_summary() { # config_summary <dump>
+  local out n m targets
+  out="$(config_py summary "$1" 2>/dev/null)" || return 0
+  n="$(printf '%s\n' "$out" | sed -n 1p)"
+  m="$(printf '%s\n' "$out" | sed -n 2p)"
+  echo "loom: pinned ${n:-0} local + ${m:-0} worktree config entries" >&2
+  targets="$(printf '%s\n' "$out" | sed -n '3,$p')"
+  [ -n "$targets" ] || return 0
+  echo "loom: WARN: this repository's git config pulls in other files (include.path /" >&2
+  echo "loom: WARN: includeIf.<cond>.path). Their bytes are pinned to this task too, so" >&2
+  echo "loom: WARN: an edit to one is a refusal — and an included file can carry every" >&2
+  echo "loom: WARN: key .git/config can, core.hooksPath and credential.helper included:" >&2
+  printf '%s\n' "$targets" | sed 's|^|loom: WARN:   |' >&2
+}
+
 # Re-pin: the config as it is NOW becomes task <task>'s baseline. Called by
 # `--accept-config`, by `loom new` once its own worktree setup has run, and by
 # `loom land --pr` after the `--set-upstream-to` it writes itself. Never called
 # from a path an agent reaches.
 config_repin() { # config_repin <task>
   local f d
-  f="$(config_snapshot)"
+  f="$(config_snapshot "$(config_wt "$1")")"
   d="$(config_digest_of "$f")" || { rm -f "$f"; return 1; }
   config_write_sidecar "$1" "$f"
   rm -f "$f"
   state_update "$1" "config=$d"
 }
 
-# The local git config a task was created against must still be the local git
-# config it runs, fetches, pushes, merges and lands against.
+# The git config a task was created against — all three scopes and the include
+# closure — must still be the git config it runs, fetches, pushes, merges and
+# lands against.
 require_recorded_config() { # require_recorded_config <task> <command-name>
   local task="$1" cmd="$2" rec now f changed
   rec="$(state_read "$task" config)"
   [ -n "$rec" ] || die "the operator record for task $task pins no git config.
-That record was written by a loom from before the local config was pinned, so
-there is nothing to compare this repository's .git/config against — and loom
-will not run, fetch, push or merge against a config it cannot vouch for. Start
-clean:
+That record was written by a loom from before the git config was pinned, so
+there is nothing to compare this repository's config against — and loom will not
+run, fetch, push or merge against a config it cannot vouch for. Start clean:
   loom drop $task && loom new $task"
-  f="$(config_snapshot)"
+  f="$(config_snapshot "$(config_wt "$task")")"
   now="$(config_digest_of "$f")"
   if [ "$rec" = "$now" ]; then rm -f "$f"; return 0; fi
   changed="$(config_py diff "$(config_sidecar "$task")" "$f" 2>&1)" \
@@ -867,7 +1128,7 @@ clean:
   rm -f "$f"
   if [ -n "$FLAG_ACCEPT_CONFIG" ]; then
     {
-      echo "loom: --accept-config: this repository's local git config is not the one task"
+      echo "loom: --accept-config: this repository's git config is not the one task"
       echo "loom: $task was created against. What changed:"
       printf '%s\n' "$changed"
       echo "loom: re-recording it as the baseline. loom vouches for none of it — you do."
@@ -875,21 +1136,29 @@ clean:
     config_repin "$task" || die "cannot re-record the git config for task $task"
     return 0
   fi
-  die "this repository's local git config is not the one task $task was created against:
+  die "this repository's git config is not the one task $task was created against:
 $changed
-'.git/config' is in the SHARED git directory, so every linked worktree can write
-it with one command — and its keys are not preferences. core.hooksPath decides
-which hooks run (in YOUR checkout, during a merge); filter.<d>.clean,
-merge.<d>.driver and diff.<d>.textconv are programs run on checkout, 'git add',
-commit and a conflicted merge; credential.helper and core.askPass are programs
-that are ALSO handed your credentials; gpg.program, pager.<cmd> (any subcommand,
-plumbing included) and include.path/includeIf.* are more of the same. loom will
-not $cmd against a config it cannot vouch for.
+Each line names the SCOPE it came from. '.git/config' ([local]) is in the SHARED
+git directory, so every linked worktree can write it with one command;
+'.git/config.worktree' ([worktree-main]) is the MAIN checkout's own scope, and
+'.git/worktrees/<wt>/config.worktree' ([worktree-task]) is the agent worktree's,
+one 'git config --worktree' away from inside it. An 'include:<path>:<sha256>'
+line is a file the config PULLS IN — '--list' shows those directives as pointers
+and never the keys behind them, so the target's bytes are pinned too.
+None of these keys are preferences. core.hooksPath decides which hooks run (in
+YOUR checkout, during a merge); filter.<d>.clean, merge.<d>.driver and
+diff.<d>.textconv are programs run on checkout, 'git add', commit and a
+conflicted merge; credential.helper and core.askPass are programs that are ALSO
+handed your credentials; gpg.program, pager.<cmd> (any subcommand, plumbing
+included) and include.path/includeIf.* are more of the same. loom will not $cmd
+against a config it cannot vouch for.
 If that change is YOURS — or an agent ran 'git config user.name', which loom
 never does for you — re-record it and carry on:
   loom $cmd $task${FLAG_PROFILE:+ --fence-profile $FLAG_PROFILE} --accept-config
 Otherwise put it back:
-  git config --local --list        # and compare with the '-' lines above
+  git config --local --list                    # the [local] lines
+  git config --worktree --list                 # the [worktree-main] lines
+  git -C <the task worktree> config --worktree --list   # the [worktree-task] ones
 or start clean:  loom drop $task && loom new $task"
 }
 
@@ -1303,13 +1572,13 @@ run_role() { # run_role <role> <workdir> <prompt> [<logfile>]
       fence_reconcile "$wd" "$FENCE_PROFILE"
       profile_provider_guard "$role"
     fi
-    # ... and the same argument for the repository's local git config, which is
-    # in the shared .git and is therefore writable from the worktree attempt 1
-    # just ran in. A `git config filter.x.clean '!sh -c …'` planted by attempt 1
-    # would otherwise be a program running in your session before attempt 2 (or
-    # the operator's next command) — so it is re-read here, per attempt, not
-    # once per command. Not gated on in_task_worktree: the config is the
-    # REPOSITORY's, whatever directory this role runs in.
+    # ... and the same argument for the repository's git config, which is in the
+    # shared .git and in the worktree's own config.worktree, both writable from
+    # the tree attempt 1 just ran in. A `git config filter.x.clean '!sh -c …'`
+    # planted by attempt 1 would otherwise be a program running in your session
+    # before attempt 2 (or the operator's next command) — so it is re-read here,
+    # per attempt, not once per command. Not gated on in_task_worktree: the
+    # config is the REPOSITORY's, whatever directory this role runs in.
     if [ -n "$CONFIG_TASK" ]; then
       require_recorded_config "$CONFIG_TASK" "$CONFIG_CMD"
     fi
@@ -2674,14 +2943,17 @@ fenced paths into this worktree. Confirm it on the command line:
   require_one_line "'remote.origin.url'" "$neworigin"
   require_one_line "'remote.origin.fetch'" "$newfetch"
   require_one_line "the push URL of 'origin'" "$newpushurl"
-  # The whole local config, digested. It is written with the rest of the record
-  # — while the tree is still empty — and re-pinned once more at the end of this
-  # command, because `loom`'s OWN worktree setup writes to it: the first
-  # `git sparse-checkout init` in a repository adds `extensions.worktreeConfig`
-  # to the shared .git/config (measured, git 2.34). An interrupt in between
-  # leaves the earlier digest, which is a refusal, not a pass.
+  # The whole git config — all three scopes and the include closure — digested.
+  # It is written with the rest of the record (while the tree is still empty,
+  # so the worktree-task scope is empty here) and re-pinned once more at the end
+  # of this command, because `loom`'s OWN worktree setup writes to it in TWO
+  # scopes: the first `git sparse-checkout init` in a repository adds
+  # `extensions.worktreeConfig` to the shared .git/config, and the same command
+  # writes `core.sparseCheckout` into the new worktree's own config.worktree
+  # (measured, git 2.34). An interrupt in between leaves the earlier digest,
+  # which is a refusal, not a pass.
   local newcfgdump newconfig
-  newcfgdump="$(config_snapshot)"
+  newcfgdump="$(config_snapshot "$(config_wt "$task")")"
   newconfig="$(config_digest_of "$newcfgdump")"
   NEW_WT="$wt"
   # $NEW_BR before the add, on purpose: the add CREATES the branch and can then
@@ -2708,8 +2980,13 @@ fenced paths into this worktree. Confirm it on the command line:
   else
     git -C "$wt" checkout >&2
   fi
-  # Re-pin, now that this command's own writes to .git/config have happened.
+  # Re-pin, now that this command's own writes to the config have happened — in
+  # BOTH scopes: `extensions.worktreeConfig` in the shared .git/config, and
+  # `core.sparseCheckout` in the new worktree's own config.worktree.
   config_repin "$task" || die "cannot pin this repository's git config for task $task"
+  # `loom new` is the command that pins, so it is the command that says what it
+  # pinned. Every later command only ever compares against this.
+  config_summary "$(config_sidecar "$task")"
   NEW_WT=""; NEW_BR=""; NEW_STATE=""
   trap - EXIT INT TERM
   echo "$wt"
