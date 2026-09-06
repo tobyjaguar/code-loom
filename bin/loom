@@ -4252,8 +4252,18 @@ cmd_pin_config() {
   done
   [ -z "$FLAG_PROFILE" ] || die "loom pin-config: --fence-profile means nothing here. This command records the
 REPOSITORY's git config baseline, which is not a task's and not a worktree's."
-  repo_config_read > /dev/null            # a malformed baseline dies here
-  rec="$(repo_config_read)"
+  # A baseline that is not one loom wrote is a dead stop everywhere else — but
+  # not here, and the exception is the whole reason this command exists. Its own
+  # refusal names `loom pin-config --accept-config` as the way out, so that
+  # command has to BE a way out: with the flag, an unreadable baseline is simply
+  # overwritten, which is exactly what the operator asked for. Without it, the
+  # dead stop stands.
+  if [ -n "$FLAG_ACCEPT_CONFIG" ]; then
+    rec="$( repo_config_read 2>/dev/null || true )"
+  else
+    repo_config_read > /dev/null          # a malformed baseline dies here
+    rec="$(repo_config_read)"
+  fi
   f="$(config_snapshot)"; cfg_track "$f"
   now="$(config_digest_of "$f")"
   if [ -n "$rec" ] && [ "$rec" = "$now" ]; then
