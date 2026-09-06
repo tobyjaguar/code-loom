@@ -51,6 +51,12 @@ printf '%s\n' "$@" >> "${LOOM_TEST_TMP:?}/called-claude.log"
 # to the next model in the chain with the widened tree already on disk.
 if [ -n "${LOOM_TEST_RELAX_SPARSE:-}" ]; then
   git sparse-checkout disable > /dev/null 2>&1 || true
+  # ... and put loom's own bookkeeping back. `sparse-checkout disable` empties
+  # the worktree's own config.worktree, which is a SCOPE the config pin covers,
+  # so without this the pin would refuse attempt 2 before the fence reconciler
+  # ever looked at the tree — and (x) is the case about the reconciler. The
+  # TREE stays widened either way; only the config bookkeeping is restored.
+  git config --worktree core.sparseCheckout true > /dev/null 2>&1 || true
   echo "429 rate limit exceeded"
   exit 1
 fi
@@ -209,7 +215,8 @@ for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p \
          0050-loom 0051-ax 0052-ax2 0053-au3 \
          0054-az 0055-az2 0056-az3 0057-ba 0058-bb 0059-bc 0060-bd 0061-ba2 0062-bf \
          0063-bh 0064-bi 0065-bj \
-         0066-bk 0067-bk2 0068-bk3 0069-bk4 0070-bl 0071-bl2; do mk_task "$t"; done
+         0066-bk 0067-bk2 0068-bk3 0069-bk4 0070-bl 0071-bl2 \
+         0072-bm 0073-bn 0074-bo; do mk_task "$t"; done
 mk_task 0040-ar  codex
 mk_task 0042-as  codex
 mk_task 0005-f codex
@@ -438,7 +445,11 @@ want_file "(k) setup: it holds the released path"         "$WTP/0008-k/core/lib.
 rm -f "$(state_of 0008-k)"                       # the record is lost
 out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0008-k 2>&1)"; rc=$?
 want_eq "(k) without the flag, a released tree is refused"   "$rc" "1"
-want_in "(k) ... naming the paths it found on disk"          "$out" "core/lib.rs"
+# The record is the first thing the command asks for now — the config pin runs
+# before the first fence operation, and a task with no record pins no config —
+# so the refusal names the missing record rather than the tree it would have
+# gone on to inspect. Same dead stop, one step earlier.
+want_in "(k) ... on the record it no longer has"             "$out" "no operator record for task 0008-k"
 want_not_in "(k) ... and no reviewer was launched"           "$out" "running on"
 out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0008-k --fence-profile codex 2>&1)"; rc=$?
 want_eq "(k) with the flag and no record it STILL dies"       "$rc" "1"
@@ -818,7 +829,15 @@ ADW="$WTU/0024-ad"
 taint 0024-ad "$ADW"
 git -C "$ADW" config "branch.agent/0024-ad.loombase" "$(git -C "$ADW" rev-parse HEAD)"  # the agent
 rm -f "$ADW/.agents/reviews/0024-ad.patch"
+# Planting the key is itself a write to the shared .git/config, so the config
+# pin — which runs before the first fence operation — stops the command and
+# names it. That is the pin's job, not this case's; --accept-config is the
+# operator reading the line, and what this case asserts is what the key does
+# afterwards: nothing.
 out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0024-ad 2>&1)"; rc=$?
+want_eq "(ad) the config pin sees the planted loombase"   "$rc" "1"
+want_in "(ad) ... naming it as a config change"           "$out" "branch.agent/0024-ad.loombase"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0024-ad --accept-config 2>&1)"; rc=$?
 want_eq "(ad) a loombase at HEAD does not empty the check" "$rc" "1"
 want_eq "(ad) ... and the recorded base is untouched by it" \
         "$(state_field 0024-ad base)" "$(git rev-parse "agent/0024-ad~1")"
@@ -846,7 +865,12 @@ AEW="$WTU/0025-ae2"
 taint 0025-ae2 "$AEW"
 git config "branch.agent/0025-ae2.loombase" "0000000000000000000000000000000000000000"
 rm -f "$AEW/.agents/reviews/0025-ae2.patch"
+# Same two steps as (ad): planting the key trips the config pin first, and
+# --accept-config is what gets past it to the fact under test.
 out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0025-ae2 2>&1)"; rc=$?
+want_eq "(ae) the config pin sees the planted loombase"   "$rc" "1"
+want_in "(ae) ... naming it as a config change"           "$out" "branch.agent/0025-ae2.loombase"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0025-ae2 --accept-config 2>&1)"; rc=$?
 want_eq "(ae) an unresolvable loombase still dies"        "$rc" "1"
 want_in "(ae) ... naming the fenced path, not a git error" "$out" "core/lib.rs"
 want_absent "(ae) ... and NO patch was written"           "$AEW/.agents/reviews/0025-ae2.patch"
@@ -926,7 +950,10 @@ want_eq "(ai) ... and no branch was created"              "$(sha_of agent/0029-a
 # way that fact can be asserted from here: a loom.env naming the tainted tip
 # changes nothing, and the fenced path is still caught.
 printf 'LOOM_BASE_REF=%s\n' "$(git -C "$WTU/0016-v" rev-parse HEAD)" > .agents/loom.env
-out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0016-v 2>&1)"; rc=$?
+# --accept-config because the branch-config keys (ad) and (ae) planted are
+# still in the shared .git/config, and task 0016-v's own pin refuses them
+# before it looks at anything else. The fact under test is the next one.
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0016-v --accept-config 2>&1)"; rc=$?
 rm -f .agents/loom.env
 want_eq "(ai) loom.env cannot move the base"              "$rc" "1"
 want_in "(ai) ... and the fenced path is still caught"    "$out" "core/lib.rs"
@@ -2224,6 +2251,223 @@ want_not_in "(bl) ... and git never had to pick here either" "$out" "is ambiguou
 git update-ref -d refs/tags/main 2>/dev/null || true
 "$LOOM" drop 0071-bl2 > /dev/null 2>&1 || true
 git remote remove origin
+
+# ==========================================================================
+# ROUND-9 fixes. Every case below FAILS against the pre-fix bin/loom (428c664).
+#
+# The theme: `git config --local --list` is not the whole of what git reads.
+# Two entire SCOPES sit outside it — the MAIN checkout's `config.worktree` and
+# each linked worktree's own — and an `include.path` in any of them is a
+# POINTER whose target the listings never show. And the pin was read one line
+# too late: `fence_apply` updates the working tree, and a working-tree update
+# runs smudge filters.
+# ==========================================================================
+
+# --- (bm) the WORKTREE scopes are pinned too -----------------------------
+# git reads `$GIT_COMMON_DIR/config.worktree` (the MAIN checkout's own scope)
+# and `$GIT_COMMON_DIR/worktrees/<wt>/config.worktree` (each linked worktree's)
+# whenever `extensions.worktreeConfig` is enabled — which loom's own
+# `git sparse-checkout init` enables, on the first `loom new` in a repository.
+# `git config --local --list` never shows a key from either. So every key the
+# pin exists for is settable from inside the agent's tree with one
+# `git config --worktree`, invisibly to the old pin — and a `core.hooksPath` in
+# the MAIN scope runs in YOUR checkout, during `loom land`'s merge.
+git init -q --bare "$TMP/origin-bm.git"
+git remote add origin "$TMP/origin-bm.git"
+git push -q origin main
+mkdir -p "$TMP/bm-hooks"
+cat > "$TMP/bm-hooks/pre-commit" << HOOK
+#!/usr/bin/env bash
+: > "$TMP/bm-hook-ran"
+exit 0
+HOOK
+cat > "$TMP/bm-prog.sh" << PROG
+#!/usr/bin/env bash
+: > "$TMP/bm-prog-ran"
+exit 0
+PROG
+chmod +x "$TMP/bm-hooks/pre-commit" "$TMP/bm-prog.sh"
+out="$("$LOOM" new 0072-bm 2>&1)"; rc=$?
+want_eq "(bm) setup: a task against a real origin"        "$rc" "0"
+want_in "(bm) ... and loom new says what it pinned"       "$out" "loom: pinned "
+want_in "(bm) ... counting the worktree scopes of it"     "$out" "worktree config entries"
+BMW="$WTU/0072-bm"
+echo "benign" > "$BMW/backend/bm.txt"
+git -C "$BMW" add backend/bm.txt
+git -C "$BMW" commit -qm "benign work on bm"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0072-bm 2>&1)"; rc=$?
+want_eq "(bm) setup: it is reviewed"                      "$rc" "0"
+# 1. core.hooksPath, set at --worktree scope from inside the agent's worktree.
+#    `loom run` commits when the gate is green, so the hook is one step away.
+git -C "$BMW" config --worktree core.hooksPath "$TMP/bm-hooks"
+bm_claude_before="$(wc -l < "$TMP/called-claude.log" 2>/dev/null || echo 0)"
+out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 "$LOOM" run 0072-bm 2>&1)"; rc=$?
+want_eq     "(bm) loom run refuses a core.hooksPath set at --worktree scope" "$rc" "1"
+want_in     "(bm) ... naming the key"                     "$out" "+ core.hookspath="
+want_in     "(bm) ... and the scope it appeared in"       "$out" "[worktree-task]"
+want_absent "(bm) ... before the add/commit, so the hook never ran" "$TMP/bm-hook-ran"
+want_not_in "(bm) ... and before the model, not after"    "$out" "running on"
+want_eq     "(bm) ... so none was launched" \
+            "$(wc -l < "$TMP/called-claude.log" 2>/dev/null || echo 0)" "$bm_claude_before"
+git -C "$BMW" config --worktree --unset core.hooksPath
+# 2. credential.helper, the same way: refused before the transport that would
+#    hand it your credential.
+git -C "$BMW" config --worktree credential.helper "!$TMP/bm-prog.sh"
+out="$("$LOOM" land 0072-bm --pr 2>&1)"; rc=$?
+want_eq     "(bm) land --pr refuses a credential.helper at --worktree scope" "$rc" "1"
+want_in     "(bm) ... naming it"                          "$out" "+ credential.helper="
+want_in     "(bm) ... in the worktree's own scope"        "$out" "[worktree-task]"
+want_absent "(bm) ... refused before any transport"       "$TMP/bm-prog-ran"
+want_eq     "(bm) ... and origin received nothing" \
+            "$(git -C "$TMP/origin-bm.git" rev-parse --verify --quiet refs/heads/agent/0072-bm || echo GONE)" "GONE"
+git -C "$BMW" config --worktree --unset credential.helper
+# 3. a filter driver AND the attributes file that selects it, both at
+#    --worktree scope: the pair that makes `git add` run a program.
+printf '* filter=bmf\n' > "$TMP/bm-attrs"
+git -C "$BMW" config --worktree filter.bmf.clean       "$TMP/bm-prog.sh"
+git -C "$BMW" config --worktree core.attributesFile    "$TMP/bm-attrs"
+out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 "$LOOM" run 0072-bm 2>&1)"; rc=$?
+want_eq     "(bm) loom run refuses a filter driver at --worktree scope" "$rc" "1"
+want_in     "(bm) ... naming the driver"                  "$out" "+ filter.bmf.clean="
+want_in     "(bm) ... and the attributes file that selects it" "$out" "+ core.attributesfile="
+want_absent "(bm) ... and the filter never ran"           "$TMP/bm-prog-ran"
+want_not_in "(bm) ... before the model, not after"        "$out" "running on"
+git -C "$BMW" config --worktree --unset filter.bmf.clean
+git -C "$BMW" config --worktree --unset core.attributesFile
+# 4. (bi)'s and (bk)'s plants, re-run at --worktree scope. Every one of them
+#    was invisible to a pin taken over `git config --local --list`.
+git -C "$BMW" config --worktree core.fsmonitor "$TMP/bm-prog.sh"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0072-bm 2>&1)"; rc=$?
+want_eq     "(bm) loom check refuses a core.fsmonitor at --worktree scope" "$rc" "1"
+want_in     "(bm) ... naming it"                          "$out" "+ core.fsmonitor="
+want_absent "(bm) ... which never ran"                    "$TMP/bm-prog-ran"
+git -C "$BMW" config --worktree --unset core.fsmonitor
+git -C "$BMW" config --worktree core.askPass "$TMP/bm-prog.sh"
+out="$("$LOOM" land 0072-bm --pr 2>&1)"; rc=$?
+want_eq     "(bm) land --pr refuses a core.askPass at --worktree scope" "$rc" "1"
+want_in     "(bm) ... naming it"                          "$out" "+ core.askpass="
+want_absent "(bm) ... which never ran either"             "$TMP/bm-prog-ran"
+git -C "$BMW" config --worktree --unset core.askPass
+git -C "$BMW" config --worktree diff.external "$TMP/bm-prog.sh"
+out="$("$LOOM" diff 0072-bm 2>&1)"; rc=$?
+want_eq     "(bm) loom diff refuses a diff.external at --worktree scope" "$rc" "1"
+want_in     "(bm) ... naming it"                          "$out" "+ diff.external="
+want_absent "(bm) ... nor did that one run"               "$TMP/bm-prog-ran"
+git -C "$BMW" config --worktree --unset diff.external
+git -C "$BMW" config --worktree remote.origin.receivepack "$TMP/bm-prog.sh"
+out="$("$LOOM" land 0072-bm --pr 2>&1)"; rc=$?
+want_eq     "(bm) land --pr refuses a remote.origin.receivepack at --worktree scope" "$rc" "1"
+want_in     "(bm) ... naming it"                          "$out" "+ remote.origin.receivepack="
+git -C "$BMW" config --worktree --unset remote.origin.receivepack
+# 5. the MAIN checkout's own scope: `.git/config.worktree`, which no linked
+#    worktree reads and `git config --local --list` does not show. A
+#    core.hooksPath there runs in YOUR checkout, during the merge.
+printf '[core]\n\thooksPath = %s\n' "$TMP/bm-hooks" >> "$REPO/.git/config.worktree"
+bm_main_before="$(git rev-parse HEAD)"
+out="$("$LOOM" land 0072-bm 2>&1)"; rc=$?
+want_eq     "(bm) land refuses a core.hooksPath in the MAIN checkout's config.worktree" "$rc" "1"
+want_in     "(bm) ... naming it"                          "$out" "+ core.hookspath="
+want_in     "(bm) ... in the main checkout's own scope"   "$out" "[worktree-main]"
+want_absent "(bm) ... refused before the merge, so no hook ran" "$TMP/bm-hook-ran"
+want_eq     "(bm) ... and your checkout did not move"     "$(git rev-parse HEAD)" "$bm_main_before"
+want_ne     "(bm) ... with the branch still standing" \
+            "$(git rev-parse --verify --quiet refs/heads/agent/0072-bm || echo GONE)" "GONE"
+rm -f "$REPO/.git/config.worktree"
+# 6. ... and with every scope back where the record pinned it, the push happens.
+out="$("$LOOM" land 0072-bm --pr 2>&1)"; rc=$?
+want_eq "(bm) with all three scopes back, land --pr pushes" "$rc" "0"
+want_ne "(bm) ... and origin now carries the branch" \
+        "$(git -C "$TMP/origin-bm.git" rev-parse --verify --quiet refs/heads/agent/0072-bm || echo GONE)" "GONE"
+"$LOOM" drop 0072-bm > /dev/null 2>&1 || true
+git remote remove origin
+
+# --- (bn) the include closure is pinned, and `loom new` is loud about it ---
+# `git config --local --list` prints `include.path=<file>` and
+# `includeIf.<cond>.path=<file>` as POINTERS: the keys of the included file are
+# live (they show up in the FULL `git config --list`) and appear in no scoped
+# listing at all — measured, git 2.34.1. A pin taken over the listings therefore
+# pins the pointer and nothing behind it: plant one benign include while a task
+# is created, and every later edit of the TARGET is free. loom resolves the
+# closure and digests the target FILES, and says so at `loom new`.
+mkdir -p "$TMP/bn" "$TMP/bn-hooks"
+cat > "$TMP/bn-hooks/pre-commit" << HOOK
+#!/usr/bin/env bash
+: > "$TMP/bn-hook-ran"
+exit 0
+HOOK
+chmod +x "$TMP/bn-hooks/pre-commit"
+printf '[core]\n\tquotePath = false\n' > "$TMP/bn/inc.cfg"      # benign, for now
+git config include.path "$TMP/bn/inc.cfg"                       # planted by task A
+out="$("$LOOM" new 0073-bn 2>&1)"; rc=$?
+want_eq "(bn) setup: a task created while an include is present" "$rc" "0"
+want_in "(bn) loom new prints what it pinned"             "$out" "loom: pinned "
+want_in "(bn) ... and WARNs that the config pulls other files in" "$out" "include.path"
+want_in "(bn) ... naming the target"                      "$out" "$TMP/bn/inc.cfg"
+want_in "(bn) ... which is in the pinned sidecar, digested" \
+        "$(tr '\0' '\n' < "$(state_of 0073-bn).gitconfig")" "include:$TMP/bn/inc.cfg:"
+# the agent edits the INCLUDED file. Nothing in .git/config changes at all.
+printf '[core]\n\thooksPath = %s\n' "$TMP/bn-hooks" >> "$TMP/bn/inc.cfg"
+want_eq     "(bn) setup: the include really is live"      "$(git config --get core.hooksPath)" "$TMP/bn-hooks"
+want_in     "(bn) ... while the local listing still shows only the pointer" \
+            "$(git config --local --list)" "include.path=$TMP/bn/inc.cfg"
+want_not_in "(bn) ... and names no hooksPath of its own"  "$(git config --local --list)" "hookspath"
+bn_claude_before="$(wc -l < "$TMP/called-claude.log" 2>/dev/null || echo 0)"
+out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 "$LOOM" run 0073-bn 2>&1)"; rc=$?
+want_eq     "(bn) loom run refuses an edit to the INCLUDED file" "$rc" "1"
+want_in     "(bn) ... naming the include by path"         "$out" "include:$TMP/bn/inc.cfg"
+want_absent "(bn) ... before the commit, so the hook never fired" "$TMP/bn-hook-ran"
+want_eq     "(bn) ... and no model was launched" \
+            "$(wc -l < "$TMP/called-claude.log" 2>/dev/null || echo 0)" "$bn_claude_before"
+# ... and --accept-config re-records the closure. The hook firing on the commit
+# that follows is what proves the plant was live all along.
+out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 "$LOOM" run 0073-bn --accept-config 2>&1)"; rc=$?
+want_eq   "(bn) --accept-config re-pins the closure and proceeds" "$rc" "0"
+want_in   "(bn) ... printing the include line that changed" "$out" "include:$TMP/bn/inc.cfg"
+want_file "(bn) ... and the hook the included file named really does fire" "$TMP/bn-hook-ran"
+"$LOOM" drop 0073-bn > /dev/null 2>&1 || true
+git config --unset include.path
+rm -f "$TMP/bn/inc.cfg"
+want_eq "(bn) cleanup: the include is gone"               "$(git config --get core.hooksPath || true)" ""
+
+# --- (bo) the config check runs BEFORE the first fence operation ----------
+# `fence_reconcile` -> `fence_apply` -> `git sparse-checkout set` is a
+# WORKING-TREE UPDATE: git materialises every path the new pattern list admits,
+# and materialising one runs the SMUDGE side of whatever `filter.<d>` a
+# `.gitattributes` in that worktree selects. The `.gitattributes` is a file the
+# agent writes (uncommitted is enough) and `filter.<d>.smudge` is one
+# `git config` away — so the planted program ran, as the operator, one line
+# before the pin that exists to refuse it.
+out="$("$LOOM" new 0074-bo 2>&1)"; rc=$?
+want_eq "(bo) setup: a plain worktree"                    "$rc" "0"
+BOW="$WTU/0074-bo"
+echo "benign" > "$BOW/backend/bo.txt"
+git -C "$BOW" add backend/bo.txt
+git -C "$BOW" commit -qm "benign work on bo"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0074-bo 2>&1)"; rc=$?
+want_eq "(bo) setup: it is reviewed"                      "$rc" "0"
+cat > "$TMP/bo-smudge.sh" << SM
+#!/usr/bin/env bash
+: > "$TMP/bo-smudge-ran"
+exec cat
+SM
+chmod +x "$TMP/bo-smudge.sh"
+git -C "$BOW" config filter.evil.smudge "$TMP/bo-smudge.sh"    # the program
+printf '* filter=evil\n' > "$BOW/.gitattributes"               # what selects it
+# ... and a narrowed sparse spec, so that loom's own `sparse-checkout set` has
+# files to MATERIALISE. That materialisation is the step that runs the smudge.
+git -C "$BOW" sparse-checkout set '/.agents/' > /dev/null 2>&1
+for c in check diff run land; do
+  case "$c" in
+    run) out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 "$LOOM" run 0074-bo 2>&1)"; rc=$? ;;
+    *)   out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" "$c" 0074-bo 2>&1)"; rc=$? ;;
+  esac
+  want_eq     "(bo) loom $c refuses the planted smudge filter" "$rc" "1"
+  want_in     "(bo) ... naming it"                        "$out" "+ filter.evil.smudge="
+  want_absent "(bo) ... before fence_apply could run it"  "$TMP/bo-smudge-ran"
+done
+git config --unset filter.evil.smudge
+rm -f "$BOW/.gitattributes"
+"$LOOM" drop 0074-bo > /dev/null 2>&1 || true
 
 # --- (j)/(t) doctor lists the profiles, and touches no network ------------
 out="$(timeout 180 "$LOOM" doctor 2>&1 || true)"
