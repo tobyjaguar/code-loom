@@ -330,9 +330,22 @@ part of the branch that still changes your runs:
   the failing `loom new` *itself* created **is** removed, and it says so — `git
   worktree add -b` creates the branch and can then fail on the path, and an
   orphan there made the task id unusable forever.
-- **A fence that was widened under an existing worktree is refused**, not
-  quietly re-applied — the worktree's own diff carries the content regardless.
-  There is no "the record says this would have been fine" arm any more.
+- **A worktree holding fenced paths is refused**, not quietly re-applied — the
+  worktree's own diff carries the content regardless. There is no "the record
+  says this would have been fine" arm any more, and there will not be one: a
+  record is agent-reachable state and can only ever refuse.
+  The **one** exception is not about the tree at all. If you widen `[fence]`
+  while a task's worktree exists, the paths it is now holding are there because
+  `loom new` was right to check them out, and refusing stranded the task (the
+  only recovery on offer was `loom drop`, after which `loom new` refuses —
+  "branch already exists"). So `loom` compares your `[fence]` **now** against
+  `git show <the task's recorded base>:.agents/zones.toml` — your own file at a
+  commit in your own trunk. A present path that only a pattern **added since
+  the base** matches is your change: `loom` re-fences the worktree, prints one
+  note naming the patterns, and carries on. A present path that a pattern which
+  **already existed** matches is the agent's doing and still refuses. No base,
+  no `zones.toml` at the base, or anything unreadable: every pattern counts as
+  pre-existing and the refusal stands.
 - **The history is refused in `check`, `diff`, `loop`, `rebase` and `land`**
   when the branch's commits touch a fenced path, and `land` refuses a `[hand]`
   path in those commits too. `--force` skips the gate, not this.

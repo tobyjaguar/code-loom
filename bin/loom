@@ -2620,6 +2620,8 @@ zones_py() { # zones_py <mode> [arg]
   #   fence-orphans | fence-shape | fence-present <worktree>
   #   fence-present-full <worktree>   (both answer from the index AND the disk)
   #   history-fence <path>... | history-hand <path>...
+  #   fence-since <base-zones-file> <path>...   (paths a BASE-era pattern hits)
+  #   fence-added <base-zones-file> <path>...   (patterns ADDED since the base)
   #   profiles | profile-release | profile-providers | profile-released <path>
   #   profile-tracked <worktree>
   # The fence modes answer with the EFFECTIVE fence: [fence] minus the
@@ -2935,6 +2937,48 @@ elif mode == "fence-orphans":                          # typo detection for doct
     for g in fence:
         if not any(hit(p, g) for p in tracked):
             print(g)
+elif mode in ("fence-since", "fence-added"):
+    # Did the OPERATOR widen [fence] under an existing worktree, or did the
+    # AGENT materialise a path that was already fenced when the task started?
+    # The two look identical on disk and they are not the same event, so the
+    # discriminator is the operator's own file at the task's recorded base:
+    # args[0] is `git show <base>:.agents/zones.toml` written to a temp.
+    #
+    #   fence-since -> of the given paths, the ones a pattern that ALREADY
+    #                  existed at the base matches. Non-empty is the agent's
+    #                  doing and stays a refusal.
+    #   fence-added -> the patterns in [fence] now that were NOT there at the
+    #                  base and that match at least one of the given paths.
+    #                  That is the note the operator gets.
+    #
+    # No file, an unparseable one, or one with no [fence] at all: every current
+    # pattern counts as pre-existing, so nothing can read as widening. Fail
+    # closed, like everything else here.
+    fence_sanity()
+    basef, paths = (args[0] if args else ""), args[1:]
+    base_fence = None
+    if basef and os.path.exists(basef):
+        try:
+            with open(basef, "rb") as _bf:
+                _bd = tomllib.load(_bf)
+        except Exception as e:
+            die("cannot read the base copy of zones.toml (%s): %s" % (basef, e))
+        _v = _bd.get("fence", {}).get("paths", [])
+        if not isinstance(_v, list) or not all(isinstance(g, str) for g in _v):
+            die("%s: [fence].paths must be a list of glob strings" % basef)
+        base_fence = _v
+    if base_fence is None:
+        base_fence = list(fence)
+    if mode == "fence-since":
+        for p in paths:
+            if any(hit(p, g) for g in base_fence):
+                print(p)
+    else:
+        for g in fence:
+            if g in base_fence:
+                continue
+            if any(hit(p, g) for p in paths):
+                print(g)
 elif mode == "fence-shape":    # patterns where gitignore and fnmatch may differ
     fence_sanity()
     plain = re.compile(r"^[^*?\[\]!/][^*?\[\]!]*/\*\*$")
@@ -3324,6 +3368,12 @@ Replace them with links that stay inside the tree, or throw the branch away:
   loom drop <task-id>"
 }
 
+# The task's RECORDED BASE, for the one question fence_reconcile cannot answer
+# from the worktree: was [fence] widened by the operator since this task was
+# created? Set by every command that has a record in hand, BEFORE it reconciles;
+# empty means "cannot tell", which is the refusing answer.
+FENCE_BASE=""
+
 # ---------------------------------------------------------------- reconcile
 # THE gate between a worktree and a model. Driven by what is ON DISK — never by
 # a recorded profile, and not by the index either: `git show HEAD:core/lib.rs >
@@ -3344,15 +3394,19 @@ Replace them with links that stay inside the tree, or throw the branch away:
 #      That tree was not built under the profile, and a profile may not be
 #      introduced after `loom new` — that is how a forged branch record would
 #      otherwise cash out.
-#   4. present, nothing asserted: DIE. Unconditionally.
-#      This rule used to have an arm: if the record named a profile that would
-#      have released exactly these paths, `loom` re-fenced to the full fence,
-#      printed three warnings and ran. Back then the record was branch config,
-#      so that arm let a `git config` in the worktree turn a refusal into a
-#      warning. The record has moved out of the repo since, and the arm is
-#      still gone: a record only ever refuses, whoever can write it. An
-#      unprofiled tree holding fenced paths is a dead stop; `loom drop` is the
-#      fix.
+#   4. present, nothing asserted: DIE — unless the OPERATOR widened [fence]
+#      since this task's base, which is a fact about their own file and not
+#      about the tree (see the arm below).
+#      This rule used to have a different arm: if the RECORD named a profile
+#      that would have released exactly these paths, `loom` re-fenced to the
+#      full fence, printed three warnings and ran. Back then the record was
+#      branch config, so that arm let a `git config` in the worktree turn a
+#      refusal into a warning. The record has moved out of the repo since, and
+#      that arm is still gone, permanently: a record only ever refuses, whoever
+#      can write it. The widening arm is not it coming back — nothing in the
+#      worktree, and nothing in the branch's history, takes part in the
+#      decision; the two inputs are the operator's zones.toml now and the
+#      operator's zones.toml at a commit in their own trunk.
 #   5. nothing present, nothing asserted: the ordinary path — apply and verify
 #      the full fence, as `loom run` has always done. (Not a rule about a
 #      release; it is the ordinary case, and it is numbered so that the count
@@ -3408,13 +3462,57 @@ It was not created under that profile, and a profile cannot be introduced after
 
   # Nothing asserted, and the tree holds fenced paths. Every top-level command
   # has already refused this (require_fence_flag dies when a record exists and
-  # the flag does not), so reaching here means either a fence that was widened
-  # under an existing worktree — which dies, `loom drop` is the fix — or a caller
-  # that skipped require_fence_flag, which is what run_role's second call is
-  # here to catch. Either way it is a dead stop: the record is not consulted,
-  # because a record that could turn this refusal into a warning would be a
-  # record that authorises.
+  # the flag does not), so reaching here means either a caller that skipped
+  # require_fence_flag — which is what run_role's second call is here to catch
+  # — or one of TWO events that look identical on disk and are not the same
+  # thing at all:
+  #
+  #   * the OPERATOR widened [fence] under an existing worktree (`core/**`
+  #     yesterday, `core/**` + `ios/**` today). The paths are present because
+  #     `loom new` was right to check them out; nothing in the worktree did
+  #     anything. This used to be a dead stop whose only offered recovery was
+  #     `loom drop` — after which `loom new` refuses ("branch already exists"),
+  #     so the branch's commits became reachable only by hand.
+  #   * the AGENT materialised a path that was ALREADY fenced when the task
+  #     started (`git show HEAD:core/lib.rs > core/copy.rs`, or a
+  #     `sparse-checkout disable`). That is the whole point of this refusal.
+  #
+  # The discriminator is operator-side, and it is deliberately NOT "do the
+  # branch's commits touch the path" — that cannot tell widening from an agent
+  # materialising a path UNCOMMITTED, which is the arm this design removed. It
+  # is the operator's own `.agents/zones.toml` as it stood at the task's
+  # RECORDED BASE (a commit in their trunk), against their zones.toml now. A
+  # present path that only a pattern ADDED since the base matches is the
+  # operator's own change: re-fence, say so once, carry on. A present path a
+  # pattern that already existed matches is the agent's doing and still dies.
+  # No base, no zones.toml at the base, or anything unreadable: every pattern
+  # counts as pre-existing and the refusal stands.
   if [ -n "$present" ]; then
+    local -a pres=()
+    while IFS= read -r p; do [ -n "$p" ] && pres+=("$p"); done <<< "$present"
+    local basezones="" preexisting="" added=""
+    if [ -n "${FENCE_BASE:-}" ] && [ "${#pres[@]}" -gt 0 ]; then
+      basezones="$(mktemp "${TMPDIR:-/tmp}/loom-basezones.XXXXXX")" \
+        || die "cannot create a temporary file for the base copy of zones.toml"
+      tmp_track "$basezones"
+      # A base commit with no zones.toml is not an error here; it is the
+      # fail-closed case, and the empty file makes zones_py read it as one.
+      git -C "$ROOT" show "$FENCE_BASE:.agents/zones.toml" > "$basezones" 2>/dev/null \
+        || : > "$basezones"
+      preexisting="$(zones_py fence-since "$basezones" "${pres[@]}")" \
+        || die "cannot tell which of these paths were already fenced when task's base was recorded — refusing to guess"
+      added="$(zones_py fence-added "$basezones" "${pres[@]}")" \
+        || die "cannot tell which fence patterns are new since this task's base — refusing to guess"
+      rm -f "$basezones"
+    fi
+    if [ -n "$added" ] && [ -z "$preexisting" ]; then
+      echo "loom: note — [fence] has been widened since this task's base:" >&2
+      printf '%s\n' "$added" | sed 's/^/loom:   + /' >&2
+      echo "loom: those patterns match paths this worktree was built with, and nothing" >&2
+      echo "loom: in it put them there. Re-fencing $wt and carrying on." >&2
+      fence_enforce "$wt"
+      return 0
+    fi
     die "fenced paths are present in $wt and no fence profile is \
 asserted for this command:
 $(printf '%s\n' "$present" | sed 's/^/  /')
@@ -4669,7 +4767,10 @@ cmd_run() {
   require_recorded_config "$task" run
   # Re-apply and verify, and refuse outright if what is on disk and what the
   # operator asserted do not line up. The tree cannot authorise anything; it
-  # can only contradict the flag, and a contradiction is a dead stop.
+  # can only contradict the flag, and a contradiction is a dead stop. The base
+  # goes with it: it is the only thing that can tell an operator who widened
+  # [fence] from an agent who materialised an already-fenced path.
+  FENCE_BASE="$(state_read "$task" base)"
   fence_reconcile "$wt" "$FENCE_PROFILE"
   # RESOLVED, and used as the resolved path from here on: the implementer writes
   # -done/-blocked there on attempt 1, and the gate log below is loom's own write.
@@ -4767,6 +4868,7 @@ cmd_check() {
   # the diff, so a tree the operator has not vouched for must stop the command
   # here, not one line later — and so must a HISTORY the operator has not
   # vouched for, which a re-fenced worktree no longer shows.
+  FENCE_BASE="$(state_read "$task" base)"
   fence_reconcile "$wt" "$FENCE_PROFILE"
   pin_branch_tip "$task"
   base="$(security_base "$task")"
@@ -4890,6 +4992,7 @@ cmd_loop() {
   # nothing yet to compare.
   FLAG_ACCEPT_CONFIG="$accept_cfg"
   require_recorded_config "$task" loop
+  FENCE_BASE="$(state_read "$task" base)"
   fence_reconcile "$wt" "$FENCE_PROFILE"
 
   implement() { # one implementer pass, with cmd_run's exit codes named
@@ -4987,6 +5090,7 @@ cmd_diff() {
   # Same order as `loom check`, for the same reason: the patch this writes carries
   # the content of every path in it, so the tree AND the history are judged
   # before a byte of it is written.
+  FENCE_BASE="$(state_read "$task" base)"
   fence_reconcile "$wt" "$FENCE_PROFILE"
   pin_branch_tip "$task"
   base="$(security_base "$task")"
@@ -5065,6 +5169,7 @@ cmd_land() {
   # require_recorded_config.
   require_recorded_config "$task" land
   wt="$(require_worktree "$task")"; br="$(branch_of "$task")"
+  FENCE_BASE="$(state_read "$task" base)"
   fence_reconcile "$wt" "$FENCE_PROFILE"
   # Uncommitted work in the worktree is not the branch's work: the reviewer read
   # a patch cut from the commits, and what is landing is the commits. `loom rebase`
@@ -5311,6 +5416,7 @@ refresh what it replays onto first:
   # require_recorded_config.
   require_recorded_config "$task" rebase
   wt="$(require_worktree "$task")"; br="$(branch_of "$task")"
+  FENCE_BASE="$(state_read "$task" base)"
   fence_reconcile "$wt" "$FENCE_PROFILE"
   # A rebase rewrites these commits onto a new base and re-points the recorded
   # one, which is exactly when a fenced path buried in the history would stop

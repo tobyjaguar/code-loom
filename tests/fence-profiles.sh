@@ -269,7 +269,7 @@ for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p \
          0084-bu 0085-bu2 0086-bu3 0087-bu4 0088-bu5 0089-bu6 0090-bu7 \
          0091-bw 0093-bx 0094-by 0095-bz 0096-ca 0097-cb \
          0098-cc 0099-cd 0100-ce 0101-cf 0102-cf2 \
-         0103-ch 0104-ch2 0105-ch3; do mk_task "$t"; done
+         0103-ch 0104-ch2 0105-ch3 0106-ci 0107-ci2 0108-ci3; do mk_task "$t"; done
 mk_task 0040-ar  codex
 mk_task 0042-as  codex
 mk_task 0005-f codex
@@ -3812,6 +3812,79 @@ want_eq   "(ch) control: a link that stays inside the tree passes"  "$rc" "0"
 want_file "(ch) ... and the patch is written"                       "$CH3/.agents/reviews/0105-ch3.patch"
 out="$("$LOOM" land 0105-ch3 2>&1)"; rc=$?
 want_eq   "(ch) control: and it lands"                              "$rc" "0"
+
+# --- (ci) widening [fence] under an existing worktree ----------------------
+# `[fence]` gains a pattern while a task's worktree is already on disk holding
+# paths it now names. Every command refused ("fenced paths are present … or
+# start clean: loom drop <task-id>"), and after `loom drop --keep-branch`
+# `loom new` refuses too ("branch already exists") — so the branch's commits
+# were reachable only by hand. Nothing in the worktree did anything: the
+# OPERATOR changed their own file.
+#
+# The discriminator is operator-side and is deliberately not "do the branch's
+# commits touch it" (that cannot tell widening from an agent materialising a
+# path uncommitted). It is `.agents/zones.toml` as it stood at the task's
+# RECORDED BASE, against the operator's zones.toml now.
+mkdir -p spike
+echo "spike notes" > spike/notes.md
+git add -A
+git commit -qm "(ci) a directory the fence does not name yet"
+out="$("$LOOM" new 0106-ci 2>&1)"; rc=$?
+want_eq "(ci) setup: a task, created BEFORE the widening"           "$rc" "0"
+out="$("$LOOM" new 0108-ci3 2>&1)"; rc=$?
+want_eq "(ci) setup: and a second one"                              "$rc" "0"
+CI="$WTU/0106-ci"; CI3="$WTU/0108-ci3"
+want_file "(ci) setup: spike/ is in the worktree — it is not fenced yet" "$CI/spike/notes.md"
+echo "ci3 work" > "$CI3/backend/ci3.txt"
+git -C "$CI3" add backend/ci3.txt
+git -C "$CI3" commit -qm "work on ci3"
+# The operator widens their OWN zones.toml, in their own checkout. Uncommitted
+# on purpose: the comparison is against the file at the base COMMIT, so this
+# also proves loom reads the live operator file on this side.
+ci_zones_orig="$(cat .agents/zones.toml)"
+python3 - << 'PYCI'
+p = ".agents/zones.toml"
+s = open(p).read()
+old = 'paths = ["core/**", "ios/**", "docs/audits/**"]'
+assert s.count(old) == 1
+open(p, "w").write(s.replace(old, 'paths = ["core/**", "ios/**", "docs/audits/**", "spike/**"]'))
+PYCI
+want_in "(ci) setup: the fence really is wider now" "$("$LOOM" zone spike/notes.md 2>&1)" "fenced"
+out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 "$LOOM" run 0106-ci 2>&1)"; rc=$?
+want_eq     "(ci) loom run proceeds under a widened fence"          "$rc" "0"
+want_in     "(ci) ... saying the fence was widened"                 "$out" "[fence] has been widened"
+want_in     "(ci) ... and naming the pattern"                       "$out" "+ spike/**"
+want_absent "(ci) ... with the widened path re-fenced out"          "$CI/spike/notes.md"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0108-ci3 2>&1)"; rc=$?
+want_eq     "(ci) loom check proceeds too"                          "$rc" "0"
+want_in     "(ci) ... with the same note"                           "$out" "[fence] has been widened"
+want_absent "(ci) ... and the same re-fencing"                      "$CI3/spike/notes.md"
+want_file   "(ci) ... and the review patch really was written"      "$CI3/.agents/reviews/0108-ci3.patch"
+# Once re-fenced there is nothing left to reconcile, so the note is said once.
+out="$("$LOOM" diff 0108-ci3 2>&1)"; rc=$?
+want_eq     "(ci) the next command is quiet"                        "$rc" "0"
+want_not_in "(ci) ... no second note"                               "$out" "has been widened"
+# The regression guard: a path that was ALREADY fenced when the task started,
+# materialised in the worktree by hand. That is the agent's doing and it is
+# still a dead stop — the arm this whole design refuses to grow back.
+out="$("$LOOM" new 0107-ci2 2>&1)"; rc=$?
+want_eq "(ci) setup: a third task"                                  "$rc" "0"
+CI2="$WTU/0107-ci2"
+mkdir -p "$CI2/ios"
+echo "// materialised by hand" > "$CI2/ios/App.swift"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0107-ci2 2>&1)"; rc=$?
+want_fail   "(ci) a path fenced AT THE BASE, materialised, still dies"  "$rc"
+want_in     "(ci) ... naming it"                                    "$out" "ios/App.swift"
+want_in     "(ci) ... with the unchanged refusal"                   "$out" "fenced paths are present"
+want_not_in "(ci) ... and NOT as a widening"                        "$out" "has been widened"
+rm -rf "$CI2/ios"
+"$LOOM" drop 0106-ci  > /dev/null 2>&1 || true
+"$LOOM" drop 0107-ci2 > /dev/null 2>&1 || true
+"$LOOM" drop 0108-ci3 > /dev/null 2>&1 || true
+printf '%s\n' "$ci_zones_orig" > .agents/zones.toml
+git rm -q -r --cached spike > /dev/null
+rm -rf spike
+git commit -qm "(ci) and the fence back as it was"
 
 # --- (j)/(t)/(cg) doctor lists the profiles, touches no network, and counts -
 # (cg): `local pname pprov prel role m mp bad` inside the [fence_profiles] loop

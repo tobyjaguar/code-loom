@@ -230,8 +230,14 @@ confused agent asks instead of digging.
    profiles" below), which is stricter: a worktree holding fenced paths that no
    `--fence-profile` on the command line accounts for is **refused**, not
    quietly re-fenced, because the tree's own diff would carry the content to
-   the next model regardless. Either way, after changing `[fence]`, treat
-   existing worktrees in `loom ls` as stale and `loom drop` them.
+   the next model regardless — with one exception, which is about YOUR file
+   and not about the tree: when the only patterns matching what is present were
+   **added to `[fence]` since that task's recorded base** (compared against
+   `git show <base>:.agents/zones.toml`), the widening is yours, so `loom`
+   re-fences, says so once, and carries on. A pattern that was already there at
+   the base is the agent's doing and still refuses. Widening therefore no longer
+   strands a task; a `loom ls` worktree that predates a `[fence]` change is
+   re-fenced on the next command rather than needing `loom drop`.
 
 Fencing `.agents/**` is refused outright, as is any pattern that would remove
 `zones.toml`, `gate.sh`, the `reviews/` directory or `.opencode/`. Removing
