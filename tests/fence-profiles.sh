@@ -1506,6 +1506,15 @@ out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0056-az3 2>&1)"; rc=$?
 want_eq "(az) ... and on a key a record does not have"    "$rc" "1"
 want_in "(az) ... naming it"                              "$out" "not a field a record has"
 want_not_in "(az) ... and no reviewer was launched"       "$out" "running on"
+# ... and `loom ls` — the one command whose job is to SHOW the operator what
+# state exists — says so instead of printing a blank profile column. It used to
+# swallow the refusal with `2>/dev/null || true`, so a forged record listed as an
+# ordinary task.
+out="$("$LOOM" ls 2>&1)"; rc=$?
+want_eq "(az) loom ls still lists every worktree"         "$rc" "0"
+want_in "(az) ... calling the unreadable record out"      "$out" "OPERATOR RECORD UNREADABLE"
+want_in "(az) ... naming the file to read"                "$out" "$(state_of 0056-az3)"
+want_in "(az) ... and the other worktrees are still listed" "$out" "agent/0043-at"
 "$LOOM" drop 0056-az3 > /dev/null 2>&1 || true
 
 # --- (ba) the rebase fetch names its refspec, and the refspec is pinned ----

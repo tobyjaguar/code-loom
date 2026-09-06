@@ -3048,14 +3048,38 @@ cmd_drop() {
 # — a reminder of the flag every command for that task needs, not a claim about
 # what is on disk (`loom run` reconciles the tree; the record only ever refuses).
 cmd_ls() {
-  local line br prof found=""
+  local line br t prof bad found=""
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     found=yes
     br="$(printf '%s' "$line" | sed -n 's/.*\[\(.*\)\].*/\1/p')"
-    prof=""
-    case "$br" in agent/*) prof="$(state_read "${br#agent/}" profile 2>/dev/null || true)" ;; esac
-    if [ -n "$prof" ]; then printf '%s  fence-profile:%s\n' "$line" "$prof"
+    prof=""; bad=""
+    # The record's SHAPE, judged here rather than swallowed. This used to be
+    # `state_read … 2>/dev/null || true`, which turned "this record is not one
+    # loom wrote" — a duplicated field, an unknown key, a line that is not
+    # <key>=<value>, the exact shapes a forged `reviewed=` takes — into a blank
+    # profile column and a listing that read as normal. `loom ls` is the one
+    # command whose job is to show the operator what state exists, so a record
+    # it cannot read has to be the loudest line on the screen.
+    #
+    # In a SUBSHELL, because require_sane_record dies (exit), and the listing
+    # must go on to the next worktree rather than stop at the first bad record.
+    # A task with NO record at all is not an error here: state_read answers ""
+    # for a missing file, and every command that needs one refuses on its own.
+    case "$br" in
+      agent/*)
+        t="${br#agent/}"
+        if ( require_sane_record "$t" ) >/dev/null 2>&1; then
+          prof="$(state_read "$t" profile)"
+        else
+          bad=yes
+        fi ;;
+    esac
+    if [ -n "$bad" ]; then
+      printf '%s  *** OPERATOR RECORD UNREADABLE — loom will refuse every command for this task ***\n' "$line"
+      printf '    %s\n' "$(state_file "${br#agent/}")"
+      printf '    read it, then:  loom drop %s && loom new %s\n' "${br#agent/}" "${br#agent/}"
+    elif [ -n "$prof" ]; then printf '%s  fence-profile:%s\n' "$line" "$prof"
     else                    printf '%s\n' "$line"; fi
     # Both roots: a profiled worktree is a sibling of the unprofiled root, not
     # a child of it, so one -F pattern would miss half the list.
