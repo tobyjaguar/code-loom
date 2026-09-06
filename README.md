@@ -425,22 +425,59 @@ part of the branch that still changes your runs:
   already on the branch.
 - **Repo-local git config is not a code channel.** `.git/config` is in the
   shared git directory, so `git -C <worktree> config core.pager /tmp/x` is one
-  command from inside an agent's tree — and `core.pager`, `core.fsmonitor`,
-  `core.sshCommand`, `diff.external`, `remote.<n>.uploadpack`/`receivepack`,
-  `core.editor` and `sequence.editor` each name a **program git runs**, in your
-  session, the next time you type a `loom` command. `loom` now exports its own
-  `GIT_CONFIG_PARAMETERS` (the variable `git -c` uses, which outranks every
-  config *file*) for every git subprocess it spawns, clears git's own `GIT_*`
-  environment first — the config half of it too: `GIT_CONFIG_*`,
-  `GIT_SSH_COMMAND`, `GIT_PROXY_COMMAND`, `GIT_EXTERNAL_DIFF`, `GIT_PAGER`,
-  `GIT_EDITOR`, `GIT_ASKPASS`, … — and spells out `--no-ext-diff`,
-  `--upload-pack=` and `--receive-pack=` at the diff, fetch and push call sites,
-  because those three keys do not obey the variable (measured; see
-  `ARCHITECTURE.md` § 5). `core.hooksPath` is deliberately **not** overridden —
-  your hooks have to run — and what that leaves trusted is enumerated in
-  `docs/KNOWN-GAPS.md` gap 6. **Two costs:** `loom diff` no longer pages by
-  default (`export LOOM_DIFF_CMD="less -R"` if you want one), and a repo-local
-  `core.sshCommand` is ignored — your global one is not.
+  command from inside an agent's tree — and `core.pager`, `pager.<cmd>`,
+  `core.fsmonitor`, `core.sshCommand`, `diff.external`,
+  `remote.<n>.uploadpack`/`receivepack`, `core.editor` and `sequence.editor`
+  each name a **program git runs**, in your session, the next time you type a
+  `loom` command. `loom` now exports its own `GIT_CONFIG_PARAMETERS` (the
+  variable `git -c` uses, which outranks every config *file*) for every git
+  subprocess it spawns, clears git's own `GIT_*` environment first — the config
+  half of it too: `GIT_CONFIG_*`, `GIT_SSH_COMMAND`, `GIT_PROXY_COMMAND`,
+  `GIT_EXTERNAL_DIFF`, `GIT_PAGER`, `GIT_EDITOR`, `GIT_ASKPASS`, … — and spells
+  out `--no-ext-diff`, `--upload-pack=` and `--receive-pack=` at the diff, fetch
+  and push call sites, because those keys do not obey the variable (measured;
+  see `ARCHITECTURE.md` § 5). **`pager.<cmd>` is the fourth:** measured in a
+  pty, a `pager.log=<script>` ran straight through `core.pager=cat`, because
+  git consults `pager.<cmd>` first — and a string-valued `pager.<cmd>` turns
+  paging *on* for subcommands that never page, `update-ref` and `merge-base`
+  included. `GIT_PAGER=cat` plus one `pager.<cmd>=cat` per subcommand loom runs
+  is the lock. **Two costs:** `loom diff` no longer pages by default (`export
+  LOOM_DIFF_CMD="less -R"` if you want one), and a repo-local `core.sshCommand`
+  is ignored — your global one is not.
+- **...and the whole local config is PINNED to the task**, because the keys that
+  matter cannot be enumerated: `filter.<anything>.clean`,
+  `merge.<anything>.driver`, `pager.<anything>` and `includeIf.<anything>` put
+  the attack in the **key name**, so there is no list for
+  `GIT_CONFIG_PARAMETERS` to override — and `credential.helper` /
+  `core.askPass` are handed your credential as well as being run. `loom new`
+  records `config=<sha256 of `git config --local --list --null`, sorted>` in the
+  operator record, with the full list beside it as `<task>.gitconfig` so a
+  mismatch is shown as a diff. It is recomputed and compared **before every
+  model launch** (per *attempt*, not per command), before `land`'s merge and its
+  push, before `rebase`'s fetch and again before its replay, and before `check`
+  and `diff` write the review patch. A change is a refusal;
+  **`--accept-config`** is the one escape — it prints what changed and
+  re-records it as the baseline. `loom` writes local config on your behalf in
+  exactly two places and both re-pin themselves (`loom new`'s first
+  `sparse-checkout init`, which adds `extensions.worktreeConfig`; and `land
+  --pr`'s `--set-upstream-to`). Everything else that changes it is you or an
+  agent, so **an agent's `git config user.name` in its worktree will trip
+  this** — deliberately: it is the same command as `git config
+  credential.helper '!sh -c …'`. A record with no `config=` (one an older
+  `loom` wrote) is refused outright, and `--accept-config` is not an escape from
+  that: `loom drop <task> && loom new <task>`. What the pin leaves trusted — the
+  config as it stood at `loom new`, your `~/.gitconfig`, and in-tree
+  `.gitattributes` (now a `[hand]` path) — is enumerated in
+  `docs/KNOWN-GAPS.md` gap 6.
+- **`loom rebase` resolves its refs instead of looking them up.** `origin/main`
+  and `main` are not ref names, they are things git *resolves*, and the order is
+  `refs/<n>` > `refs/tags/<n>` > `refs/heads/<n>` > `refs/remotes/<n>`. So a
+  local branch literally named `origin/main`, a `refs/origin/main`, or a **tag**
+  named `main` each answer before the ref the rebase just fetched and means —
+  each of them one `git update-ref` from inside a worktree, and git only prints
+  `warning: refname … is ambiguous` and carries on. The upstream is now resolved
+  once, to `refs/remotes/origin/<b>` or `refs/heads/<name>`, and the branch is
+  read as `refs/heads/agent/<task>`.
 - **The pre-commit guard reads the index git hands it.** git runs a hook with a
   **temporary** index for `git commit -a`, `git commit -- <path>`, `--only` and
   `--include`, and names it in `$GIT_INDEX_FILE`. Clearing git's environment
@@ -502,6 +539,10 @@ loom check  0007-c --fence-profile codex
 loom diff   0007-c --fence-profile codex
 loom rebase 0007-c --fence-profile codex
 loom land   0007-c --fence-profile codex
+
+# and, separately, when the repository's local git config has changed since
+# `loom new` — `--accept-config` prints the diff and re-records it:
+loom run    0007-c --fence-profile codex --accept-config
 ```
 
 **A profiled task's worktree lives under its own root.** `$LOOM_WORKTREES` with

@@ -268,7 +268,10 @@ subprocess it spawns — including `git -C <worktree> …`, the operator's
 core.pager=cat          core.fsmonitor=false     protocol.ext.allow=never
 core.editor=true        sequence.editor=true     core.sshCommand=<your global one, or `ssh`>
 remote.origin.uploadpack=git-upload-pack         remote.origin.receivepack=git-receive-pack
+pager.<cmd>=cat         for every subcommand loom runs (see below)
 ```
+
+and it exports `GIT_PAGER=cat` alongside them.
 
 and it clears git's own environment (`GIT_DIR`, `GIT_WORK_TREE`,
 `GIT_OBJECT_DIRECTORY*`, `GIT_CONFIG_*`, `GIT_SSH_COMMAND`, `GIT_PROXY_COMMAND`,
@@ -288,32 +291,82 @@ enough":
   receivepack given, using the first"). The lock is `--upload-pack=` on the
   fetch and `--receive-pack=` on the push, which do win; the config parameter is
   only a floor.
+- **`core.pager=cat` does not cover `pager.<cmd>`.** Measured, git 2.34.1, in a
+  pty: with `pager.log=<script>` in `.git/config` and `core.pager=cat` in the
+  variable, the script *ran*. `git_pager()` reads `$GIT_PAGER`, then
+  `pager_program`, then `core.pager` — and `check_pager_config()` has already
+  set `pager_program` from `pager.<cmd>`, so `core.pager` is never reached. And
+  `pager.<cmd>` with a *string* value turns paging **on** for a subcommand that
+  never pages by default: `status`, `remote`, `branch`, `worktree`, `ls-files`,
+  `show-ref`, `merge-base`, `rev-list`, `update-ref`, `add`, `commit`,
+  `checkout`, `reset`, `diff`, `log`, `show`, `ls-remote`, `symbolic-ref`,
+  `sparse-checkout` and `patch-id` all ran the planted pager; only `rev-parse`
+  and `config` did not. Both levers that do win are used — `GIT_PAGER=cat` (the
+  complete one: it beats `pager.<cmd>` for every subcommand, including ones loom
+  does not run today) and one `pager.<cmd>=cat` per subcommand loom runs (the
+  floor). `--no-pager` on every call site also works and was rejected: ~100
+  sites, and a site added later would silently have no pin.
 
-**What is still trusted, honestly enumerated.** Neutralising every config key
-git can run a program from is not achievable from outside git, so the list
-below is the residual, not an oversight:
+**The whole local config is pinned, because the keys that matter cannot be
+enumerated.** `filter.<anything>.clean`, `merge.<anything>.driver`,
+`pager.<anything>`, `includeIf.<anything>` put the attack **in the key name**,
+so there is no finite list for `GIT_CONFIG_PARAMETERS` to override, and
+`credential.helper` / `core.askPass` are worse than a program: git hands them
+the credential as well as running them. So `loom new` records
+`config=<sha256 of the sorted, NUL-separated `git config --local --list
+--null`>` as a field of the operator record, and the full list beside it as
+`<task>.gitconfig` (mode 0600) so a mismatch can be shown as a diff rather than
+two digests. It is recomputed and compared:
 
-1. **`core.hooksPath`** — deliberately *not* overridden, because the operator's
-   hooks must run: `loom install-hooks` puts the hand-zone guard in one. The
-   cost is stated plainly: a worktree that re-points `core.hooksPath` disarms
-   that guard (which `git commit --no-verify` already does, so the guard was
-   always a seatbelt), and it also decides which `pre-merge-commit` /
-   `commit-msg` / `post-merge` hook runs **in your checkout** during
-   `loom land`'s merge. `loom land`'s check of the branch's COMMITS is the lock;
-   the hook is not.
-2. **`filter.<driver>.clean` / `.smudge`**, selected by a tracked
-   `.gitattributes` — run on checkout, `git add` and commit. `loom` creates
-   worktrees and commits in them, so these run.
-3. **`diff.<driver>.textconv`** and **`merge.<driver>.driver`**, also selected
-   by `.gitattributes` — the first is covered on `loom`'s own diffs by
-   `--no-textconv`, the second runs on a conflicted merge.
-4. **`core.attributesFile` / `core.excludesFile`**, and `.gitattributes` /
-   `.gitignore` themselves.
-5. **`gpg.program`**, if `commit.gpgsign` is on.
-6. **`remote.origin.url` / `.fetch` / the push URL** — trusted only in the sense
-   that a *change* to any of them is refused: all three are pinned in the
-   operator record at `loom new` and re-checked before `loom rebase` fetches and
-   before `loom land --pr` pushes.
+- before **every** model launch (in `run_role`, per *attempt* — attempt 1 can
+  plant a config and hit a rate limit, and attempt 2 would inherit it);
+- before `loom land`'s **merge** and before its **push**;
+- before `loom rebase`'s **fetch** and again before its **replay**;
+- in `loom check` and `loom diff` before the **review patch** is written.
+
+A change is a dead stop that prints the `-`/`+` lines and names the one escape,
+`--accept-config`, which prints the same diff and re-records it as the new
+baseline. `loom` writes local config on your behalf in exactly two places and
+both re-pin themselves: `loom new`'s first `git sparse-checkout init` in a
+repository adds `extensions.worktreeConfig` to the shared `.git/config`
+(measured, git 2.34), and `loom land --pr`'s `--set-upstream-to` adds
+`branch.<br>.remote`/`.merge`. Everything else that changes it is you or an
+agent — an agent's `git config user.name` in its worktree **will** trip this,
+and that is the intended shape, because it is the same command as
+`git config credential.helper '!sh -c …'`.
+
+`core.hooksPath`, `filter.*`, `merge.*.driver`, `diff.*.textconv`,
+`gpg.program`, `credential.helper`, `core.askPass`, `pager.*`,
+`include.path`/`includeIf.*` and `core.attributesFile`/`excludesFile` are
+therefore **change-refused**. `core.hooksPath` is still not *overridden* — the
+operator's hooks must run, `loom install-hooks` puts the hand-zone guard in one
+— but a worktree can no longer re-point it under a running task without the
+command refusing.
+
+**What is still trusted, honestly enumerated.** The residual is three things,
+and it is a residual by construction rather than an oversight:
+
+1. **Whatever the local config already said at `loom new`.** The pin is a
+   *change* check. A repository that already had a hostile `filter.x.clean` in
+   `.git/config` when the task was created has it in the baseline. So is
+   whatever `--accept-config` was used to re-record — that flag is an operator
+   act with the same weight as `--fence-profile`, and `loom` vouches for none of
+   what it accepts.
+2. **The operator's own `~/.gitconfig` and the system config.** Neither is in
+   the shared `.git`, neither is writable from a worktree, and neither is
+   pinned. `core.sshCommand` is deliberately *read* from there (see the cost
+   below).
+3. **In-tree `.gitattributes`.** The driver lives in the config, which is
+   pinned; the *attribute* that selects it for a path lives in the tree. It is a
+   `[hand]` path in the shipped template (`.gitattributes` and
+   `**/.gitattributes`, because git reads one in any directory), so `loom land`
+   refuses a branch that changed it — which is the lock, since the pre-commit
+   guard is a seatbelt.
+
+`remote.origin.url` / `.fetch` / the push URL keep their own named checks on
+top of the pin, because "the remote was re-aimed" is a clearer message than "the
+config changed"; they are pinned in the operator record at `loom new` and
+re-checked before `loom rebase` fetches and before `loom land --pr` pushes.
 
 A repository whose `.gitattributes` and filter drivers you would not run is a
 repository to give an agent a separate clone of, not a sparse checkout — the
