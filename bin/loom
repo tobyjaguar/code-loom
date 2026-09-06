@@ -1625,22 +1625,40 @@ repo_config_raw() {
 }
 
 # The `-`/`+` lines between the recorded repository baseline and a fresh dump.
-# Empty when there is no baseline to compare against, or when nothing moved.
+# Empty when there is no baseline to compare against, or when nothing moved —
+# and NEVER empty when the baseline did move. A sidecar that is missing,
+# truncated or unreadable would otherwise turn "the baseline moved" into a
+# silent re-record, which is the one thing this pair exists to prevent; it says
+# so in words instead.
 repo_config_delta() { # repo_config_delta <dump>
-  local rec
+  local rec out
   rec="$(repo_config_raw)"
   [ -n "$rec" ] || return 0
   [ "$rec" != "$(config_digest_of "$1")" ] || return 0
-  config_py diff "$(repo_config_sidecar)" "$1" 2>/dev/null || true
+  out="$(config_py diff "$(repo_config_sidecar)" "$1" 2>/dev/null || true)"
+  [ -n "$out" ] || out="  (the digest moved but the recorded list did not, or cannot be read:
+  $(repo_config_sidecar))"
+  printf '%s\n' "$out"
 }
 
-# The same delta, reduced to the entries that name a PROGRAM git runs.
+# The same delta, reduced to the entries that name a PROGRAM git runs. A
+# recorded list that cannot be read is reported as a hit rather than as
+# nothing: whether the move names a program is then not knowable, and in a
+# strict mode "not knowable" is a refusal, not a pass. The way out is the same
+# one every message here names, `loom pin-config --accept-config`.
 repo_config_delta_programs() { # repo_config_delta_programs <dump>
-  local rec
+  local rec out rc=0
   rec="$(repo_config_raw)"
   [ -n "$rec" ] || return 0
   [ "$rec" != "$(config_digest_of "$1")" ] || return 0
-  config_py diffprograms "$(repo_config_sidecar)" "$1" 2>/dev/null || true
+  out="$(config_py diffprograms "$(repo_config_sidecar)" "$1" 2>/dev/null)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf '%s\n' "? (the recorded list is unreadable, so whether this move names a
+    program cannot be answered: $(repo_config_sidecar))"
+    return 0
+  fi
+  [ -n "$out" ] || return 0
+  printf '%s\n' "$out"
 }
 
 # The config as it is NOW becomes the repository's baseline. No worktree
