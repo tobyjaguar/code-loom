@@ -1297,6 +1297,91 @@ remove it by hand and inspect the root" ;;
   esac
 }
 
+# ------------------------------------------ is this worktree OURS at all?
+# `$wt/.git` in a linked worktree is a FILE — one line, `gitdir: <path>` — and
+# it is an ordinary file in a directory the agent owns. Rewrite it and the
+# directory stops being this repository's worktree: every `git -C "$wt" …`
+# after that reads a git directory of the writer's choosing — ITS config
+# (`filter.<d>.clean`, `core.hooksPath`, `credential.helper`), its refs, its
+# objects, its hooks — while the path, the task id and the branch name all go
+# on reading exactly as they did.
+#
+# Nothing downstream noticed, and the reason is worth spelling out: a decoy
+# repository built with the SAME BRANCH NAME answers
+# `git -C "$wt" symbolic-ref HEAD` with `refs/heads/agent/<task>` (measured),
+# so `require_wt_on_branch` — the check whose whole job is "is this tree the
+# branch's tree" — passed it. `loom drop` then could not clean up either: git
+# refuses to remove a worktree it does not own, and the removal was written
+# `|| true`, so the command printed "dropped" over a directory that was still
+# there with the released paths still in it.
+#
+# THREE facts, each of them asked of git and compared against a path this
+# process resolved at startup, before any worktree was touched:
+#
+#   1. the worktree's COMMON dir is this repository's shared .git ($GITCOMMON).
+#      This is the one that catches the rewritten `.git` file outright.
+#   2. its top level is the directory we asked about — not a tree somewhere
+#      else that a `core.worktree` or a moved gitdir re-aimed it at.
+#   3. its own git dir is under `$GITCOMMON/worktrees/`, i.e. git knows it as a
+#      LINKED WORKTREE OF THIS REPO, and not as a main checkout that happens to
+#      share objects or as another repository's linked worktree.
+#
+# Every path is realpath'd on BOTH sides, so a repo under a symlinked /tmp
+# cancels out (ordinary, not an attack) while a symlink planted at one of them
+# does not. git may answer relatively (`--git-common-dir` is `.git` in a main
+# checkout), so a relative answer is resolved against $wt — which is the
+# directory `git -C` was run in.
+require_wt_is_ours() { # require_wt_is_ours <worktree>
+  local wt="$1" common gd top out bad="" r_common r_gd r_top r_wt r_git
+  [ -d "$wt" ] || die "no worktree at $wt — refusing to judge a directory that is not there"
+  common="$(git -C "$wt" rev-parse --git-common-dir 2>/dev/null || true)"
+  gd="$(git -C "$wt" rev-parse --git-dir 2>/dev/null || true)"
+  top="$(git -C "$wt" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [ -z "$common" ] || [ -z "$gd" ] || [ -z "$top" ]; then
+    die "worktree $wt does not belong to this repository — git cannot resolve it as a
+worktree at all (its .git file, or the git directory it names, is gone or
+unreadable). An agent rewrote it: 'loom drop' will not remove it either, because
+git refuses to remove a worktree it does not own. Inspect it by hand:
+  cat $wt/.git
+  git worktree list"
+  fi
+  out="$(python3 - "$wt" "$GITCOMMON" "$common" "$gd" "$top" "$wt" << 'REAL'
+import os, sys
+wt = sys.argv[1]
+for p in sys.argv[2:]:
+    if not os.path.isabs(p):
+        p = os.path.join(wt, p)
+    print(os.path.realpath(p))
+REAL
+  )" || die "cannot resolve the git directory of $wt — refusing to judge it"
+  r_git="$(printf '%s\n' "$out" | sed -n 1p)"
+  r_common="$(printf '%s\n' "$out" | sed -n 2p)"
+  r_gd="$(printf '%s\n' "$out" | sed -n 3p)"
+  r_top="$(printf '%s\n' "$out" | sed -n 4p)"
+  r_wt="$(printf '%s\n' "$out" | sed -n 5p)"
+  [ -n "$r_git" ] && [ -n "$r_common" ] && [ -n "$r_gd" ] && [ -n "$r_top" ] && [ -n "$r_wt" ] \
+    || die "cannot resolve the git directory of $wt — refusing to judge it"
+  [ "$r_common" = "$r_git" ] || bad="$r_common"
+  [ -n "$bad" ] || [ "$r_top" = "$r_wt" ] || bad="$r_top"
+  if [ -z "$bad" ]; then
+    case "$r_gd" in "$r_git"/worktrees/*) ;; *) bad="$r_gd" ;; esac
+  fi
+  [ -z "$bad" ] || die "worktree $wt does not belong to this repository — its .git points at $bad;
+an agent rewrote it: loom drop $wt will not remove it; inspect by hand.
+What git answers for that directory, against what this repository is:
+  --git-common-dir  $r_common
+  --git-dir         $r_gd
+  --show-toplevel   $r_top
+  this repository   $r_git
+  this directory    $r_wt
+Every command loom would run there — the fence, the gate, the review patch, the
+merge — would read that repository's config, its hooks and its refs instead of
+this one's. Nothing is done to it automatically:
+  cat $wt/.git
+  git worktree list"
+  return 0
+}
+
 # Which root a given worktree path belongs to. Used to name the root an add is
 # expected to land under, without re-deriving it from the path being checked.
 root_of_wt() { # root_of_wt <worktree-path>
@@ -2687,6 +2772,14 @@ Inspect it, do not land it:  git log --oneline $(git rev-parse --short "$base").
 # the whole trick behind `git checkout --detach HEAD~1` after a fenced commit.
 require_wt_on_branch() { # require_wt_on_branch <task> <worktree>
   local task="$1" wt="$2" br head
+  # FIRST, and before the branch question, because the branch question is
+  # answered BY the git directory this worktree points at. A `$wt/.git`
+  # rewritten to a decoy built with the same branch name answers
+  # `refs/heads/agent/<task>` perfectly happily (measured), so this check used
+  # to pass a directory aimed at another repository entirely — and every
+  # command downstream then read that repository's filters, hooks and refs.
+  # Being on the branch is only a fact once the worktree is ours.
+  require_wt_is_ours "$wt"
   br="$(branch_of "$task")"
   head="$(git -C "$wt" symbolic-ref -q HEAD 2>/dev/null || true)"
   [ "$head" = "refs/heads/$br" ] || die "the worktree $wt is not on refs/heads/$br
@@ -3781,7 +3874,32 @@ cmd_drop() {
       where="— NOT on origin yet: git push -u origin $br"
     fi
   fi
+  # The worktree must be OURS before git is asked to remove it, and before the
+  # record that says what it was goes away. git refuses to remove a worktree it
+  # does not own, and the removal below is written `|| true` — so a `$wt/.git`
+  # rewritten to point at another repository used to end in "dropped" printed
+  # over a directory that was still there, with whatever a fence profile had
+  # released still in it. Checked only when the directory exists: dropping a
+  # task whose tree is already gone is ordinary, and it is how a half-built
+  # `loom new` is cleaned up.
+  if [ -d "$wt" ]; then require_wt_is_ours "$wt"; fi
   git worktree remove "$wt" --force 2>/dev/null || true
+  # ... and the removal is not taken on trust either. `--force` still fails on
+  # a path git cannot unlink (a permission, a mount, a file another process
+  # holds), and `|| true` above swallows exactly that. A released path left on
+  # disk is the thing `loom drop` exists to prevent, so say what is left and
+  # stop — before the record that explains why it is there is deleted.
+  if [ -e "$wt" ]; then
+    { echo "loom: the worktree for $task is STILL on disk after 'git worktree remove --force':"
+      echo "  $wt"
+      echo "loom: what remains:"
+      find "$wt" -maxdepth 2 2>/dev/null | head -20 | sed 's|^|loom:   |' || true
+    } >&2
+    die "nothing was dropped for $task: its worktree is still there, so its operator
+record and its branch have been left alone too — the record is what says what
+that directory is. Find out why git could not remove it, clear it by hand, then
+re-run:  loom drop $task"
+  fi
   # The operator record goes with the worktree, --keep-branch or not: it names
   # a base, a profile and a pinned git config for a task that no longer has a
   # tree, and the next `loom new <task>` writes a fresh one. A kept branch keeps
