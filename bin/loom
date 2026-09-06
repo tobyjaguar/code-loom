@@ -3594,16 +3594,23 @@ same directory. The file has been removed. Inspect the worktree, do not re-run."
 # stuck" and "something is playing with loom's scratch directory" are different
 # facts and must not share an exit code.
 #
+# Two files reach this now, and they are not the same file: the blocked NOTE
+# the implementer wrote, and the task SPEC `loom loop` appends the reviewer's
+# text to. So the sentence that explains what the path is FOR is the caller's
+# too (`<why>`) — the refusal on a symlinked task spec used to say loom was
+# reading it "to decide what the implementer reported", which is the other
+# file's job and sends the operator looking in the wrong place.
+#
 #   0 = present, and a plain file with exactly one link
 #   1 = absent
 # anything else dies.
-probe_agent_file() { # probe_agent_file <path> <what-it-is>
+probe_agent_file() { # probe_agent_file <path> <what-it-is> [<why loom reads it>]
   local p="$1" what="$2" n
+  local why="${3:-loom reads that path, and a link answers with a file from somewhere else.}"
   if [ -L "$p" ]; then
     die "refusing to read $what:
   $p
-is a SYMLINK. loom reads that path to decide what the implementer reported, and
-a link answers with a file from somewhere else. Inspect it, do not re-run."
+is a SYMLINK. $why Inspect it, do not re-run."
   fi
   [ -e "$p" ] || return 1
   [ -f "$p" ] || die "refusing to read $what:
@@ -4302,7 +4309,9 @@ inside the worktree after the implementer's turn. Inspect it, do not re-run."
     fi
     # Its EXISTENCE is the whole message, so the path had better be the file
     # the implementer wrote here and not a link to one somewhere else.
-    if probe_agent_file "$rdir/$task-blocked.md" "task $task's blocked note"; then
+    if probe_agent_file "$rdir/$task-blocked.md" "task $task's blocked note" \
+         "loom reads that path to decide what the implementer reported, and a link
+answers with a file from somewhere else."; then
       echo "loom: implementer reported blocked — see .agents/reviews/$task-blocked.md"
       return 2
     fi
@@ -4504,6 +4513,8 @@ cmd_loop() {
     # WHOLE new content is built in a temp and RENAMED onto it (place_file), so
     # the file this task's implementer reads next is the file loom wrote.
     probe_agent_file "$tfile" "task $task's spec in the worktree" \
+      "loom reads that path as this task's spec and appends the reviewer's REVISE
+text to it, so a link both answers with, and writes into, a file somewhere else." \
       || die "no task file in the worktree at $tfile — is .agents/tasks/ gitignored? commit it so agent worktrees see it"
     appendtmp="$(mktemp "${TMPDIR:-/tmp}/loom-task.XXXXXX")" \
       || die "cannot create a temporary file for the fix round"
