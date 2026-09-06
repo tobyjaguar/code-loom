@@ -1009,15 +1009,24 @@ def closure(seeds):
         except OSError:
             # No value half at all: "(missing)" is the whole of what is known,
             # and an empty one would read as "present and empty".
-            out.append(("include:%s:(missing)" % esc(path)).encode("utf-8"))
+            out.append(("include:%s:(missing)" % esc(path))
+                       .encode("utf-8", "surrogateescape"))
             continue
         # path, sha256 AND the bytes — so a later edit of the target is a
         # content diff and not a pair of digests nobody can compare. Escaped
         # here rather than at render time: the record is NUL-framed with a
         # newline between its halves, and an included file may contain both.
+        # surrogateescape on the way out, because `path` came in through
+        # `decode("utf-8", "surrogateescape")` — an include path with a byte
+        # that is not UTF-8 is a lone surrogate here, and a plain
+        # `.encode("utf-8")` raises on it. That would be fail-closed (the
+        # snapshot dies and the command refuses) but it would refuse for the
+        # wrong reason, on an input the writer chooses. surrogateescape puts
+        # the byte back; it is neither NUL nor newline, so the framing holds.
         out.append(("include:%s:%s\n%s"
                     % (esc(path), hashlib.sha256(raw).hexdigest(),
-                       esc(raw.decode("utf-8", "replace")))).encode("utf-8"))
+                       esc(raw.decode("utf-8", "replace"))))
+                   .encode("utf-8", "surrogateescape"))
         sub = file_records(path)
         if sub is None:            # git cannot parse it, so git honours no
             continue               # include of its either; the digest above
@@ -1667,7 +1676,7 @@ REAL
     case "$r_gd" in "$r_git"/worktrees/*) ;; *) bad="$r_gd" ;; esac
   fi
   [ -z "$bad" ] || die "worktree $wt does not belong to this repository — its .git points at $bad;
-an agent rewrote it: loom drop $wt will not remove it; inspect by hand.
+an agent rewrote it: loom drop <task-id> will not remove it; inspect by hand.
 What git answers for that directory, against what this repository is:
   --git-common-dir  $r_common
   --git-dir         $r_gd
