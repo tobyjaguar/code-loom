@@ -5124,6 +5124,14 @@ checkout — inspect it, do not attach it:  git log --oneline $br"
   else
     git -C "$wt" checkout >&2
   fi
+  # THE BRANCH IS JUDGED BEFORE THIS COMMAND SAYS IT IS ATTACHED. `loom attach`
+  # used to build the worktree and stop there: a kept branch carrying
+  # `backend/etc -> /etc` was checked out, the live link materialised on disk,
+  # and only the NEXT command refused — with the doorway already open. The disk
+  # leg (inside fence_reconcile) and the fence reconcile both run here, while
+  # the EXIT trap is still armed, so a refusal unwinds the worktree and the
+  # record this command just wrote.
+  fence_reconcile "$wt" "$FENCE_PROFILE"
   config_repin "$task" strict-new \
     || die "cannot pin this repository's git config for task $task"
   config_summary  "$(config_sidecar "$task")"
@@ -5906,6 +5914,22 @@ fetched. Fix the fetch (network, credentials, the remote URL) and re-run."
   git merge-base --is-ancestor "$new_base" "$(branch_ref "$task")" \
     || die "the new base $(git rev-parse --short "$new_base") is not an ancestor of $br — refusing to
 record a base this branch does not descend from. Inspect $wt, do not re-run."
+  # The symlinks the REPLAYED branch carries, judged against the base that is
+  # about to be recorded — `loom check`, `loom loop`, `loom diff` and `loom land`
+  # all run this check over the branch's history and this command did not, so a
+  # rebase was the one way to move a branch with an escaping link along.
+  # Measured after the replay, because the new base decides what is inherited.
+  # A refusal has to leave the task as it found it, so the branch goes back to
+  # the pinned tip first — the same unwind the --accept-upstream refusal does.
+  local rlinks
+  rlinks="$(tree_escaping_links "$ROOT" "$(branch_ref "$task")" "$new_base")" \
+    || die "cannot read the symlinks $br carries after the rebase — refusing to guess what they point at"
+  if [ -n "$rlinks" ]; then
+    git -C "$wt" reset --hard "$PINNED_TIP" >/dev/null 2>&1 \
+      || echo "loom: WARNING: could not put $br back at $PINNED_TIP after refusing this
+rebase — the branch is left on $upstream. Inspect $wt." >&2
+    link_refuse_history "$rlinks"
+  fi
   # WHAT CAME UNDER THE BASE. Everything in old_base..new_base is about to stop
   # being reviewable: it is upstream now. The fenced and hand-zone hits are
   # computed through the FULL [fence] and the FULL [hand] — a fence profile

@@ -4257,6 +4257,65 @@ want_in "(co) doctor warns about a trunk symlink out of the tree" \
 git rm -q --cached backend/hostname > /dev/null; rm -f backend/hostname
 git commit -qm "(co) and removed again"
 
+# --- (cp) attach judges the branch BEFORE it says it is attached -------------
+# `loom attach` built the worktree and stopped: a kept branch carrying
+# `backend/etc -> /etc` was checked out, the live link materialised on disk, and
+# only the NEXT command refused — with the doorway already open. It now runs the
+# disk-leg link check and the fence reconcile before it declares the attach done,
+# with the EXIT trap still armed, so a refusal unwinds both.
+out="$("$LOOM" new 0123-cp 2>&1)"; rc=$?
+want_eq "(cp) setup: a task"                                        "$rc" "0"
+CP="$WTU/0123-cp"
+( cd "$CP" && ln -s /etc backend/etc && git add -A && git commit -qm "work on cp" )
+"$LOOM" drop 0123-cp --keep-branch > /dev/null 2>&1
+want_absent "(cp) setup: the worktree is gone and the branch is not" "$CP"
+out="$("$LOOM" attach 0123-cp 2>&1)"; rc=$?
+want_fail   "(cp) attach refuses a branch carrying an escaping link" "$rc"
+want_in     "(cp) ... naming it"                                    "$out" "backend/etc"
+want_absent "(cp) ... leaving no worktree"                          "$CP"
+want_absent "(cp) ... and no record"                                "$(state_of 0123-cp)"
+git branch -D agent/0123-cp > /dev/null 2>&1 || true
+# ... and the inherited case attaches, with the WARN and without the link.
+ln -s /etc/hostname backend/hostname
+git add backend/hostname
+git commit -qm "(cp) a trunk link, for the attach case"
+out="$("$LOOM" new 0124-cp2 2>&1)"; rc=$?
+want_eq "(cp) setup: a task on that trunk"                          "$rc" "0"
+CP2="$WTU/0124-cp2"
+echo "cp2 work" > "$CP2/backend/cp2.txt"
+git -C "$CP2" add backend/cp2.txt
+git -C "$CP2" commit -qm "work on cp2"
+"$LOOM" drop 0124-cp2 --keep-branch > /dev/null 2>&1
+out="$("$LOOM" attach 0124-cp2 2>&1)"; rc=$?
+want_eq   "(cp) attach adopts a branch whose only escaping link is the trunk's" "$rc" "0"
+want_in   "(cp) ... with the WARN"                                  "$out" "backend/hostname"
+want_file "(cp) ... rebuilding the worktree"                        "$CP2/backend/cp2.txt"
+want_gone "(cp) ... and fencing the trunk's link out of it"         "$CP2/backend/hostname"
+"$LOOM" drop 0124-cp2 > /dev/null 2>&1 || true
+git branch -D agent/0124-cp2 > /dev/null 2>&1 || true
+git rm -q --cached backend/hostname > /dev/null; rm -f backend/hostname
+git commit -qm "(cp) and the trunk link removed"
+
+# --- (cq) rebase judges the branch it is about to rewrite --------------------
+# check/loop/diff/land all judge the symlinks a branch's history carries; rebase
+# did not — and it is the one command that REWRITES that history and re-points
+# the recorded base. A refusal has to leave the task exactly as it found it.
+out="$("$LOOM" new 0125-cq 2>&1)"; rc=$?
+want_eq "(cq) setup: a task"                                        "$rc" "0"
+CQ="$WTU/0125-cq"
+( cd "$CQ" && mkdir -p qd1/qd2 && ln -s ../.. qd1/qd2/l1 \
+  && ln -s ../qd1/qd2/l1/../../repo/core backend/qloot \
+  && git add -A && git commit -qm "work on cq" )
+cq_tip="$(git rev-parse refs/heads/agent/0125-cq)"
+cq_base="$(state_field 0125-cq base)"
+out="$("$LOOM" rebase 0125-cq main 2>&1)"; rc=$?
+want_fail "(cq) loom rebase refuses a branch carrying an escaping link" "$rc"
+want_in   "(cq) ... naming it"                                      "$out" "backend/qloot"
+want_eq   "(cq) ... leaving the branch at the tip it pinned" \
+          "$(git rev-parse refs/heads/agent/0125-cq)" "$cq_tip"
+want_eq   "(cq) ... and the recorded base where it was"             "$(state_field 0125-cq base)" "$cq_base"
+"$LOOM" drop 0125-cq > /dev/null 2>&1 || true
+
 # --- (j)/(t)/(cg) doctor lists the profiles, touches no network, and counts -
 # (cg): `local pname pprov prel role m mp bad` inside the [fence_profiles] loop
 # re-declared the function's own FAILURE COUNTER (`local ok=0 warn=0 bad=0`).
