@@ -3276,101 +3276,199 @@ fence_enforce() { # fence_enforce <worktree>
 # symlink AT a fenced path was already caught; this is the sibling case, and it
 # does not care what zone the link itself sits in.
 #
-# Judged LEXICALLY, and that is deliberate. `realpath` needs the entry to be on
-# disk, and under a fence half the tree is not checked out at all — so the
-# question is asked of the link's TEXT: an absolute target is outside by
-# construction, and a relative one escapes when its `..`s take it above the
-# worktree root. Nothing is followed, nothing is resolved, and a link that
-# stays inside the tree (`backend/inside -> ../docs`) is left alone.
-link_target_escapes() { # link_target_escapes <path-in-tree> <target>
-  local path="$1" tgt="$2" rest comp depth=0 dir
-  case "$tgt" in /*) return 0 ;; esac      # absolute: outside, whatever it names
-  # How deep the LINK's own directory sits below the tree root.
-  dir="${path%/*}"
-  if [ "$dir" != "$path" ] && [ -n "$dir" ]; then
-    rest="$dir"
-    while [ -n "$rest" ]; do
-      comp="${rest%%/*}"
-      if [ "$rest" = "$comp" ]; then rest=""; else rest="${rest#*/}"; fi
-      case "$comp" in ""|.) ;; ..) depth=$((depth - 1)) ;; *) depth=$((depth + 1)) ;; esac
-    done
-  fi
-  # Then walk the target from there. Going ABOVE the root at any point is the
-  # escape — `a/../../b` from depth 1 never does, `../../b` does.
-  rest="$tgt"
-  while [ -n "$rest" ]; do
-    comp="${rest%%/*}"
-    if [ "$rest" = "$comp" ]; then rest=""; else rest="${rest#*/}"; fi
-    case "$comp" in
-      ""|.) ;;
-      ..)   depth=$((depth - 1)); [ "$depth" -lt 0 ] && return 0 ;;
-      *)    depth=$((depth + 1)) ;;
-    esac
-  done
-  return 1
+# Judged as TEXT, never by following anything on disk: `realpath` needs the
+# entry to be there, and under a fence half the tree is not checked out at all.
+# But TEXT is not the same as ONE LINK'S text, and that was round 16's hole. The
+# check used to count `..` against an assumed directory depth, so both of
+#
+#   d1/d2/l1     -> ../..                          (depth 2 -> 0: "inside")
+#   backend/loot -> ../d1/d2/l1/../../repo/core    (never below 0: "inside")
+#
+# passed, and composed into <parent of the worktree root>/repo/core — the
+# operator's own checkout, readable through `backend/loot` by every worktree
+# built from that branch. Reproduced: `loom check` rc 0, `loom land` merged both
+# 120000 entries, an unprofiled worktree read core/** through it, a profiled one
+# read a path its profile does not release, and an agent WROTE the operator's
+# .agents/gate.sh — the script `run_gate` executes as the operator.
+#
+# So a target is resolved WITHIN THE TREE'S OWN LINK MAP: every mode-120000
+# entry of the subject (the INDEX for the disk leg, the commit's TREE for the
+# history leg), walked component by component over a stack rooted at the tree
+# root. `..` at the root is the escape, an absolute target is the escape by
+# construction, and every component that is itself a link in the map is
+# substituted and followed — including a PREFIX of the walked path, so `a/b/c`
+# where `a/b` is a link goes through it. A chain more than 40 hops deep, or one
+# that closes on itself, is "unresolvable" and is REFUSED rather than guessed at.
+links_py() { # links_py judge <dir> <spec>
+  python3 - "$@" << 'PY'
+import os, subprocess, sys
+
+mode = sys.argv[1]
+d    = sys.argv[2]
+spec = sys.argv[3]
+
+def die(msg):
+    sys.stderr.write("loom: %s\n" % msg)
+    raise SystemExit(2)
+
+def dec(b):
+    return b.decode("utf-8", "surrogateescape")
+
+def emit(s):
+    sys.stdout.buffer.write(s.encode("utf-8", "surrogateescape"))
+
+def link_map(what):
+    """{path: target} for every mode-120000 entry of <what>. ':index' is the
+    index of <d>; anything else is a rev, read as a tree."""
+    if what == ":index":
+        cmd, shafield = ["git", "-C", d, "ls-files", "-s", "-z"], 1
+    else:
+        cmd, shafield = ["git", "-C", d, "ls-tree", "-r", "-z", what], 2
+    p = subprocess.run(cmd, stdout=subprocess.PIPE)
+    if p.returncode != 0:
+        die("cannot list the symlinks of '%s' in %s — refusing to guess what "
+            "they point at" % (what, d))
+    shas, paths = [], []
+    for rec in p.stdout.split(b"\0"):
+        if not rec:
+            continue
+        head, tab, path = rec.partition(b"\t")
+        if not tab:
+            die("cannot parse a git entry of '%s' in %s" % (what, d))
+        f = head.split(b" ")
+        if len(f) < 3 or f[0] != b"120000":
+            continue
+        shas.append(f[shafield])
+        paths.append(path)
+    if not shas:
+        return {}
+    # ONE `cat-file --batch` for every target rather than one git per link: the
+    # map is built for every command that touches a worktree.
+    q = subprocess.Popen(["git", "-C", d, "cat-file", "--batch"],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    data, _ = q.communicate(b"\n".join(shas) + b"\n")
+    if q.returncode != 0:
+        die("cannot read the symlink targets of '%s' in %s" % (what, d))
+    out, pos = {}, 0
+    for path in paths:
+        nl = data.find(b"\n", pos)
+        if nl < 0:
+            die("cannot read the symlink target of %s in %s" % (dec(path), d))
+        hdr = data[pos:nl].split(b" ")
+        if len(hdr) != 3 or hdr[1] != b"blob":
+            die("cannot read the symlink target of %s in %s" % (dec(path), d))
+        n = int(hdr[2])
+        out[dec(path)] = dec(data[nl + 1:nl + 1 + n])
+        pos = nl + 1 + n + 1
+    return out
+
+MAXHOPS = 40
+
+def above(rest, n):
+    """Where a target lands once it has climbed above the tree root, as text,
+    so the refusal can name the resolved escape and not just the link."""
+    st = []
+    for c in rest:
+        if c in ("", "."):
+            continue
+        if c == "..":
+            if st:
+                st.pop()
+            else:
+                n += 1
+        else:
+            st.append(c)
+    up = "../" * n
+    return (up + "/".join(st)) if st else up.rstrip("/")
+
+def resolve(path, target, m):
+    """('inside', None) | ('escape', <where>) | ('unresolvable', <why>)"""
+    if target.startswith("/"):
+        return ("escape", target)
+    pending = []
+    if "/" in path:
+        pending.extend(path.rsplit("/", 1)[0].split("/"))
+    pending.extend(target.split("/"))
+    stack, hops, seen = [], 0, set()
+    while pending:
+        comp = pending.pop(0)
+        if comp in ("", "."):
+            continue
+        if comp == "..":
+            if not stack:
+                return ("escape", above(pending, 1))
+            stack.pop()
+            continue
+        stack.append(comp)
+        cur = "/".join(stack)
+        t = m.get(cur)
+        if t is None:
+            continue
+        hops += 1
+        if hops > MAXHOPS:
+            return ("unresolvable", "more than %d links deep" % MAXHOPS)
+        key = (cur, tuple(pending))
+        if key in seen:
+            return ("unresolvable", "a cycle")
+        seen.add(key)
+        stack.pop()                    # the link is REPLACED by what it names
+        if t.startswith("/"):
+            return ("escape", os.path.normpath("/".join([t] + pending)))
+        pending = t.split("/") + pending
+    return ("inside", None)
+
+links = link_map(spec)
+if mode == "judge":
+    for p in sorted(links):
+        t = links[p]
+        kind, where = resolve(p, t, links)
+        if kind == "escape":
+            emit("\n  %s -> %s  (resolves to %s, outside the tree)" % (p, t, where))
+        elif kind == "unresolvable":
+            emit("\n  %s -> %s  (unresolvable link chain: %s)" % (p, t, where))
+else:
+    die("internal error: unknown links mode '%s'" % mode)
+PY
 }
 
 # The tracked symlinks in a worktree's INDEX that leave it. The index, not the
-# disk: under a fence the entry may not be checked out, and an untracked link
-# an agent made for itself is not the thing that survives into the next
-# worktree — a COMMITTED one is.
-wt_escaping_links() { # wt_escaping_links <worktree>  -> the offending lines
-  local wt="$1" rec mode sha path tgt bad="" out
-  out="$(mktemp "${TMPDIR:-/tmp}/loom-links.XXXXXX")" \
-    || die "cannot create a temporary file for the symlink scan"
-  tmp_track "$out"
-  git -C "$wt" ls-files -s -z > "$out" 2>/dev/null \
-    || die "cannot list the index of $wt — refusing to guess what it links to"
-  while IFS= read -r -d '' rec; do
-    mode="${rec%% *}"
-    [ "$mode" = 120000 ] || continue
-    path="${rec#*$'\t'}"
-    sha="${rec#* }"; sha="${sha%% *}"
-    tgt="$(git -C "$wt" cat-file -p "$sha" 2>/dev/null)" \
-      || die "cannot read the symlink target of $path in $wt — refusing to guess"
-    link_target_escapes "$path" "$tgt" && bad="$bad
-  $path -> $tgt"
-  done < "$out"
-  rm -f "$out"
-  printf '%s' "$bad"
+# disk: under a fence the entry may not be checked out, and an untracked link an
+# agent made for itself is not the thing that survives into the next worktree —
+# a COMMITTED one is.
+#
+# The die is the CALLER's, on the exit status, and that is not a style choice:
+# this is read as `x="$(wt_escaping_links …)"`, where a `die` inside the function
+# ends the command substitution's subshell and hands the caller an empty answer —
+# "no escaping links", on exactly the input an agent controls.
+wt_escaping_links() { # wt_escaping_links <worktree>  -> offending lines
+  links_py judge "$1" ":index"
 }
 
-# The same question asked of a COMMIT's tree, for the history checks: a
-# worktree can be re-fenced or the link removed from disk, and the commit still
-# carries mode 120000 into the review patch, the merge and every future
-# worktree built from it.
-tree_escaping_links() { # tree_escaping_links <dir> <rev>  -> the offending lines
-  local d="$1" rev="$2" rec mode sha path tgt bad="" out
-  out="$(mktemp "${TMPDIR:-/tmp}/loom-links.XXXXXX")" \
-    || die "cannot create a temporary file for the symlink scan"
-  tmp_track "$out"
-  git -C "$d" ls-tree -r -z "$rev" > "$out" 2>/dev/null \
-    || die "cannot list the tree of $rev in $d — refusing to guess what it links to"
-  while IFS= read -r -d '' rec; do
-    mode="${rec%% *}"
-    [ "$mode" = 120000 ] || continue
-    path="${rec#*$'\t'}"
-    sha="${rec%%$'\t'*}"; sha="${sha##* }"
-    tgt="$(git -C "$d" cat-file -p "$sha" 2>/dev/null)" \
-      || die "cannot read the symlink target of $path at $rev — refusing to guess"
-    link_target_escapes "$path" "$tgt" && bad="$bad
-  $path -> $tgt"
-  done < "$out"
-  rm -f "$out"
-  printf '%s' "$bad"
+# The same question asked of a COMMIT's tree, for the history checks: a worktree
+# can be re-fenced or the link removed from disk, and the commit still carries
+# mode 120000 into the review patch, the merge and every future worktree built
+# from it.
+tree_escaping_links() { # tree_escaping_links <dir> <rev>  -> offending lines
+  links_py judge "$1" "$2"
+}
+
+link_refuse_history() { # link_refuse_history <offending-lines>
+  die "this branch's commits carry symlinks that point OUTSIDE the worktree:$1
+A committed symlink is a mode, not a file: every worktree loom builds from this
+branch checks it out, and whatever it names is then readable through it — the
+fence removes PATHS, and it cannot remove a doorway to one. Targets are resolved
+through this tree's OWN links and never followed on disk, so this is what the
+links say, not what happens to be there today.
+Replace them with links that stay inside the tree, or throw the branch away:
+  loom drop <task-id>"
 }
 
 link_reconcile_history() { # link_reconcile_history <dir> <rev>
-  local bad; bad="$(tree_escaping_links "$1" "$2")"
+  local bad
+  bad="$(tree_escaping_links "$1" "$2")" \
+    || die "cannot read the symlinks in the tree of $2 — refusing to guess what they point at"
   [ -n "$bad" ] || return 0
-  die "this branch's commits carry symlinks that point OUTSIDE the worktree:$bad
-A committed symlink is a mode, not a file: every worktree loom builds from this
-branch checks it out, and whatever it names is then readable through it — the
-fence removes PATHS, and it cannot remove a doorway to one. Targets are read as
-text and never followed, so this is what the link says, not what happens to be
-there today.
-Replace them with links that stay inside the tree, or throw the branch away:
-  loom drop <task-id>"
+  link_refuse_history "$bad"
 }
 
 # The task's RECORDED BASE, for the one question fence_reconcile cannot answer
@@ -3422,7 +3520,8 @@ fence_reconcile() { # fence_reconcile <worktree> <asserted-profile-or-empty>
   # FIRST, because it is the one thing re-fencing cannot fix: a tracked symlink
   # pointing out of the tree is a doorway the sparse rules do not close, and it
   # is in the index of every worktree built from the branch that carries it.
-  links="$(wt_escaping_links "$wt")"
+  links="$(wt_escaping_links "$wt")" \
+    || die "cannot read the tracked symlinks of $wt — refusing to guess what they point at"
   [ -z "$links" ] || die "worktree $wt has tracked symlinks that point OUTSIDE it:$links
 The fence removes PATHS from a worktree; it cannot remove a doorway to one, and
 this tree has one — whatever those links name is readable here whether it was

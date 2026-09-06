@@ -270,7 +270,10 @@ for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p \
          0091-bw 0093-bx 0094-by 0095-bz 0096-ca 0097-cb \
          0098-cc 0099-cd 0100-ce 0101-cf 0102-cf2 \
          0103-ch 0104-ch2 0105-ch3 0106-ci 0107-ci2 0108-ci3 \
-         0109-cj 0110-cj2 0111-cj3; do mk_task "$t"; done
+         0109-cj 0110-cj2 0111-cj3 \
+         0112-ck 0113-ck2 0114-ck3 0115-ck4 0116-ck5 \
+         0117-cl 0118-cl2 0119-cm 0120-cm2 0121-cn 0122-cn2 \
+         0123-cp 0124-cp2 0125-cq; do mk_task "$t"; done
 mk_task 0040-ar  codex
 mk_task 0042-as  codex
 mk_task 0005-f codex
@@ -3953,6 +3956,103 @@ want_absent "(cj) ... and built nothing"                            "$WTU/0111-c
 "$LOOM" drop 0111-cj3 > /dev/null 2>&1 || true
 git branch -D agent/0111-cj3 > /dev/null 2>&1 || true
 git remote remove origin
+
+# --- (ck) a TWO-HOP symlink chain, which one link's text cannot see ----------
+# `link_target_escapes` counted `..` against an assumed directory depth, so each
+# link was judged on its OWN text with every component treated as a real
+# directory. Two links that are each "inside" compose into one that is not:
+#
+#   d1/d2/l1     -> ../..                          (depth 2 -> 0)
+#   backend/loot -> ../d1/d2/l1/../../repo/core    (never below 0)
+#
+# and `backend/loot` then names the OPERATOR'S OWN CHECKOUT — two levels above
+# the worktree, which is exactly where $REPO sits beside $LOOM_WORKTREES.
+# Reproduced by the external review: `loom check` rc 0, `loom land` merged both
+# 120000 entries, a fresh worktree read core/** through it, and an agent WROTE
+# the operator's .agents/gate.sh — the script run_gate executes. Targets are now
+# resolved within the tree's own link map.
+out="$("$LOOM" new 0112-ck 2>&1)"; rc=$?
+want_eq "(ck) setup: a task"                                        "$rc" "0"
+CK="$WTU/0112-ck"
+( cd "$CK" && mkdir -p d1/d2 && ln -s ../.. d1/d2/l1 \
+  && ln -s ../d1/d2/l1/../../repo/core backend/loot \
+  && git add -A && git commit -qm "work on ck" )
+want_eq "(ck) setup: both entries really are mode 120000" \
+        "$(git -C "$CK" ls-tree -r HEAD -- backend/loot d1/d2/l1 | cut -d' ' -f1 | tr '\n' ' ')" \
+        "120000 120000 "
+want_eq "(ck) setup: and the chain really does land in the operator's checkout" \
+        "$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$CK/backend/loot")" \
+        "$REPO_REAL/core"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0112-ck 2>&1)"; rc=$?
+want_fail   "(ck) loom check refuses the two-hop chain"             "$rc"
+want_in     "(ck) ... naming the link the agent added"              "$out" "backend/loot"
+want_in     "(ck) ... and where it RESOLVES, not just what it says" "$out" "../../repo/core"
+want_absent "(ck) ... with no review patch written"                 "$CK/.agents/reviews/0112-ck.patch"
+out="$("$LOOM" land 0112-ck 2>&1)"; rc=$?
+want_fail   "(ck) loom land refuses it too"                         "$rc"
+want_in     "(ck) ... naming the path"                              "$out" "backend/loot"
+want_eq     "(ck) ... and merged nothing" \
+            "$(git merge-base --is-ancestor refs/heads/agent/0112-ck HEAD 2>/dev/null && echo merged || echo no)" "no"
+"$LOOM" drop 0112-ck > /dev/null 2>&1 || true
+# The DISK leg on its own: staged, never committed, so only the index carries it.
+out="$("$LOOM" new 0113-ck2 2>&1)"; rc=$?
+want_eq "(ck) setup: a second task"                                 "$rc" "0"
+CK2="$WTU/0113-ck2"
+# One ordinary commit first, so that the branch has work to review and the only
+# thing standing between this `loom check` and a green run is the staged chain.
+echo "ck2 work" > "$CK2/backend/ck2.txt"
+git -C "$CK2" add backend/ck2.txt
+git -C "$CK2" commit -qm "work on ck2"
+( cd "$CK2" && mkdir -p k2d1/k2d2 && ln -s ../.. k2d1/k2d2/l1 \
+  && ln -s ../k2d1/k2d2/l1/../../repo/core backend/k2loot && git add -A )
+want_ne "(ck) setup: the chain is in the INDEX"                     "$(git -C "$CK2" ls-files -s -- backend/k2loot)" ""
+want_eq "(ck) setup: ... and in no commit"                          "$(git -C "$CK2" ls-tree -r HEAD -- backend/k2loot)" ""
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0113-ck2 2>&1)"; rc=$?
+want_fail "(ck) the disk leg refuses a chain that is only staged"   "$rc"
+want_in   "(ck) ... naming it"                                      "$out" "backend/k2loot"
+git -C "$CK2" reset -q --hard
+"$LOOM" drop 0113-ck2 > /dev/null 2>&1 || true
+# The control: a chain that stays inside the tree is nobody's business.
+out="$("$LOOM" new 0114-ck3 2>&1)"; rc=$?
+want_eq "(ck) setup: a third task"                                  "$rc" "0"
+CK3="$WTU/0114-ck3"
+( cd "$CK3" && mkdir -p k3d1 && ln -s .. k3d1/l && ln -s ../k3d1/l/backend backend/x \
+  && git add -A && git commit -qm "work on ck3" )
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0114-ck3 2>&1)"; rc=$?
+want_eq   "(ck) control: a chain that stays inside passes"          "$rc" "0"
+want_file "(ck) ... and the patch is written"                       "$CK3/.agents/reviews/0114-ck3.patch"
+"$LOOM" drop 0114-ck3 > /dev/null 2>&1 || true
+git branch -D agent/0114-ck3 > /dev/null 2>&1 || true
+# A CYCLE is refused rather than followed: loom does not guess what it names.
+out="$("$LOOM" new 0115-ck4 2>&1)"; rc=$?
+want_eq "(ck) setup: a fourth task"                                 "$rc" "0"
+CK4="$WTU/0115-ck4"
+( cd "$CK4/backend" && ln -s b a && ln -s a b )
+( cd "$CK4" && git add -A && git commit -qm "work on ck4" )
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0115-ck4 2>&1)"; rc=$?
+want_fail "(ck) a link cycle is refused"                            "$rc"
+want_in   "(ck) ... as unresolvable, not as 'inside'"               "$out" "unresolvable link chain"
+"$LOOM" drop 0115-ck4 > /dev/null 2>&1 || true
+# A chain THROUGH a link the trunk carries. The first hop is inherited AND stays
+# inside the tree on its own terms, so it is neither refused nor fenced out —
+# and it is still in the resolution map, so the hop the agent added is caught.
+mkdir -p k5d1/k5d2
+ln -s ../.. k5d1/k5d2/l1
+git add k5d1
+git commit -qm "(ck) a link the trunk carries that stays inside it"
+out="$("$LOOM" new 0116-ck5 2>&1)"; rc=$?
+want_eq   "(ck) setup: a task cut from that trunk"                  "$rc" "0"
+CK5="$WTU/0116-ck5"
+want_file "(ck) setup: the inherited hop is in the worktree — it does not escape" "$CK5/k5d1/k5d2/l1"
+( cd "$CK5" && ln -s ../k5d1/k5d2/l1/../../repo/core backend/k5loot \
+  && git add -A && git commit -qm "work on ck5" )
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0116-ck5 2>&1)"; rc=$?
+want_fail   "(ck) a chain THROUGH an inherited link is still refused" "$rc"
+want_in     "(ck) ... naming the hop the agent added"               "$out" "backend/k5loot"
+want_not_in "(ck) ... and not the trunk's own"                      "$out" "k5d1/k5d2/l1 ->"
+"$LOOM" drop 0116-ck5 > /dev/null 2>&1 || true
+git rm -q -r --cached k5d1 > /dev/null; rm -rf k5d1
+git commit -qm "(ck) and the trunk's link taken back out"
 
 # --- (j)/(t)/(cg) doctor lists the profiles, touches no network, and counts -
 # (cg): `local pname pprov prel role m mp bad` inside the [fence_profiles] loop
