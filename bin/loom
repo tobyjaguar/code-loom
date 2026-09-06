@@ -489,12 +489,14 @@ STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/loom/repos/$STATE_KEY"
 state_file() { # state_file <task>  -> the path of that task's record
   case "$1" in
     ""|.|..|*/*) die "'$1' is not a usable task id (no '/', '.' or '..')" ;;
-    # The pinned git config lives beside the record as `<task>.gitconfig`, so a
-    # task literally called `x.gitconfig` would have its record written over
-    # task `x`'s config sidecar (and read back as one). Refuse the name.
-    *.gitconfig) die "'$1' is not a usable task id: a task's pinned git config is
-recorded beside its operator record as '<task>.gitconfig', so an id ending in
-'.gitconfig' would collide with another task's. Rename the task." ;;
+    # The pinned git config lives beside the record as `<task>.gitconfig`, and
+    # the authoritative review artifacts as `<task>.artifacts/`, so a task
+    # literally called `x.gitconfig` (or `x.artifacts`) would have its record
+    # written over task `x`'s sidecar (and read back as one). Refuse the name.
+    *.gitconfig|*.artifacts) die "'$1' is not a usable task id: a task's pinned git config is
+recorded beside its operator record as '<task>.gitconfig' and its review
+artifacts as '<task>.artifacts/', so an id ending in '.gitconfig' or
+'.artifacts' would collide with another task's. Rename the task." ;;
   esac
   printf '%s\n' "$STATE_DIR/tasks/$1"
 }
@@ -823,8 +825,16 @@ not $cmd against a remote it cannot vouch for. Put it back, or start clean:
 # tracking itself — it answers through `$(…)`, i.e. from a subshell, where an
 # assignment to this array would be discarded — so tracking is the caller's,
 # one line under each call.
+#
+# The same list, and the same exit trap, sweep loom's OTHER temporary files:
+# the gate log, the review patch and the reviewer's transcript are now written
+# to a temp first (the authoritative copy under $STATE_DIR is taken from it,
+# and `place_file` renames a copy of it into the worktree), and every one of
+# those calls has a dozen ways to die in between. `tmp_track` is `cfg_track`
+# under the name that says what it is tracking.
 CFG_TMPS=()
 cfg_track()   { CFG_TMPS+=("$1"); }
+tmp_track()   { CFG_TMPS+=("$1"); }
 cfg_cleanup() {
   local p
   for p in ${CFG_TMPS[0]+"${CFG_TMPS[@]}"}; do rm -f "$p"; done
@@ -1837,7 +1847,58 @@ Otherwise put it back:
 #
 # The REPOSITORY baseline ($STATE_DIR/config) is deliberately not touched here:
 # it is not this task's.
-state_rm() { rm -f "$(state_file "$1")" "$(config_sidecar "$1")"; }
+state_rm() {
+  rm -f "$(state_file "$1")" "$(config_sidecar "$1")"
+  rm -rf "$(state_artifact_dir "$1")"
+}
+
+# ------------------------------------------- the AUTHORITATIVE review artifacts
+# The review patch, the reviewer's text and the gate log are written HERE
+# first — beside the operator record, outside every repository and outside the
+# shared `.git` — and only then PLACED into the worktree, where they are a
+# courtesy for the agent that reads them and nothing loom acts on.
+#
+# The reason is the same one the operator record itself is here for. Those
+# three files are loom's own writes into a tree the agent owns, and the copy in
+# the worktree is a copy an agent can replace between loom writing it and loom
+# reading it back: `loom loop` reads the review to decide REVISE vs APPROVE and
+# then pastes it into the task spec the implementer reads, and `loom run` reads
+# the gate log's tail into the next attempt's prompt. Neither question may be
+# answered by a file the answering party wrote.
+#
+#   $STATE_DIR/tasks/<task>.artifacts/<task>.patch
+#   $STATE_DIR/tasks/<task>.artifacts/<task>-review.md
+#   $STATE_DIR/tasks/<task>.artifacts/<task>-gate.log
+#
+# Beside the record and the config sidecar, named the way the sidecar is (which
+# is why `state_file` refuses an id ending in `.artifacts`), 0700/0600, and
+# removed by `state_rm` with the rest of the task's state.
+#
+# Be exact about what that is worth — the same sentence the record carries: it
+# is OPERATOR INTEGRITY, not tamper-proofing. An unsandboxed agent can write
+# $HOME (KNOWN-GAPS 3) and this directory is in it. What it removes is the
+# class of "the tree loom is judging rewrites the thing loom judges it by",
+# which is one `ln -s` away and needs no capability at all.
+state_artifact_dir() { # state_artifact_dir <task> -> where that task's artifacts live
+  printf '%s\n' "$(state_file "$1").artifacts"
+}
+
+state_artifact() { # state_artifact <task> <name> <source-file> -> the path written
+  local task="$1" name="$2" src="$3" d f tmp
+  case "$name" in
+    ""|.|..|*/*) die "internal error: '$name' is not an artifact name" ;;
+  esac
+  d="$(state_artifact_dir "$task")"
+  ( umask 077; mkdir -p "$d" ) \
+    || die "cannot create the operator artifact directory $d"
+  chmod 700 "$d" 2>/dev/null || true
+  f="$d/$name"; tmp="$d/.$name.tmp.$$"
+  ( umask 077; cat "$src" > "$tmp" ) \
+    || { rm -f "$tmp"; die "cannot write the operator copy of $name at $f"; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$f" || { rm -f "$tmp"; die "cannot write the operator copy of $name at $f"; }
+  printf '%s\n' "$f"
+}
 
 # ------------------------------------------------------------ worktree roots
 # Two roots, and `loom` must be able to say where each one physically IS before
@@ -3326,41 +3387,150 @@ hook_path() { git rev-parse --git-path hooks/pre-commit; }
 # The resolved path is what the caller writes into, never `$wt/.agents/reviews`
 # spelled out again: re-deriving it would re-open the window between the check
 # and the write.
-reviews_dir() { # reviews_dir <worktree>  -> the RESOLVED review directory
-  local wt="$1" rwt adir rdir
+#
+# The walk is per COMPONENT rather than on the leaf alone, and that is what
+# `resolve_under_wt` is: `.agents` is the coarse variant, `.agents/reviews` the
+# stealth one, and a third level would need no new code.
+resolve_under_wt() { # resolve_under_wt <worktree> <relative-dir> -> its physical path
+  local wt="$1" rel="$2" rwt rest part acc="" dir=""
   rwt="$(cd "$wt" 2>/dev/null && pwd -P)" \
-    || die "no worktree at $wt — refusing to write a review into a directory that is not there"
-  if [ -e "$wt/.agents" ] || [ -L "$wt/.agents" ]; then
-    adir="$(cd "$wt/.agents" 2>/dev/null && pwd -P)" \
-      || die "refusing to write a review in $wt: its .agents cannot be resolved as a
+    || die "no worktree at $wt — refusing to write into a directory that is not there"
+  rest="$rel"
+  while [ -n "$rest" ]; do
+    part="${rest%%/*}"
+    if [ "$part" = "$rest" ]; then rest=""; else rest="${rest#*/}"; fi
+    { [ -n "$part" ] && [ "$part" != "." ]; } || continue
+    acc="${acc:+$acc/}$part"
+    dir="$(cd "$wt/$acc" 2>/dev/null && pwd -P)" \
+      || die "refusing to write in $wt: its $acc cannot be resolved as a
 directory. Something replaced it — inspect it, do not re-run."
-    case "$adir" in
+    case "$dir" in
       "$rwt"/*) ;;
-      *) die "refusing to write a review in $wt: .agents resolves to
-  $adir
+      *) die "refusing to write in $wt: $acc resolves to
+  $dir
 which is outside the worktree
   $rwt
-Something replaced it with a link out of the tree. The review patch carries the
-content of every path in the diff, so it is not written anywhere but here.
-Inspect it, do not re-run." ;;
+Something replaced it with a link out of the tree, which redirects loom's OWN
+writes — the review patch (which carries the content of every path in the diff,
+released paths included), the gate log, the review text and the task spec — into
+whatever it points at. Inspect it, do not re-run:
+  ls -ld $wt/.agents $wt/.agents/reviews" ;;
     esac
+  done
+  [ -n "$dir" ] || die "internal error: resolve_under_wt was given no relative directory"
+  printf '%s\n' "$dir"
+}
+
+reviews_dir() { # reviews_dir <worktree>  -> the RESOLVED review directory
+  local wt="$1"
+  # `.agents` FIRST, and BEFORE the mkdir below: `mkdir -p "$wt/.agents/reviews"`
+  # through a symlinked `.agents` would CREATE the directory at the far end —
+  # a write outside the worktree by the very call that is supposed to be
+  # checking. Only when it is there at all; git cannot track an empty directory.
+  if [ -e "$wt/.agents" ] || [ -L "$wt/.agents" ]; then
+    resolve_under_wt "$wt" ".agents" > /dev/null
   fi
   mkdir -p "$wt/.agents/reviews" 2>/dev/null || true
-  rdir="$(cd "$wt/.agents/reviews" 2>/dev/null && pwd -P)" \
-    || die "cannot create or resolve $wt/.agents/reviews — refusing to write a review there"
-  case "$rdir" in
-    "$rwt"/*) ;;
-    *) die "refusing to write a review in $wt: .agents/reviews resolves to
-  $rdir
-which is outside the worktree
-  $rwt
-A symlink there redirects loom's OWN writes — the review patch (which carries
-the content of every path in the diff, released paths included), the gate log
-and the review text — out of this worktree and into whatever it points at.
-Inspect it, do not re-run:
-  ls -ld $wt/.agents $wt/.agents/reviews" ;;
+  resolve_under_wt "$wt" ".agents/reviews"
+}
+
+# --- every write into the worktree REPLACES the entry, and never follows it ---
+# `reviews_dir` answers "is this directory still inside the worktree". It does
+# not answer the question one level down: the FILE. `> "$rdir/<task>.patch"`
+# opens the path with O_CREAT|O_TRUNC and FOLLOWS a symlink standing there, so
+# a link at the leaf redirects the write exactly as a link at the directory
+# did — and a HARD link needs no symlink at all: two names for one inode, and
+# the far name sees every byte with nothing to see in `ls -l`.
+#
+# So loom's writes into a worktree all go through here, and the contract is:
+#
+#   1. the worktree and the target's parent chain are RE-RESOLVED immediately
+#      before the write (`resolve_under_wt`) — never trusted from earlier in
+#      the command, because the agent has had a turn in this tree since;
+#   2. the content is written to a fresh `mktemp` INSIDE the resolved parent;
+#   3. that temp is RENAMED onto the target. rename(2) replaces the target's
+#      directory ENTRY: a symlink there is overwritten as a link, a hardlinked
+#      name keeps the old inode and the old bytes, and neither ever sees what
+#      loom wrote;
+#   4. and the post-conditions are asserted rather than assumed — after the
+#      rename the target must not be a symlink and must have exactly one hard
+#      link, or the file is removed and the command dies.
+#
+# `mv -T` is the rename: `-T` is what stops `mv` from moving INTO a target that
+# is a symlink to a directory. Not every `mv` has it (BSD's does not), so
+# python3 — already required, for zones — is the fallback, and `os.rename` is
+# the same syscall.
+link_count() { # link_count <path> -> its hard-link count, or "" if neither stat answers
+  stat -c %h "$1" 2>/dev/null || stat -f %l "$1" 2>/dev/null || true
+}
+
+place_file() { # place_file <worktree> <relative-path> <source-file> -> the path written
+  local wt="$1" rel="$2" src="$3" parent base rdir target tmp n what=""
+  parent="$(dirname "$rel")"; base="$(basename "$rel")"
+  case "$base" in
+    ""|.|..) die "internal error: place_file was given no file name in '$rel'" ;;
   esac
-  printf '%s\n' "$rdir"
+  # `|| die` in place_file's OWN shell, deliberately. resolve_under_wt answers
+  # through `$( )`, so its refusal is a subshell exit and the assignment simply
+  # fails — and `loom run` reaches this from `loom loop` through `|| rc=$?`,
+  # which switches errexit off for the whole call. Without this the refusal
+  # would be a message nobody acted on and an empty $rdir.
+  rdir="$(resolve_under_wt "$wt" "$parent")" \
+    || die "refusing to write $rel in $wt: its $parent could not be resolved inside
+the worktree. Inspect it, do not re-run."
+  target="$rdir/$base"
+  tmp="$(mktemp "$rdir/.loom-place.XXXXXX")" \
+    || die "cannot create a temporary file in $rdir — refusing to write $rel"
+  cat "$src" > "$tmp" || { rm -f "$tmp"; die "cannot write $rel in $wt"; }
+  mv -T "$tmp" "$target" 2>/dev/null \
+    || python3 -c 'import os,sys; os.rename(sys.argv[1], sys.argv[2])' "$tmp" "$target" \
+    || { rm -f "$tmp"; die "cannot place $rel in $wt — the rename onto $target failed"; }
+  n="$(link_count "$target")"
+  if [ -L "$target" ]; then what="a symlink"
+  elif [ "$n" != "1" ]; then what="a file with ${n:-an unreadable number of} hard link(s)"
+  fi
+  if [ -n "$what" ]; then
+    rm -f "$target"
+    die "refusing to leave $rel in $wt: right after loom renamed its own file onto
+  $target
+that path is $what. loom writes a fresh file and renames it, so the only way
+this reads as anything but one plain file is that something else is writing the
+same directory. The file has been removed. Inspect the worktree, do not re-run."
+  fi
+  printf '%s\n' "$target"
+}
+
+# --- and the one file loom READS back out of the worktree --------------------
+# `<task>-blocked.md` is the implementer's own note, and loom acts on its mere
+# EXISTENCE: `loom run` returns 2 ("blocked") and `loom loop` stops and points
+# the operator at it. A symlink there answers that question with a file from
+# somewhere else — and a hard link is the same trick with nothing to see — so
+# neither is read as "blocked". It is a refusal instead: "the implementer is
+# stuck" and "something is playing with loom's scratch directory" are different
+# facts and must not share an exit code.
+#
+#   0 = present, and a plain file with exactly one link
+#   1 = absent
+# anything else dies.
+probe_agent_file() { # probe_agent_file <path> <what-it-is>
+  local p="$1" what="$2" n
+  if [ -L "$p" ]; then
+    die "refusing to read $what:
+  $p
+is a SYMLINK. loom reads that path to decide what the implementer reported, and
+a link answers with a file from somewhere else. Inspect it, do not re-run."
+  fi
+  [ -e "$p" ] || return 1
+  [ -f "$p" ] || die "refusing to read $what:
+  $p
+is not a regular file. Inspect it, do not re-run."
+  n="$(link_count "$p")"
+  [ "$n" = "1" ] || die "refusing to read $what:
+  $p
+has ${n:-an unreadable number of} hard links, so it is also a file under another
+name — the same redirect a symlink is, with nothing to see in 'ls -l'. Inspect
+it, do not re-run."
+  return 0
 }
 
 # Profiled tasks live under $WT_ROOT_PROFILED, unprofiled ones under $WT_ROOT,
@@ -3430,6 +3600,29 @@ branch_ref() { echo "refs/heads/agent/$1"; }
 # the one status line that says so, letting `loom land` publish over it. So the
 # pathspec is dropped in that case and the link counts as dirty, which is what
 # the refusal reads as.
+#
+# ... and the same rule one level down, on the ENTRIES. The directory being
+# loom's is not the whole of "this is loom's scratch": a symlink or a hard link
+# AT `.agents/reviews/<task>.patch` is a redirect of the same write, inside a
+# directory that passes every check above, and `git status` reports it — as a
+# modified or an untracked path — only while the exclusion is not hiding it.
+# So every entry must be a plain file with one name; anything else drops the
+# pathspec, exactly as a swapped directory does. (loom's own writes go through
+# `place_file`, which renames a fresh file onto the target and refuses to leave
+# anything but a one-link plain file behind, so this cannot fire on loom's own
+# scratch.)
+reviews_entries_plain() { # reviews_entries_plain <resolved-dir>
+  local d="$1" e
+  for e in "$d"/* "$d"/.*; do
+    case "${e##*/}" in .|..) continue ;; esac
+    # An unmatched glob comes back as the pattern itself.
+    { [ -e "$e" ] || [ -L "$e" ]; } || continue
+    if [ -L "$e" ] || [ ! -f "$e" ]; then return 1; fi
+    [ "$(link_count "$e")" = "1" ] || return 1
+  done
+  return 0
+}
+
 wt_dirty() { # wt_dirty <worktree>   -> the offending `git status --porcelain` lines
   local wt="$1" rwt rdir
   local -a spec=(-- .)
@@ -3438,7 +3631,9 @@ wt_dirty() { # wt_dirty <worktree>   -> the offending `git status --porcelain` l
   if [ ! -L "$wt/.agents" ] && [ ! -L "$wt/.agents/reviews" ] \
      && [ -d "$wt/.agents/reviews" ]; then
     rdir="$(cd "$wt/.agents/reviews" 2>/dev/null && pwd -P)" || rdir=""
-    [ "$rdir" = "$rwt/.agents/reviews" ] && spec+=(':(exclude).agents/reviews')
+    if [ "$rdir" = "$rwt/.agents/reviews" ] && reviews_entries_plain "$rdir"; then
+      spec+=(':(exclude).agents/reviews')
+    fi
   fi
   git -C "$wt" status --porcelain "${spec[@]}" 2>/dev/null \
     || die "cannot read the state of the worktree $wt — refusing to guess whether it is clean"
@@ -3887,7 +4082,7 @@ fenced paths into this worktree. Confirm it on the command line:
 cmd_run() {
   scan_fence_flag "$@"
   local task="${FLAG_ARGS[0]:?usage: loom run <task-id> [--fence-profile <name>]}"
-  local wt br attempt=1 gate_note="" title fnote pnote rdir
+  local wt br attempt=1 gate_note="" title fnote pnote rdir gatetmp gatelog gate_rc
   local -a newargs=()
   # require_fence_flag first: it may activate the profile, and which worktree
   # ROOT this task lives under follows the profile (wt_path).
@@ -3935,6 +4130,16 @@ fix failures until it exits 0. Write brief notes on what you did to \
 .agents/reviews/$task-done.md. If you cannot proceed, write why to \
 .agents/reviews/$task-blocked.md and stop.$fnote$pnote$gate_note" || true
 
+    # The implementer has just had a turn in THIS tree, so everything below
+    # re-resolves rather than trusting what was resolved before it ran: the
+    # review directory is one `ln -s` from being somewhere else, and it was
+    # last looked at before a model was launched into the worktree that owns it.
+    # `|| die` in cmd_run's own shell: from `loom loop` this function runs under
+    # `|| rc=$?`, which switches errexit off, so a failed assignment would carry
+    # on with an empty $rdir rather than stop.
+    rdir="$(reviews_dir "$wt")" \
+      || die "refusing to carry on in $wt: its .agents/reviews could not be resolved
+inside the worktree after the implementer's turn. Inspect it, do not re-run."
     # The OPERATOR's gate script, with the worktree as its cwd. `.agents/gate.sh`
     # inside the worktree is a file the implementer edits (the claude leg even
     # allowlists running it), so the copy that decides "green, commit it" must
@@ -3942,7 +4147,21 @@ fix failures until it exits 0. Write brief notes on what you did to \
     # `git update-ref`s the branch on the way past, is one line of shell. The
     # implementer still runs the worktree's copy for its own iteration; this is
     # the one whose verdict `loom` acts on.
-    if ( cd "$wt" && "$STATE_MAIN_ROOT/.agents/gate.sh" > "$rdir/$task-gate.log" 2>&1 ); then
+    #
+    # Its output goes to a temp, then to the AUTHORITATIVE copy beside the
+    # operator record, and only then into the worktree — `> "$rdir/…"` follows
+    # a symlink (or writes through a hard link) at the leaf, and the tail of
+    # this log is fed back to the next attempt as its prompt.
+    gatetmp="$(mktemp "${TMPDIR:-/tmp}/loom-gate.XXXXXX")" \
+      || die "cannot create a temporary file for the gate log"
+    tmp_track "$gatetmp"
+    gate_rc=0
+    ( cd "$wt" && "$STATE_MAIN_ROOT/.agents/gate.sh" > "$gatetmp" 2>&1 ) || gate_rc=$?
+    gatelog="$(state_artifact "$task" "$task-gate.log" "$gatetmp")" \
+      || die "cannot write the operator's copy of the gate log for $task"
+    place_file "$wt" ".agents/reviews/$task-gate.log" "$gatetmp" > /dev/null
+    rm -f "$gatetmp"
+    if [ "$gate_rc" -eq 0 ]; then
       echo "loom: gate green"
       # Checked explicitly: from `loom loop` this function runs under `|| rc=$?`,
       # which switches set -e off, and a failed add/commit (sparse-checkout
@@ -3953,12 +4172,16 @@ fix failures until it exits 0. Write brief notes on what you did to \
       echo "loom: committed on $br — review with: loom check $task && loom diff $task"
       return 0
     fi
-    if [ -f "$rdir/$task-blocked.md" ]; then
+    # Its EXISTENCE is the whole message, so the path had better be the file
+    # the implementer wrote here and not a link to one somewhere else.
+    if probe_agent_file "$rdir/$task-blocked.md" "task $task's blocked note"; then
       echo "loom: implementer reported blocked — see .agents/reviews/$task-blocked.md"
       return 2
     fi
+    # Read from the operator's copy, which is the point of taking one: this
+    # text becomes the next attempt's prompt.
     gate_note=" PREVIOUS ATTEMPT FAILED THE GATE. Failing output (tail):
-$(tail -40 "$rdir/$task-gate.log" 2>/dev/null)"
+$(tail -40 "$gatelog" 2>/dev/null)"
     attempt=$((attempt + 1))
   done
 
@@ -3970,7 +4193,7 @@ $(tail -40 "$rdir/$task-gate.log" 2>/dev/null)"
 cmd_check() {
   scan_fence_flag "$@"
   local task="${FLAG_ARGS[0]:?usage: loom check <task-id> [--fence-profile <name>]}"
-  local wt base review log rdir pnote=""
+  local wt base review log rdir patchtmp pnote=""
   require_fence_flag "$task" check
   # BEFORE the first fence operation, which is the whole of this line's
   # placement: `fence_reconcile` -> `fence_apply` -> `git sparse-checkout set`
@@ -3995,14 +4218,27 @@ cmd_check() {
   # One base, one endpoint, and neither is read from the worktree: the patch
   # handed to the reviewer is exactly the range the history check just cleared,
   # cut against the SHA that range was cleared for.
-  # RESOLVED before the patch is written, and written to the resolved path:
-  # this patch carries the content of every path in the diff, released paths
-  # included, and .agents/reviews is a directory the agent owns.
+  # RESOLVED before the patch is written, and it is the EARLY refusal: a
+  # redirected review directory must stop this command before the diff is even
+  # computed, not at the write. (`place_file` resolves it again, immediately
+  # before each write; this call is what makes the refusal happen here.)
   rdir="$(reviews_dir "$wt")"
-  git -C "$ROOT" diff --no-ext-diff --no-textconv "$base" "$PINNED_TIP" > "$rdir/$task.patch" \
+  patchtmp="$(mktemp "${TMPDIR:-/tmp}/loom-patch.XXXXXX")" \
+    || die "cannot create a temporary file for the review patch"
+  tmp_track "$patchtmp"
+  git -C "$ROOT" diff --no-ext-diff --no-textconv "$base" "$PINNED_TIP" > "$patchtmp" \
     || die "cannot write the review patch for $task"
-  review="$rdir/$task-review.md"
-  log="$(mktemp "${TMPDIR:-/tmp}/loom-review.XXXXXX")"
+  # The AUTHORITATIVE copy first, beside the operator record; the worktree's is
+  # the courtesy copy the reviewer reads. This patch carries the content of
+  # every path in the diff, released paths included, and .agents/reviews is a
+  # directory the agent owns — so the write into it REPLACES the entry rather
+  # than following whatever is standing there.
+  state_artifact "$task" "$task.patch" "$patchtmp" > /dev/null
+  place_file "$wt" ".agents/reviews/$task.patch" "$patchtmp" > /dev/null
+  rm -f "$patchtmp"
+  log="$(mktemp "${TMPDIR:-/tmp}/loom-review.XXXXXX")" \
+    || die "cannot create a temporary file for the review"
+  tmp_track "$log"
   # Without this the scope check reads a released path as an "unauthorized
   # hand/fence change" and REVISEs a diff the profile explicitly authorised.
   if [ -n "$FENCE_PROFILE" ]; then
@@ -4015,7 +4251,12 @@ hand-zone path is still out of bounds."
 against the task spec .agents/tasks/$task.md and the plan it references. \
 Print your review to stdout: scope check, correctness concerns, test coverage, \
 and end with a final line 'VERDICT: APPROVE' or 'VERDICT: REVISE — <reason>'.$pnote" "$log"
-  cp "$log" "$review"
+  # Same order, same reason: the operator's copy is the one `loom loop` reads
+  # its verdict out of and pastes into the task spec, so it is written where
+  # the tree being reviewed cannot reach it, and the worktree gets a copy.
+  state_artifact "$task" "$task-review.md" "$log" > /dev/null
+  review="$(place_file "$wt" ".agents/reviews/$task-review.md" "$log")"
+  rm -f "$log"
   # What was reviewed, recorded: `loom land` refuses a tip that is not this one,
   # so a commit added after the reviewer read the patch cannot ride the review
   # into the merge.
@@ -4033,7 +4274,7 @@ cmd_loop() {
   scan_fence_flag "$@"
   local task="${FLAG_ARGS[0]:?usage: loom loop <task-id> [--fence-profile <name>]}"
   local rounds="${LOOM_LOOP_ROUNDS:-2}"
-  local wt review verdict tfile base rdir i=1  # $base is set per round, below
+  local wt review verdict tfile base rdir appendtmp i=1  # $base is set per round, below
   # `loom loop` calls cmd_new, cmd_run and cmd_check, and each of those re-runs
   # scan_fence_flag on ITS OWN argv — which resets $FLAG_ACCEPT_CONFIG in this
   # shell, because only cmd_run's cmd_new call happens in a subshell. Snapshot
@@ -4092,13 +4333,17 @@ cmd_loop() {
     esac
   }
 
-  # The review text this loop APPENDS to the task file is read back out of the
-  # review directory, so the loop resolves it too rather than trusting the
-  # spelling — a redirected `.agents/reviews` would otherwise feed another
-  # tree's review into this task's spec, and into the implementer that reads it.
+  # The review text this loop reads its verdict from, and then pastes into the
+  # task spec the implementer reads, is the OPERATOR's copy — the one under
+  # $STATE_DIR, written by `loom check` before the worktree ever saw it. The
+  # worktree's copy is a courtesy placement in a directory the agent owns: the
+  # tree being reviewed does not get to write the review that judges it, nor
+  # the REVISE text that becomes the next prompt. ($rdir is still resolved,
+  # because `implement` -> `cmd_run` writes the gate log and reads the blocked
+  # note there, and because the refusal belongs before the first model launch.)
   rdir="$(reviews_dir "$wt")"
   implement
-  review="$rdir/$task-review.md"
+  review="$(state_artifact_dir "$task")/$task-review.md"
   tfile="$wt/.agents/tasks/$task.md"
   while [ "$i" -le "$rounds" ]; do
     echo "loom: [loop] review round $i/$rounds"
@@ -4113,24 +4358,38 @@ cmd_loop() {
     verdict="$(grep '^VERDICT:' "$review" 2>/dev/null | tail -1 || true)"
     # No verdict line at all means a truncated or derailed review, not a
     # rejection — re-implementing on it would act on nothing.
-    [ -n "$verdict" ] || die "no VERDICT line in $(relpath "$review") — review truncated — re-run loom check $task"
+    [ -n "$verdict" ] || die "no VERDICT line in $review — review truncated — re-run loom check $task"
     case "$verdict" in
       *APPROVE*) echo "loom: [loop] APPROVE after $i round(s) — next: loom diff $task && loom land $task"
                  return 0 ;;
     esac
     if [ "$i" -eq "$rounds" ]; then
       echo "loom: [loop] still REVISE after $rounds round(s) — escalating to the coordinator." >&2
-      echo "loom: [loop] read $(relpath "$review"), then fix the task spec by hand." >&2
+      echo "loom: [loop] read $review, then fix the task spec by hand." >&2
       return 1
     fi
-    [ -f "$tfile" ] || die "no task file in the worktree at $tfile — is .agents/tasks/ gitignored? commit it so agent worktrees see it"
+    # The task file is a file the AGENT owns too — `.agents/tasks/<task>.md` in
+    # its own worktree — and this is loom appending the reviewer's text to it.
+    # `>>` follows a symlink standing there and writes through a hard link, so
+    # the append would land in another tree's spec (or anywhere at all) while
+    # this one went on reading as it always did. It is probed first, then the
+    # WHOLE new content is built in a temp and RENAMED onto it (place_file), so
+    # the file this task's implementer reads next is the file loom wrote.
+    probe_agent_file "$tfile" "task $task's spec in the worktree" \
+      || die "no task file in the worktree at $tfile — is .agents/tasks/ gitignored? commit it so agent worktrees see it"
+    appendtmp="$(mktemp "${TMPDIR:-/tmp}/loom-task.XXXXXX")" \
+      || die "cannot create a temporary file for the fix round"
+    tmp_track "$appendtmp"
     {
+      cat "$tfile"
       printf '\n## Auto fix round %s (loom loop — reviewer REVISE)\n\n' "$i"
       printf '%s\n' "The reviewer returned REVISE. Address every point below. Keep all existing"
       printf '%s\n' "rulings from earlier rounds; do not weaken or delete tests to satisfy the"
       printf '%s\n\n' "reviewer."
       cat "$review"
-    } >> "$tfile"
+    } > "$appendtmp" || die "cannot build the fix round for $task"
+    place_file "$wt" ".agents/tasks/$task.md" "$appendtmp" > /dev/null
+    rm -f "$appendtmp"
     echo "loom: [loop] REVISE — fix round $i appended to $(relpath "$tfile" "$wt") in the worktree"
     implement
     i=$((i + 1))
@@ -4143,7 +4402,7 @@ cmd_loop() {
 cmd_diff() {
   scan_fence_flag "$@"
   local task="${FLAG_ARGS[0]:?usage: loom diff <task-id> [--fence-profile <name>]}"
-  local wt base patch rdir
+  local wt base patch rdir patchtmp
   require_fence_flag "$task" diff
   # BEFORE the first fence operation, which is the whole of this line's
   # placement: `fence_reconcile` -> `fence_apply` -> `git sparse-checkout set`
@@ -4163,9 +4422,16 @@ cmd_diff() {
   # before a byte of the patch is written, and the patch goes to what it
   # resolved to.
   rdir="$(reviews_dir "$wt")"
-  patch="$rdir/$task.patch"
-  git -C "$ROOT" diff --no-ext-diff --no-textconv "$base" "$PINNED_TIP" > "$patch" \
+  patchtmp="$(mktemp "${TMPDIR:-/tmp}/loom-patch.XXXXXX")" \
+    || die "cannot create a temporary file for the diff"
+  tmp_track "$patchtmp"
+  git -C "$ROOT" diff --no-ext-diff --no-textconv "$base" "$PINNED_TIP" > "$patchtmp" \
     || die "cannot write the diff for $task"
+  # The operator's copy first, the worktree's second and by rename — the same
+  # patch `loom check` writes, and the same reason (see cmd_check).
+  state_artifact "$task" "$task.patch" "$patchtmp" > /dev/null
+  patch="$(place_file "$wt" ".agents/reviews/$task.patch" "$patchtmp")"
+  rm -f "$patchtmp"
   echo "loom: patch at $(relpath "$patch")" >&2
   # No editor is assumed. LOOM_DIFF_CMD takes the patch path as its last
   # argument (`delta`, `bat`, `less -R`, `code --wait`, `vim -R` — whatever you
@@ -4243,6 +4509,14 @@ Commit it in the worktree, or discard it, then re-run:  loom check $task"
   # The tip a reviewer actually read. A branch that moved since — an extra
   # commit, an `update-ref` from a gate script, a force-push into the ref — is
   # not the thing that was reviewed, and `--force` does not skip this either.
+  #
+  # It is read from the OPERATOR RECORD, and nothing here reads the worktree's
+  # copy of the review or of the patch: those are courtesy placements in a
+  # directory the agent owns (see `place_file` and the artifacts beside the
+  # record). The one file in the worktree that still speaks to this decision is
+  # `.agents/reviews` itself, and it speaks by being DIRTY — `wt_dirty` drops
+  # its exclusion the moment that directory, or anything in it, stops being
+  # loom's own plain scratch.
   local reviewed; reviewed="$(state_read "$task" reviewed)"
   [ -n "$reviewed" ] || die "task $task has never been through 'loom check', so nothing has reviewed the
 commits this would publish. Run it first:  loom check $task${FENCE_PROFILE:+ --fence-profile $FENCE_PROFILE}"
