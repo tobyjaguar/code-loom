@@ -975,7 +975,7 @@ verifiers, one delta pass; throwaway repos, stubbed `claude`/`codex`/
 `opencode`/`curl`, scratch `XDG_CONFIG_HOME`; no model or network call) was
 opened as a draft PR against `tobyjaguar/coding-harness`, pinned at `7da0cc4`.
 Its Status table is reproduced here in full, with what each id is at THIS tip
-— round 17 — and the test letter that holds it. "Round N" is the fix round in
+— round 18 — and the test letter that holds it. "Round N" is the fix round in
 this branch's history; a letter in brackets is a case in
 `tests/fence-profiles.sh`.
 
@@ -1131,3 +1131,85 @@ commands, and nothing at all about what a model *read* — that is gap 4's
 exfiltration class, and no check of this shape reaches it. The gate is still
 your build running as you (gap 3). And `.agents/loom.env` is still `.`-sourced
 shell from a tracked path.
+
+### Round 18 — the adversarial pass on round 17's own fixes
+
+Round 17's closure pass PASSED; its adversarial pass reproduced ONE blocker,
+against the very exemption round 17 had just added. Closed here with `(cr)`, and
+the consolidated non-blocking items with `(cs)` through `(cv)` and the `(ce)`
+additions.
+
+**B18-1 — an inherited link, never re-resolved, turned into a doorway by a
+DIFFERENT link (fence breach).** Round 17 exempted from judging any entry whose
+path AND target matched the recorded base (`if p in inherited and inherited[p]
+== t: continue`), but the set it FENCED OUT of the worktree was the entries that
+ESCAPE at the base under the base's own map. Those are different sets: a link
+that was INSIDE at the base is in the exempt set but not the fenced-out set, so
+loom checks it out AND skips resolving it — and whether it escapes NOW is decided
+by the rest of the map, which the branch controls. Reproduced end to end,
+agent-only, from a trunk with ZERO symlinks: task 1 lands `backend/loot ->
+../ta/tb/../..` (inside), task 2 commits `ta/tb -> ..` (itself inside), and
+`backend/loot` now realpaths to the PARENT of the operator's checkout.
+`loom check`/`run`/`land` all rc 0, the default unprofiled chain read `core/**`
+and `docs/audits/**` through the doorway, and the agent WROTE the operator's
+`.agents/gate.sh` — the script `run_gate` executes. Closed by making the exempt
+set EQUAL the fenced-out set: every entry is RE-RESOLVED against the CURRENT map,
+and an escape is exempt only when the SAME link (path and target) ALSO escapes
+under the BASE's own map. An inside-at-base link that escapes at the tip is the
+branch's doing and refused — named as such ("on this branch", no trunk remedy);
+an escape-at-base link stays fenced out. Both legs, plus `attach` and `rebase`
+go through the corrected judge. `(cr)`.
+
+**The non-blocking items, all in.**
+
+* **N1 — `cmd_guard` lacked `-z`.** With `core.quotePath` on (git's default) a
+  non-ASCII staged path came back C-quoted (`".opencode/\303\244.md"`, leading
+  quote and all), which no longer starts with `.opencode/`, so `zone_of` judged
+  it OUTSIDE `[hand]` and the hook let it through (`loom check`'s history leg
+  still caught it — seatbelt, not lock). It reads the stream NUL-delimited now,
+  as `history_paths` and `hand_reconcile_staged` already did, and names the
+  dequoted path. `(cs)`.
+* **N2 — the inherited-link sparse escaping.** It escaped `\ * ? [` but not a
+  TRAILING SPACE (gitignore strips it, so the fenced-out pattern missed the real
+  link and left it on disk — round-16's "unusable repo" shape) and could not
+  express a NEWLINE. A trailing space is escaped as `\ ` now; a newline-bearing
+  link path is refused up front, naming it. `(ct)`.
+* **N3 — `link_map` and an unmerged index.** `ls-files -s` stages a conflicted
+  path at 1/2/3, and last-wins silently kept one target — so an inside-looking
+  stage-3 hid an escaping stage-2. It refuses an unmerged symlink now, naming
+  the path. `(cu)`.
+* **N4 — the gate scrub, widened again.** `*_KEY` was the omission next to
+  `*_ACCESS_KEY`/`*_KEY_ID`; measured survivors `*_PRIVATE_KEY`, `ID_RSA`,
+  `BEARER`, `NETRC`, `KUBECONFIG`, `SESSION_COOKIE`, `MNEMONIC`, `SEED_PHRASE`,
+  `MINT_SEED` and `stripe_sk` are now covered by `*key*`, `*bearer*`, `*netrc*`,
+  `*kubeconfig*`, `*cookie*`, `*mnemonic*`, `*seed*`, `*passphrase*`, `*rsa*` and
+  a `stripe_` prefix. Still a name-shape filter, not a complete list. See § 3.
+  `(ce)`.
+* **N5 — `fence_verify`'s re-created-link message.** When the AGENT re-creates an
+  inherited (fenced-out) link on disk in its own worktree, the refusal used to
+  point the operator at their TRUNK for the worktree's own act. It now says it is
+  the worktree's own re-creation ("delete it here").
+* **N6 — `loom attach` materialised the branch's own escaping links** via
+  `git checkout` before `fence_reconcile` judged them (only the EXIT trap removed
+  them). The history-leg link check now runs BEFORE the checkout — the tree of
+  the branch is read from `$ROOT`, so no worktree file need exist — and a refusal
+  is the history-leg one, which can only fire before anything is written to disk.
+  `(cv)`.
+* **N7 — ARCHITECTURE § 5 wording.** It said the mode-120000 history check is cut
+  at `$PINNED_TIP` for "check, diff, loop, rebase, land"; `rebase`'s is cut from
+  the REPLAYED branch tip against the `new_base` it is about to record.
+  Corrected.
+* **N8 — tests `(ck)`/`(ch)` "merged nothing".** `merge-base --is-ancestor
+  <branch> HEAD || echo no` reads "no" both when nothing merged AND when land
+  SUCCEEDED (land deletes the branch, so the ancestor test fails on a missing
+  ref). Re-worded to assert the trunk tip is unchanged, in every new letter too.
+  **N9** — the `(ch)` header comment still said "judged lexically"; B1 replaced
+  that with tree-map resolution, so the comment is fixed.
+
+**What round 18 did NOT change.** Everything round 17 left standing: the
+exfiltration class (gap 4), the gate as your build running as you (gap 3),
+`.agents/loom.env` as `.`-sourced shell, P1(e), and the inherited escaping
+symlink as a **residual by design** — loom closes the doorway in the worktrees
+it builds and tells you three times, but the link is still in your trunk and in
+every clone of it, and loom will not rewrite a file it does not own.
+
