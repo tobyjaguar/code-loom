@@ -43,7 +43,16 @@ want_not_link() { # want_not_link <label> <path>
   else ok "$1"; fi
 }
 
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/loom-fence-profiles.XXXXXX")"
+# GNU coreutils' `timeout` is not on a stock macOS. Nothing here needs it for
+# correctness — every network call is stubbed — so where it is missing it
+# becomes "drop the duration and run the command".
+command -v timeout >/dev/null 2>&1 || timeout() { shift; "$@"; }
+
+# RESOLVED, and that is not cosmetic: on macOS `$TMPDIR` is
+# /var/folders/... behind a `/var -> private/var` symlink, and `loom` resolves
+# every root and worktree path it is given. An unresolved $TMP made 13
+# assertions compare a path against its own physical form and fail.
+TMP="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/loom-fence-profiles.XXXXXX")" && pwd -P)"
 trap 'rm -rf "$TMP"' EXIT
 REPO="$TMP/repo"
 
