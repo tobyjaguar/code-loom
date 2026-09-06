@@ -3691,6 +3691,7 @@ out="$(ZHIPU_API_KEY=FAKE-KEY DEEPSEEK_API_KEY=FAKE-KEY MY_SECRET=FAKE-KEY \
        AWS_SECRET_ACCESS_KEY=FAKE-KEY AWS_ACCESS_KEY_ID=FAKE-KEY \
        NPM_CONFIG__AUTH=FAKE-KEY DOCKER_AUTH_CONFIG=FAKE-KEY PGPASSWORD=FAKE-KEY \
        GOOGLE_APPLICATION_CREDENTIALS=FAKE-KEY openai_api_key=FAKE-KEY \
+       ID_RSA=FAKE-KEY MNEMONIC=FAKE-KEY BEARER=FAKE-KEY stripe_sk=FAKE-KEY \
        LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 \
        "$LOOM" run 0100-ce 2>&1)"; rc=$?
 want_eq "(ce) loom run reaches a green gate"                        "$rc" "0"
@@ -3712,6 +3713,12 @@ want_not_in "(ce) run: nor DOCKER_AUTH_CONFIG"                      "$ce_run" "D
 want_not_in "(ce) run: nor PGPASSWORD"                              "$ce_run" "PGPASSWORD="
 want_not_in "(ce) run: nor GOOGLE_APPLICATION_CREDENTIALS"          "$ce_run" "GOOGLE_APPLICATION_CREDENTIALS="
 want_not_in "(ce) run: nor a LOWERCASE openai_api_key"              "$ce_run" "openai_api_key="
+# Round 18's widening: `*_KEY` was the omission (`*rsa*`, `*mnemonic*`, a bare
+# `*bearer*`, and a `stripe_` prefix among the new patterns).
+want_not_in "(ce) run: nor ID_RSA (an ssh key, *rsa*)"             "$ce_run" "ID_RSA="
+want_not_in "(ce) run: nor MNEMONIC (*mnemonic*)"                  "$ce_run" "MNEMONIC="
+want_not_in "(ce) run: nor a bare BEARER (*bearer*)"              "$ce_run" "BEARER="
+want_not_in "(ce) run: nor stripe_sk (stripe_ prefix)"           "$ce_run" "stripe_sk="
 want_in     "(ce) run: PATH is still there — this is env -u, not env -i" "$ce_run" "PATH="
 want_in     "(ce) run: and HOME"                                    "$ce_run" "HOME="
 out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0100-ce 2>&1)"; rc=$?
@@ -3720,6 +3727,7 @@ want_eq "(ce) setup: it is reviewed"                                "$rc" "0"
 out="$(ZHIPU_API_KEY=FAKE-KEY DEEPSEEK_API_KEY=FAKE-KEY MY_SECRET=FAKE-KEY \
        GITHUB_TOKEN=FAKE-KEY ADMIN_PASSWORD=FAKE-KEY \
        AWS_SECRET_ACCESS_KEY=FAKE-KEY PGPASSWORD=FAKE-KEY openai_api_key=FAKE-KEY \
+       ID_RSA=FAKE-KEY MNEMONIC=FAKE-KEY BEARER=FAKE-KEY stripe_sk=FAKE-KEY \
        "$LOOM" land 0100-ce 2>&1)"; rc=$?
 want_eq "(ce) loom land runs the gate and lands"                    "$rc" "0"
 ce_land="$(cat "$TMP/ce-gate-env.log")"
@@ -3732,6 +3740,10 @@ want_not_in "(ce) land: nor a *_PASSWORD"                           "$ce_land" "
 want_not_in "(ce) land: nor AWS_SECRET_ACCESS_KEY"                   "$ce_land" "AWS_SECRET_ACCESS_KEY="
 want_not_in "(ce) land: nor PGPASSWORD"                             "$ce_land" "PGPASSWORD="
 want_not_in "(ce) land: nor a LOWERCASE openai_api_key"             "$ce_land" "openai_api_key="
+want_not_in "(ce) land: nor ID_RSA (*rsa*)"                        "$ce_land" "ID_RSA="
+want_not_in "(ce) land: nor MNEMONIC (*mnemonic*)"                 "$ce_land" "MNEMONIC="
+want_not_in "(ce) land: nor a bare BEARER (*bearer*)"             "$ce_land" "BEARER="
+want_not_in "(ce) land: nor stripe_sk (stripe_ prefix)"          "$ce_land" "stripe_sk="
 want_in     "(ce) land: PATH is still there"                        "$ce_land" "PATH="
 want_in     "(ce) land: and HOME"                                   "$ce_land" "HOME="
 printf '%s\n' "$ce_gate_orig" > .agents/gate.sh

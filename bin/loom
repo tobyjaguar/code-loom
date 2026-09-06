@@ -4832,9 +4832,9 @@ new_abort() {
 # That is the honest statement, and this comment used to make a bigger one
 # ("every variable whose NAME looks like a credential"). It is a NAME-SHAPE
 # filter and nothing more: a credential in a variable the patterns do not
-# describe — `NETRC_BODY`, `GH_ENTERPRISE`, a bare `SLACK_HOOK` — still reaches
-# the gate, as does one in any file the gate can read. KNOWN-GAPS § 3 has always
-# said so; this comment now says the same thing.
+# describe — `GH_ENTERPRISE`, a `SLACK_WEBHOOK`, a `DATABASE_URL` with the
+# password in it — still reaches the gate, as does one in any file the gate can
+# read. KNOWN-GAPS § 3 has always said so; this comment now says the same thing.
 #
 # The list is built from the environment itself (`compgen -e`, the exported
 # names) and matched CASE-INSENSITIVELY, so a provider variable added later, and
@@ -4856,8 +4856,9 @@ run_gate() { # run_gate <worktree> [<logfile>]
       [ -n "$n" ] || continue
       case "$n" in
         *api_key*|*token*|*secret*|*password*|*passwd*|*auth*|*credential*|\
-        *access_key*|*key_id*|\
-        aws_*|anthropic_*|openai_*|codex_*|opencode_*|zai_*|zhipu_*|deepseek_*|moonshot_*)
+        *access_key*|*key_id*|*key*|*bearer*|*netrc*|*kubeconfig*|*cookie*|\
+        *mnemonic*|*seed*|*passphrase*|*rsa*|\
+        aws_*|anthropic_*|openai_*|codex_*|opencode_*|zai_*|zhipu_*|deepseek_*|moonshot_*|stripe_*)
           printf '%s\n' "$n" ;;
       esac
     done < <(compgen -e 2>/dev/null || true)

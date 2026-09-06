@@ -168,14 +168,20 @@ and once more before `loom land` merges or pushes. What loom does about it is
 narrow and worth stating plainly, so nobody reads more into it: every exported
 variable whose NAME matches, **case-insensitively**, `*api_key*`, `*token*`,
 `*secret*`, `*password*`, `*passwd*`, `*auth*`, `*credential*`, `*access_key*`,
-`*key_id*`, or a provider prefix (`aws_`, `anthropic_`, `openai_`, `codex_`,
-`opencode_`, `zai_`, `zhipu_`, `deepseek_`, `moonshot_`) is dropped for the
-length of the gate (`run_gate`, `env -u`). Round 17 widened that list from the
-four SUFFIXES it used to be (`*_API_KEY`, `*_TOKEN`, `*_SECRET`,
-`*_PASSWORD`): the measured survivors were `AWS_SECRET_ACCESS_KEY`,
-`AWS_ACCESS_KEY_ID`, `NPM_CONFIG__AUTH`, `DOCKER_AUTH_CONFIG`, `PGPASSWORD`,
-`GOOGLE_APPLICATION_CREDENTIALS` and a lowercase `openai_api_key` — every one
-of them an ordinary way to hold a credential. The rest of the environment stays
+`*key_id*`, `*key*`, `*bearer*`, `*netrc*`, `*kubeconfig*`, `*cookie*`,
+`*mnemonic*`, `*seed*`, `*passphrase*`, `*rsa*`, or a provider prefix (`aws_`,
+`anthropic_`, `openai_`, `codex_`, `opencode_`, `zai_`, `zhipu_`, `deepseek_`,
+`moonshot_`, `stripe_`) is dropped for the length of the gate (`run_gate`,
+`env -u`). Round 17 widened that list from the four SUFFIXES it used to be
+(`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`): the survivors it measured
+were `AWS_SECRET_ACCESS_KEY`, `AWS_ACCESS_KEY_ID`, `NPM_CONFIG__AUTH`,
+`DOCKER_AUTH_CONFIG`, `PGPASSWORD`, `GOOGLE_APPLICATION_CREDENTIALS` and a
+lowercase `openai_api_key`. Round 18 widened it again — `*_KEY` was the big
+omission next to `*_ACCESS_KEY` and `*_KEY_ID` — after measuring these still
+through: `*_PRIVATE_KEY`, `ID_RSA`, `BEARER`, `NETRC`, `KUBECONFIG`,
+`SESSION_COOKIE`, `MNEMONIC`, `SEED_PHRASE`, `MINT_SEED` and `stripe_sk` — every
+one of them an ordinary way to hold a credential. It is still not a complete
+list; it is a name-shape filter (see below). The rest of the environment stays
 — `PATH`, `HOME`, `GOPATH`, `CARGO_HOME` and everything else a build needs to
 exist at all — and there is no sandbox. This is a **NAME-SHAPE filter and
 nothing more**: keeping a credential out of a variable name that matches those

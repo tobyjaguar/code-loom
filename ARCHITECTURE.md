@@ -835,7 +835,9 @@ Semantics:
   environment (56 variables, `ZHIPU_API_KEY` among them). Both call sites go
   through `run_gate`, which builds an `env -u` list from `compgen -e` and drops
   every exported name matching `*api_key*`, `*token*`, `*secret*`, `*password*`,
-  `*auth*`, `*credential*`, `*access_key*`, `*key_id*` or a provider prefix,
+  `*passwd*`, `*auth*`, `*credential*`, `*access_key*`, `*key_id*`, `*key*`,
+  `*bearer*`, `*netrc*`, `*kubeconfig*`, `*cookie*`, `*mnemonic*`, `*seed*`,
+  `*passphrase*`, `*rsa*` or a provider prefix (`aws_`, …, `stripe_`),
   case-insensitively (`nocasematch`, set inside the matching subshell and
   nowhere else). Never `env -i`: a build needs PATH, HOME, GOPATH, CARGO_HOME
   and a dozen more. It is a NAME-SHAPE filter and nothing more — a credential
