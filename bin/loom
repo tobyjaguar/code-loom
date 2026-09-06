@@ -3295,10 +3295,11 @@ fence_verify() { # fence_verify <worktree>
     if [ -L "$wt/$lp" ] || [ -e "$wt/$lp" ]; then still="$still
   $lp"; fi
   done
-  [ -z "$still" ] || die "symlinks the trunk carries out of the tree are STILL present in $wt:$still
-loom removes them from every worktree it builds, because whatever they name is
-readable through them and the fence cannot close a doorway. Delete them here, or
-better, remove them from your trunk."
+  [ -z "$still" ] || die "escaping symlinks that loom FENCED OUT of this worktree are on disk in $wt:$still
+Each names a path where the trunk carries a doorway, fenced out of every worktree
+loom builds — so a copy present HERE is this worktree's OWN re-creation, and
+re-fencing cannot drop it. Delete it here. (The trunk still carries the same
+doorway; that is warned about separately at 'loom new' and 'loom doctor'.)"
   left="$(zones_py fence-present "$wt")" || die "cannot verify the fence in $wt"
   [ -z "$left" ] && return 0
   die "fenced paths are STILL present in $wt:
