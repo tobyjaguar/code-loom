@@ -321,7 +321,8 @@ the gate log are written to the operator's own state directory first —
 `${XDG_CONFIG_HOME:-$HOME/.config}/loom/repos/<key>/tasks/<task>.artifacts/`,
 mode 0700/0600, removed by `loom drop` with the record — and only then *placed*
 into `.agents/reviews/` in the worktree, where they are a courtesy for the
-agent. `loom loop` reads its VERDICT, and the REVISE text it appends to the
+agent (0600 there too — `place_file` renames a `mktemp` into place, and that is
+mktemp's mode). `loom loop` reads its VERDICT, and the REVISE text it appends to the
 task spec, from the operator's copy; `loom land` reads `reviewed` from the
 operator's record. Nothing loom decides is read back out of the tree it is
 deciding about.
@@ -432,7 +433,14 @@ or up to date. Two consequences worth knowing before you rely on it:
   the patch itself — gitignore that directory). That exception holds only while
   that directory is loom's own scratch: neither it nor `.agents` a symlink, the
   directory physically inside the worktree, and every entry in it a plain file
-  with one name.
+  with one name. And because you gitignored it, the check is two steps:
+  `git status --porcelain -- .` with the `:(exclude).agents/reviews` pathspec —
+  dropped the moment that condition fails — and then, only when it was dropped,
+  `git status --porcelain --ignored=matching -- .agents/reviews`, whose `!!`
+  lines are appended. A link planted inside an ignored directory is an ignored
+  path that step one cannot see; step two is what makes landing refuse it. Both
+  are a tripwire — `place_file` (write) and `probe_agent_file` (read) close the
+  paths themselves, whatever your `.gitignore` says.
 
 ```sh
 # the record for a task, if you ever want to read one:

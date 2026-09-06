@@ -184,7 +184,11 @@ gap 6 and ARCHITECTURE.md § 5 for what is in it and what it cannot reach.
 **One carve-out, and it is git's, not a caller's.** `GIT_INDEX_FILE` (with
 `GIT_DIR`, `GIT_WORK_TREE`, `GIT_PREFIX` and the identity variables) is
 snapshotted **before either env file is sourced** and restored **after** the
-unset — the same shape the `OPENCODE_*` set has. Without that, round 6's
+unset — the same shape the `OPENCODE_*` set has, and the same shape `TMPDIR`
+now has (round 13: `${TMPDIR:-/tmp}` is where every one of loom's own temps
+lands, including the authoritative gate log and review patch on their way to
+the state directory, so a landed `loom.env` must not be able to aim them at a
+directory the agent owns — `tests/fence-profiles.sh` (by)). Without that, round 6's
 blanket unset broke `loom guard`: git runs a pre-commit hook with a
 **temporary** index for `git commit -a`, `git commit -- <path>`, `--only` and
 `--include`, and names it in `$GIT_INDEX_FILE`. Unset, `cmd_guard`'s
@@ -743,10 +747,31 @@ same rule to the `--add-dir` sandbox root it grants an implementer, and
 directory inside the worktree, so the link counts as dirty and landing refuses
 (`tests/fence-profiles.sh` (br)).
 
+That tripwire is **two steps**, because dropping the exclusion is not enough in
+the repo this file asks you to run: one that gitignores `.agents/reviews/`.
+
+1. `git status --porcelain -- .`, carrying `:(exclude).agents/reviews` only
+   while that directory is loom's own plain scratch;
+2. and, **only when that exclusion was not applied**,
+   `git status --porcelain --ignored=matching -- .agents/reviews` — whose `!!`
+   lines are appended to the first step's output.
+
+Without step two the plant is an IGNORED path: `git status` says nothing about
+it with or without the pathspec, `wt_dirty` returned nothing, and `loom land`
+published over it. With it, the plant reads as `!! .agents/reviews/<name>` and
+landing refuses (`tests/fence-profiles.sh` (bw)).
+
+Neither step is the lock. `place_file` closes the write path and
+`probe_agent_file` the read path (gap 9), regardless of what any repo ignores;
+`wt_dirty` is what stops `loom land` publishing over a tree somebody has been
+playing with.
+
 **The residual.** A consuming repo should still gitignore `.agents/reviews/`
-(README § The loop). And the fence itself is unchanged: this closes a redirect
-of loom's writes, not the question of what an agent may read. It also closed
-the DIRECTORY and nothing below it — the FILE is gap 9.
+(README § The loop) — the tripwire now holds either way, but an unignored
+scratch directory makes every task's diff noisy. And the fence itself is
+unchanged: this closes a redirect of loom's writes, not the question of what an
+agent may read. It also closed the DIRECTORY and nothing below it — the FILE is
+gap 9.
 
 ---
 
@@ -788,8 +813,12 @@ implementer reads next — with `>>`, which follows a link exactly as `>` does.
 **What closes it.** Every loom write into a worktree goes through `place_file`,
 whose contract is four steps: (1) the worktree and the target's whole parent
 chain are RE-RESOLVED immediately before the write, never trusted from earlier
-in the command; (2) the content is written to a fresh `mktemp` **inside** that
-resolved parent; (3) the temp is **renamed** onto the target — rename(2)
+in the command; (2) that resolved parent is then HELD as the working directory
+and the content is written to a fresh `mktemp` named relative to it
+(`./.loom-place.XXXXXX`) — a cwd is an INODE, so renaming `reviews` or
+`.agents` aside after the check moves nothing under loom's feet, which spelling
+the path out again at every syscall would have let it do; (3) the temp is
+**renamed** onto the target (relative to the same held directory) — rename(2)
 replaces the target's directory ENTRY, so a symlink there is overwritten as a
 link and a hardlinked name keeps its old inode and its old bytes, and neither
 ever sees what loom wrote; (4) the post-conditions are asserted rather than
@@ -804,7 +833,9 @@ symlinked, non-regular or multiply-linked `-blocked.md` is a refusal, never
 `.agents/reviews` to be a plain one-link file. And the copies loom ACTS on are
 not in the worktree at all: the patch, the review and the gate log are written
 to `$STATE_DIR/tasks/<task>.artifacts/` first (0700/0600, removed by
-`loom drop`), the worktree copies are courtesy placements, `loom loop` reads
+`loom drop`), the worktree copies are courtesy placements — 0600 as well, since
+`place_file` renames a `mktemp` into place and that is mktemp's mode —
+`loom loop` reads
 its verdict and its REVISE text from the operator's copy, and `loom land` takes
 `reviewed` from the record (`tests/fence-profiles.sh` (bu)).
 

@@ -375,6 +375,22 @@ part of the branch that still changes your runs:
   loom's own scratch (see the next bullet): neither it nor `.agents` a symlink,
   the directory physically inside the worktree, and **every entry in it a plain
   file with one name**. Anything else counts as dirty, and landing refuses.
+
+  That check is two steps, and the second one exists **because** you gitignored
+  the directory. Step one is `git status --porcelain -- .`, with the
+  `:(exclude).agents/reviews` pathspec dropped the moment the directory stops
+  being loom's own plain scratch. In a repo that ignores `.agents/reviews/`,
+  dropping the pathspec changes nothing — a link planted inside an ignored
+  directory is an ignored path, and `git status` will not mention it either
+  way. So whenever the exclusion is dropped, `loom` asks the same directory a
+  second time with `git status --porcelain --ignored=matching --
+  .agents/reviews` and appends those `!!` lines to the dirty output. The plant
+  surfaces as `!! .agents/reviews/<name>` and landing refuses.
+
+  It is a **tripwire**, not the lock. What actually closes the write path is
+  `place_file` (resolve the directory, hold it as the working directory, rename
+  a fresh file onto the target, assert what is left is one plain file) and the
+  read path `probe_agent_file` — both regardless of what any repo ignores.
 - **The review directory is RESOLVED before loom writes into it, and the write
   REPLACES the file rather than following it.**
   `.agents/reviews` is the one place loom writes on the agent's side of the
@@ -407,7 +423,9 @@ part of the branch that still changes your runs:
   gate log — to
   `${XDG_CONFIG_HOME:-~/.config}/loom/repos/<key>/tasks/<task>.artifacts/`
   first (0700/0600, removed by `loom drop` with the rest of the task's state),
-  and only then places a copy in `.agents/reviews/` for the agent to read.
+  and only then places a copy in `.agents/reviews/` for the agent to read. The
+  worktree copy is **0600** as well — it is a `mktemp` renamed into place, and
+  that is mktemp's mode, not the umask's.
   `loom loop` takes its VERDICT — and the REVISE text it pastes into the task
   spec — from the operator's copy, and `loom land` takes `reviewed` from the
   record. The tree being judged does not get to write what judges it.
@@ -649,6 +667,15 @@ part of the branch that still changes your runs:
   `providers` rule rests on. A caller that exports them still wins; the file
   does not. `OPENCODE_CONFIG_CONTENT` (a whole config inline in a variable) is
   stripped from every launch outright, caller included.
+- **`TMPDIR` is pinned the same way, and for the same reason.** It is the
+  parent of every temp `loom` makes, and those temps are the *authoritative*
+  copies on their way to the operator's state directory: the gate log fed back
+  into the next attempt's prompt, the patch a reviewer is handed. One
+  `TMPDIR=` line in a landed `.agents/loom.env` would move all of them into a
+  directory the agent owns. So it is snapshotted **before either env file is
+  sourced** — the global `~/.config/loom/env` as well as the project's
+  `loom.env` — and restored after both, with a WARN if a file tried to set it.
+  A caller who exports `TMPDIR` still wins, untouched.
 - Independent of all of it: implementer-class roles on `claude-sub` and
   `codex-sub` get a write-capable sandbox (see "Codex as an implementer"
   below), and `loom doctor` prints the parse error when `zones.toml` is

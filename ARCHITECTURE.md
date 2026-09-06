@@ -849,13 +849,37 @@ Semantics:
   pathspec is dropped and the link counts as dirty, which is what the refusal
   reads as.
 
+  `wt_dirty` is therefore **two steps**, and the second is there because the
+  consuming repo did what this document asks and gitignored the directory:
+
+  1. `git status --porcelain -- .`, carrying `:(exclude).agents/reviews` only
+     while the condition above holds;
+  2. and — **only when that exclusion was not applied** —
+     `git status --porcelain --ignored=matching -- .agents/reviews`, whose
+     `!!` lines are appended to the first step's output.
+
+  Step one is blind exactly where the plant is: in a repo that ignores
+  `.agents/reviews/`, the planted link is an IGNORED path, so dropping the
+  pathspec surfaces nothing and the tripwire reported a clean tree. Step two
+  asks the same directory the one way git will answer, the plant shows up as
+  `!! .agents/reviews/<name>`, and `loom land` refuses. Only the `!!` lines are
+  taken: everything else in that listing is already in step one's output.
+
+  Neither step is the lock, and it matters which is which. `place_file` closes
+  the WRITE path — resolve the parent, hold it as the working directory, rename
+  a fresh file onto the target, assert that what is left is a one-link plain
+  file — and `probe_agent_file` closes the READ path, both regardless of what
+  any repo ignores. `wt_dirty` is the tripwire on top: it stops `loom land`
+  from publishing over a tree somebody has been playing with.
+
   The stamp itself, and the artifacts behind it, are read from the **operator
   record**, never from the worktree: `loom check` writes the patch, the review
   and (from `loom run`) the gate log to
   `$STATE_DIR/tasks/<task>.artifacts/` first — beside the record, outside every
   repository, mode 0600, removed by `loom drop` with the rest of the task's
   state — and only then *places* a copy in `.agents/reviews/` for the agent to
-  read. `loom loop` takes its VERDICT, and the REVISE text it pastes into the
+  read. That copy is 0600 too: `place_file` renames a `mktemp` into place, and
+  0600 is mktemp's mode. `loom loop` takes its VERDICT, and the REVISE text it pastes into the
   task spec, from that copy; `loom land` takes `reviewed` from the record. The
   tree being judged does not get to write what judges it.
 - **The gate `loom` acts on is the operator's.** `loom run` (green -> commit) and
