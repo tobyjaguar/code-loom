@@ -287,7 +287,44 @@ loom check <some-task> --fence-profile codex      # must die naming /tmp/elsewhe
 loom land  <some-task> --fence-profile codex      # must die: dirty worktree
 rm -f <worktree>/.agents/reviews                  # (the same must hold with
                                                 # `.agents` itself symlinked)
+
+# --- ... and one level down, at the FILE ----------------------------------
+# `>` follows a symlink at the leaf, and a HARD link is the same redirect with
+# nothing to see in `ls -l`. loom writes a fresh temp inside the resolved
+# directory and RENAMES it onto the target, so the entry is replaced and the
+# far end of the link never sees a byte.
+ln -s /tmp/elsewhere/stolen.patch <worktree>/.agents/reviews/<some-task>.patch
+loom check <some-task> --fence-profile codex      # goes through
+ls /tmp/elsewhere/stolen.patch                    # must NOT exist
+ls -l <worktree>/.agents/reviews/<some-task>.patch  # a plain file, 1 link
+
+printf 'mine\n' > /tmp/elsewhere/hard.txt
+ln /tmp/elsewhere/hard.txt <worktree>/.agents/reviews/<some-task>.patch
+loom check <some-task> --fence-profile codex      # goes through
+cat /tmp/elsewhere/hard.txt                       # must still say "mine"
+
+# A link INSIDE the review directory is not loom's scratch either, so the
+# dirty-worktree exclusion is dropped and landing refuses.
+ln -s /tmp/elsewhere <worktree>/.agents/reviews/note.txt
+loom land <some-task> --fence-profile codex       # must die: dirty worktree
+rm -f <worktree>/.agents/reviews/note.txt
+
+# And the file loom READS back is refused rather than believed.
+ln -s /tmp/elsewhere/blocked.md <worktree>/.agents/reviews/<some-task>-blocked.md
+loom run <some-task> --fence-profile codex        # must die naming the symlink,
+                                                # never "implementer reported
+                                                # blocked"
 ```
+
+**Where the artifacts loom acts on actually live.** The patch, the review and
+the gate log are written to the operator's own state directory first —
+`${XDG_CONFIG_HOME:-$HOME/.config}/loom/repos/<key>/tasks/<task>.artifacts/`,
+mode 0700/0600, removed by `loom drop` with the record — and only then *placed*
+into `.agents/reviews/` in the worktree, where they are a courtesy for the
+agent. `loom loop` reads its VERDICT, and the REVISE text it appends to the
+task spec, from the operator's copy; `loom land` reads `reviewed` from the
+operator's record. Nothing loom decides is read back out of the tree it is
+deciding about.
 
 The record is a file you own, not a git object: `loom new` writes it, `loom check`
 stamps its `reviewed`, `loom rebase` re-points its `base`, `loom drop` deletes it
@@ -392,7 +429,10 @@ or up to date. Two consequences worth knowing before you rely on it:
   A commit added after the reviewer read the patch does not ride the review
   into the merge — re-run `loom check`. Landing also refuses a worktree with
   uncommitted changes (`.agents/reviews/` excepted, which is where `loom` writes
-  the patch itself — gitignore that directory).
+  the patch itself — gitignore that directory). That exception holds only while
+  that directory is loom's own scratch: neither it nor `.agents` a symlink, the
+  directory physically inside the worktree, and every entry in it a plain file
+  with one name.
 
 ```sh
 # the record for a task, if you ever want to read one:

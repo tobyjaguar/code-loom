@@ -1,11 +1,11 @@
 # Known gaps
 
-Holes an adversarial review found in the harness. Four of the eight are
-**closed on this branch** (gaps 1, 5, 7 and 8) and are kept here because each
-closure has a cost or a residual worth naming; the rest are **not fixed**, and
-are written down so that the fence-profile work is not mistaken for closing
+Holes an adversarial review found in the harness. Six of the ten are
+**closed on this branch** (gaps 1, 5, 7, 8, 9 and 10) and are kept here because
+each closure has a cost or a residual worth naming; the rest are **not fixed**,
+and are written down so that the fence-profile work is not mistaken for closing
 them and so they are not re-discovered from scratch. Gap 6 is round 7's,
-narrowed again in rounds 8 through 11: it is a residual by construction rather
+narrowed again in rounds 8 through 12: it is a residual by construction rather
 than a hole nobody got to.
 
 None of them is *caused* by fence profiles — but gap 4's consequence is
@@ -615,6 +615,25 @@ also not a privilege escalation — nothing runs, nothing leaks — it is a
 denial of service against your own repository, available to anything that can
 write the shared `.git/config`, which is every linked worktree.
 
+**loom's OWN reader, on the other hand, does not go near such a target.** The
+FIFO above wedges *git*, and nothing loom can do changes that. But the include
+closure is walked by `loom` itself — `config_py`'s `closure()` opens each
+pointer and reads it — and it used to `open(); read()` whatever the value
+named, unbounded. git refuses most of these when it reads the config, so the
+pointer never reached loom; an **`includeIf.<cond>.path` whose condition does
+not match** is the exception, and it is not an obscure one: git never opens the
+target, and `--list` prints the directive as a pointer all the same (measured).
+So `git config --local includeIf.gitdir:/nowhere/.path /dev/zero` handed
+`closure()` an infinite file with nothing in front of it — not a hang so much
+as a memory climb ending at the OOM killer, inside the snapshot whose job is to
+REFUSE what the config now says. `closure()` now `os.stat`s the target first
+and reads only a **regular file** — a directory, a device, a FIFO or a socket
+is recorded as `(not a regular file)`, which is a distinct fact from
+`(missing)` (a target that turns from a config file into a FIFO has CHANGED)
+and counts as a program-naming hit, because "loom cannot read it" is not "it
+contains nothing" — and it reads at most `CAP + 1` bytes, never the whole file
+(`tests/fence-profiles.sh` (bv)).
+
 **Recovery is by hand, and it does not involve git**: open
 `$GIT_COMMON_DIR/config` (that is `.git/config`, or the absolute path
 `git rev-parse --git-common-dir` printed *before* the plant) in an editor,
@@ -726,4 +745,101 @@ directory inside the worktree, so the link counts as dirty and landing refuses
 
 **The residual.** A consuming repo should still gitignore `.agents/reviews/`
 (README § The loop). And the fence itself is unchanged: this closes a redirect
-of loom's writes, not the question of what an agent may read.
+of loom's writes, not the question of what an agent may read. It also closed
+the DIRECTORY and nothing below it — the FILE is gap 9.
+
+---
+
+## 9. ... and one level down, the FILE was followed too — CLOSED
+
+**Status: fixed on this branch (round 12).** The sibling of gap 8, found by
+asking the same question one level lower.
+
+**Where.** `place_file`, `resolve_under_wt`, `probe_agent_file`, `link_count`
+and `reviews_entries_plain` (`bin/loom:3355`), the write sites in `cmd_run`
+(the gate log, and the `-blocked.md` probe), `cmd_check` (patch + review),
+`cmd_diff` (patch) and `cmd_loop` (the append to `.agents/tasks/<task>.md`),
+the artifact copies at `state_artifact` (`bin/loom:1889`), and the pathspec in
+`wt_dirty`.
+
+**What it was.** Gap 8 resolved the DIRECTORY before every write and had each
+caller write to what it resolved to. The path it then wrote was
+`"$rdir/<task>.patch"`, with `>` — and `>` opens with `O_CREAT|O_TRUNC` and
+**follows a symlink at the leaf**. So the redirect gap 8 closed at
+`.agents/reviews` was still open at `.agents/reviews/<task>.patch`, with the
+same target (another task's worktree, under the other root, that a provider
+this profile does not allow is about to run in) and the same payload (the patch
+carries the content of every path in the diff, released paths included).
+
+A **hard link** is the same redirect with nothing to see: two names for one
+inode, `ls -l` showing an ordinary file, and every byte `>` writes visible at
+the other name. Neither `[ -L ]` nor a resolved directory says anything about
+it.
+
+Three more sites had the same shape. The **gate log** is written *after* the
+implementer's turn, into a directory resolved *before* it — the window is the
+turn itself, and one `ln -s` inside it moved loom's next write out of the tree.
+`<task>-blocked.md` is read for its EXISTENCE alone and turned into an exit
+code the operator acts on, so a link there answers "is the implementer stuck?"
+with a file from somewhere else. And `loom loop` **appends** the reviewer's
+REVISE text to `.agents/tasks/<task>.md` in the worktree — the spec the
+implementer reads next — with `>>`, which follows a link exactly as `>` does.
+
+**What closes it.** Every loom write into a worktree goes through `place_file`,
+whose contract is four steps: (1) the worktree and the target's whole parent
+chain are RE-RESOLVED immediately before the write, never trusted from earlier
+in the command; (2) the content is written to a fresh `mktemp` **inside** that
+resolved parent; (3) the temp is **renamed** onto the target — rename(2)
+replaces the target's directory ENTRY, so a symlink there is overwritten as a
+link and a hardlinked name keeps its old inode and its old bytes, and neither
+ever sees what loom wrote; (4) the post-conditions are asserted rather than
+assumed — after the rename the target must not be a symlink and must have
+exactly one hard link, or the file is removed and the command dies. `mv -T` is
+the rename (`-T` is what stops `mv` moving INTO a symlink-to-a-directory), with
+python3's `os.rename` as the fallback for a `mv` that has no `-T`.
+
+`probe_agent_file` guards the one file loom reads back out of the worktree: a
+symlinked, non-regular or multiply-linked `-blocked.md` is a refusal, never
+"blocked". `wt_dirty`'s exclusion now also requires every entry inside
+`.agents/reviews` to be a plain one-link file. And the copies loom ACTS on are
+not in the worktree at all: the patch, the review and the gate log are written
+to `$STATE_DIR/tasks/<task>.artifacts/` first (0700/0600, removed by
+`loom drop`), the worktree copies are courtesy placements, `loom loop` reads
+its verdict and its REVISE text from the operator's copy, and `loom land` takes
+`reviewed` from the record (`tests/fence-profiles.sh` (bu)).
+
+**The residual.** The same one the operator record has carried since it was
+introduced, and it is not new here: an unsandboxed agent can write `$HOME`
+(gap 3), and `$STATE_DIR` is in it. This is **operator integrity, not
+tamper-proofing** — what it removes is the class of "the tree loom is judging
+rewrites the thing loom judges it by", which needed no capability at all and
+cost one `ln -s`.
+
+---
+
+## 10. `loom new _scout` would have built a task on the scout mirror — CLOSED
+
+**Status: fixed on this branch (round 12).** Small, and written down because
+the shape recurs: loom keeps directories of its own beside the task worktrees
+under `$LOOM_WORKTREES`, and a task id is a directory name there.
+
+**Where.** `state_file` (`bin/loom:489`), asked by `cmd_new` before anything is
+created (`bin/loom:3800`).
+
+**What it was.** `_scout` is the shared scout mirror — one directory, reset,
+`clean -xdff`'d and re-fenced on every `loom scout`, deliberately under the
+UNPROFILED root because it is shared by every task. `loom new _scout` would
+have put a task worktree at exactly that path, with a branch and an operator
+record, and the next `loom scout` would then have cleaned and reset the task's
+tree from under it — losing uncommitted work, and quietly, since neither
+command has a reason to mention the other.
+
+**What closes it.** `state_file` refuses the whole `_` prefix rather than the
+one name, so the next directory loom keeps there needs no second refusal, and
+`loom new` asks it first — before the worktree, the branch and the record
+(`tests/fence-profiles.sh` (bv)). It sits beside the existing refusal of an id
+ending in `.gitconfig` or `.artifacts`, which are the sidecar names a record's
+own directory would collide with.
+
+**The residual.** None worth the word: an operator who wants a task called
+`_scout` renames it.

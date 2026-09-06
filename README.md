@@ -166,9 +166,17 @@ loom doctor                     # checks the binary and that auth file
 
 `loom` invokes it as `codex exec --sandbox read-only`: a reviewer reads a diff and
 answers, it never writes to the worktree. Only the model's final message lands
-in `.agents/reviews/<task>-review.md` — the run transcript is kept just long
-enough to spot a rate limit, which falls through to the next model in the chain
-like any other provider. `LOOM_SKIP="codex"` takes it out.
+in the review file — the run transcript is kept just long enough to spot a rate
+limit, which falls through to the next model in the chain like any other
+provider. `LOOM_SKIP="codex"` takes it out.
+
+The review is written to the **operator's** copy first,
+`${XDG_CONFIG_HOME:-~/.config}/loom/repos/<key>/tasks/<task>.artifacts/<task>-review.md`,
+and then placed in `.agents/reviews/<task>-review.md` in the worktree for the
+implementer to read. The patch and the gate log go the same way. The copy in
+the worktree is a courtesy: `loom loop` reads its verdict, and the REVISE text
+it pastes into the task spec, from the operator's copy — see "The copies loom
+acts on" below.
 
 Codex can also be the *implementer*: a writable sandbox, granted per role, not
 per model, on any run — see "Codex (or Claude) as an implementer" below. It is
@@ -364,9 +372,11 @@ part of the branch that still changes your runs:
   `.agents/reviews/` is excluded, because that is where `loom check` and `loom diff`
   write the review patch themselves — **gitignore that directory** in a
   consuming repo. The exclusion applies only while `.agents/reviews` really is
-  that directory (see the next bullet): a symlink in its place counts as dirty,
-  and landing refuses.
-- **The review directory is RESOLVED before loom writes into it.**
+  loom's own scratch (see the next bullet): neither it nor `.agents` a symlink,
+  the directory physically inside the worktree, and **every entry in it a plain
+  file with one name**. Anything else counts as dirty, and landing refuses.
+- **The review directory is RESOLVED before loom writes into it, and the write
+  REPLACES the file rather than following it.**
   `.agents/reviews` is the one place loom writes on the agent's side of the
   fence — the review **patch** (which carries the content of every path in the
   diff, released paths included), the gate log, and the review text — and it is
@@ -381,6 +391,26 @@ part of the branch that still changes your runs:
   left intact) — and writes to what it resolved to rather than re-deriving the
   path. The same rule applies to the `--add-dir` sandbox root an implementer is
   granted.
+
+  One level down, the FILE was the same hole: `>` follows a symlink at
+  `.agents/reviews/<task>.patch`, and a **hard link** there is the same
+  redirect with nothing to see in `ls -l`. So every loom write into a worktree
+  — the patch, the review, the gate log, and `loom loop`'s append to
+  `.agents/tasks/<task>.md` — re-resolves the directory, writes to a fresh temp
+  **inside** it and **renames** that onto the target: rename replaces the
+  directory entry instead of following it, and the result is checked to be a
+  plain one-link file or the command dies. `<task>-blocked.md`, the one file
+  loom reads back out of the tree, is refused outright if it is a link rather
+  than read as "the implementer is blocked".
+- **The copies loom acts on live beside the operator record, not in the
+  worktree.** `loom check` writes the patch and the review — and `loom run` the
+  gate log — to
+  `${XDG_CONFIG_HOME:-~/.config}/loom/repos/<key>/tasks/<task>.artifacts/`
+  first (0700/0600, removed by `loom drop` with the rest of the task's state),
+  and only then places a copy in `.agents/reviews/` for the agent to read.
+  `loom loop` takes its VERDICT — and the REVISE text it pastes into the task
+  spec — from the operator's copy, and `loom land` takes `reviewed` from the
+  record. The tree being judged does not get to write what judges it.
 - **`loom rebase` will not bury ANY upstream commits under your base without
   your word.** A rebase is the one command that moves a recorded base, and
   everything between the old base and the new one stops being the branch's work

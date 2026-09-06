@@ -838,6 +838,26 @@ Semantics:
   what the reviewer read and what a merge would carry have come apart —
   excluding `.agents/reviews/`, which is where `loom check` and `loom diff` write
   the review patch themselves (consumers should gitignore that directory).
+
+  That exclusion is conditional, and the condition is the whole of what makes
+  it safe: it applies only while `.agents/reviews` **is** loom's own scratch —
+  neither it nor `.agents` above it a symlink, the directory resolving
+  physically inside this worktree, **and every entry in it a regular file with
+  exactly one hard link**. A link at the directory, or at one file inside it,
+  is a redirect of loom's writes rather than loom's scratch, and excluding it
+  by pathspec would hide the one `git status` line that says so. So the
+  pathspec is dropped and the link counts as dirty, which is what the refusal
+  reads as.
+
+  The stamp itself, and the artifacts behind it, are read from the **operator
+  record**, never from the worktree: `loom check` writes the patch, the review
+  and (from `loom run`) the gate log to
+  `$STATE_DIR/tasks/<task>.artifacts/` first — beside the record, outside every
+  repository, mode 0600, removed by `loom drop` with the rest of the task's
+  state — and only then *places* a copy in `.agents/reviews/` for the agent to
+  read. `loom loop` takes its VERDICT, and the REVISE text it pastes into the
+  task spec, from that copy; `loom land` takes `reviewed` from the record. The
+  tree being judged does not get to write what judges it.
 - **The gate `loom` acts on is the operator's.** `loom run` (green -> commit) and
   `loom land` (green -> merge/push) execute `<main checkout>/.agents/gate.sh`
   with the worktree as its cwd, never `<worktree>/.agents/gate.sh`. The
@@ -984,7 +1004,13 @@ Four things this table does *not* say:
    actually confines that leg is the worktree and the fence applied to it.
 3. **`--add-dir` names a writable root**, so `<wt>/.agents` is resolved with
    `pwd -P` and refused unless it is still under the resolved worktree — a
-   tracked directory can be replaced with a symlink out of the tree.
+   tracked directory can be replaced with a symlink out of the tree. And
+   `.agents/reviews` is resolved the same way, one level down: `.agents` intact
+   with `reviews` swapped is the variant every `.agents`-level check walks past,
+   and it is the directory this role is *told* to write its `-done`/`-blocked`
+   notes into, so granting the outer root while the inner one points elsewhere
+   would hand the role a writable path out of the tree under a root that looks
+   contained.
 4. **Neither `codex-sub` nor `claude-sub` is in a default implementer chain**
    (they are `zai-coding-plan/glm-5.3`, `deepseek/deepseek-v4-pro`,
    `moonshotai/kimi-*`). Reaching this code path takes an explicit
