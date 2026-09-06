@@ -877,6 +877,17 @@ config_sidecar() { # config_sidecar <task> -> the path of that task's pinned con
 #                               and a newline in either half would move the
 #                               boundary between them.
 #
+#                               The bytes are CAPPED at 64 KiB. An include
+#                               target is a config file and a config file is
+#                               small, so a bigger one is either a mistake or a
+#                               way to bloat the sidecar and drown a refusal in
+#                               it. Past the cap the value half is
+#                               `(<N> bytes, sha256 <hex>)` instead of the
+#                               content: the digest in the key half is what the
+#                               change check runs on either way, so the refusal
+#                               still fires and still names the file — it just
+#                               says how big it is rather than showing it.
+#
 # A record's SHAPE is judged by its scope tag and nothing else: a record whose
 # key half does not begin with one of `local:` / `worktree-main:` /
 # `worktree-task:` is an include record. Keying off "does it contain a newline"
@@ -885,8 +896,9 @@ config_sidecar() { # config_sidecar <task> -> the path of that task's pinned con
 config_py() { # config_py digest <dump> | diff <recorded> <dump>
               #         | snapshot <out> <dump> <file> <dump> <file> <dump> <file>
               #         | summary <dump> | programs <dump>
+              #         | diffprograms <recorded> <dump>
   python3 - "$@" << 'PY'
-import collections, hashlib, os, subprocess, sys
+import collections, hashlib, os, re, subprocess, sys, tempfile
 
 # The order is the order the sidecar is written in, and the order a diff names.
 SCOPES = ("local", "worktree-main", "worktree-task")
@@ -932,6 +944,85 @@ def program_key(k):
     if k.startswith("diff.") and (k.endswith(".textconv") or k.endswith(".command")):
         return True
     return False
+
+# How many bytes of an INCLUDED file are stored (and therefore printed) in one
+# record. An include target is a config file, and a config file is small; a
+# `include.path=/dev/urandom`, a multi-megabyte blob, or simply a large
+# generated config would otherwise be copied whole into the sidecar and then
+# printed line by line into a refusal nobody can read. Beyond the cap the
+# record keeps the DIGEST — which is the whole of the change check — and its
+# value half becomes `(<N> bytes, sha256 <hex>)`. The refusal for such a file
+# says "it changed and how big it is" rather than showing the change.
+CAP = 64 * 1024
+CAPPED = re.compile(r"^\((\d+) bytes, sha256 ([0-9a-f]{64})\)$")
+
+def unesc(s):
+    """The inverse of esc(), for the one thing that is stored escaped and has
+    to be READ back: an included file's own bytes. `programs` hands them to
+    git's config parser, so they have to be the bytes git read."""
+    out, i, n = [], 0, len(s)
+    while i < n:
+        c = s[i]
+        if c != "\\":
+            out.append(c); i += 1; continue
+        i += 1
+        if i >= n:
+            out.append("\\"); break
+        e = s[i]; i += 1
+        if e == "\\":  out.append("\\")
+        elif e == "n":  out.append("\n")
+        elif e == "t":  out.append("\t")
+        elif e == "x" and i + 2 <= n:
+            try:
+                out.append(chr(int(s[i:i + 2], 16))); i += 2
+            except ValueError:
+                out.append("\\x")
+        else:
+            out.append("\\"); out.append(e)
+    return "".join(out)
+
+def include_of(rec):
+    """(path, digest, escaped bytes or None) for an INCLUDE record, else None.
+    None for the bytes means there are none to read: the target was missing, or
+    it was over CAP and only its digest was kept."""
+    key, sep, val = rec.partition(b"\n")
+    k = key.decode("utf-8", "replace")
+    if scope_of(k)[0] or not k.startswith("include:"):
+        return None
+    body = k[len("include:"):]
+    path, _, digest = body.rpartition(":")
+    if not sep:
+        return (path, digest, None)
+    v = val.decode("utf-8", "replace")
+    m = CAPPED.match(v)
+    if m and m.group(2) == digest:
+        return (path, digest, None)
+    return (path, digest, v)
+
+def include_programs(raw_text):
+    """program_key hits inside an included file's OWN bytes, read with git's
+    own parser. `--list` shows an include as a POINTER and never the keys it
+    brings, so without this a `core.hooksPath` one directive away from
+    .git/config is pinned in full and named nowhere."""
+    hits = []
+    fd, tmp = tempfile.mkstemp(prefix="loom-inc.")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(raw_text.encode("utf-8", "surrogateescape"))
+        recs = file_records(tmp)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    if recs is None:
+        return hits                      # git cannot parse it, so git honours
+    for r in recs:                       # no key of its either
+        key, sep, val = r.partition(b"\n")
+        k = key.decode("utf-8", "replace")
+        if program_key(k.lower()):
+            hits.append((k, esc(val.decode("utf-8", "replace")) if sep else ""))
+    return hits
 
 def show(rec):
     key, sep, val = rec.partition(b"\n")
@@ -1023,9 +1114,19 @@ def closure(seeds):
         # snapshot dies and the command refuses) but it would refuse for the
         # wrong reason, on an input the writer chooses. surrogateescape puts
         # the byte back; it is neither NUL nor newline, so the framing holds.
-        out.append(("include:%s:%s\n%s"
-                    % (esc(path), hashlib.sha256(raw).hexdigest(),
-                       esc(raw.decode("utf-8", "replace"))))
+        #
+        # ... up to CAP bytes. Past that the bytes are NOT stored: an include
+        # target is a config file, and a config file is small, so a large one
+        # is either a mistake or a way to bloat the sidecar and drown a
+        # refusal in it. The digest is kept — it is what the change check runs
+        # on — and the value half says how big the file is and what it hashes
+        # to, so the refusal still names the file and still fires.
+        digest = hashlib.sha256(raw).hexdigest()
+        if len(raw) > CAP:
+            body = "(%d bytes, sha256 %s)" % (len(raw), digest)
+        else:
+            body = esc(raw.decode("utf-8", "replace"))
+        out.append(("include:%s:%s\n%s" % (esc(path), digest, body))
                    .encode("utf-8", "surrogateescape"))
         sub = file_records(path)
         if sub is None:            # git cannot parse it, so git honours no
@@ -1094,15 +1195,69 @@ try:
         # the pin is a CHANGE check, so whatever is here is being adopted as
         # the baseline, and the operator should meet that fact at the moment of
         # pinning rather than never.
+        #
+        # INCLUDE records are scanned too, and tagged `[include:<path>]`. An
+        # include is the one entry whose keys `git config --list` never shows —
+        # it prints the directive as a pointer — so a `core.hooksPath` one
+        # `include.path` away from .git/config was pinned in full and named
+        # nowhere. Its bytes are in the record; git's own parser reads them.
         for r in read(sys.argv[2]):
+            inc = include_of(r)
+            if inc is not None:
+                path, digest, raw_text = inc
+                if raw_text is None:
+                    if digest != "(missing)":
+                        print("[include:%s] (bytes not stored — over the %d-byte "
+                              "cap; its keys are not listed)" % (path, CAP))
+                    continue
+                for k, v in include_programs(raw_text):
+                    print("[include:%s] %s=%s" % (path, k, v))
+                continue
             key, sep, val = r.partition(b"\n")
             scope, k = scope_of(key.decode("utf-8", "replace"))
             if not scope:
-                continue          # an include record; `summary` names those
+                continue
             if not program_key(k.lower()):
                 continue
             print("[%s] %s=%s"
                   % (scope, k, esc(val.decode("utf-8", "replace")) if sep else ""))
+    elif mode == "diffprograms":
+        # The program-naming keys in the SYMMETRIC DIFFERENCE of two dumps —
+        # what `diff` would print, reduced to the entries that name something
+        # git runs. `loom land --pr` re-pins the repository baseline after its
+        # own `--set-upstream-to`, and this is what decides whether that re-pin
+        # is loom adopting its own two writes or loom adopting somebody else's
+        # `core.hooksPath` under cover of them. Include records count: an
+        # over-cap one counts as a hit, because "cannot be read" is not
+        # "contains nothing".
+        #
+        # ADDITIONS ONLY. A `-` line for a program key is that program going
+        # AWAY, which is not the thing being guarded against — and refusing it
+        # would make "put it back" (the escape every one of these refusals
+        # names) a refusal of its own, which is a trap rather than a check. A
+        # changed VALUE is a `-` and a `+` together, so it is still caught.
+        old = collections.Counter(read(sys.argv[2]))
+        new = collections.Counter(read(sys.argv[3]))
+        for sign, cnt in (("+", new - old),):
+            for r in sorted(cnt.elements()):
+                inc = include_of(r)
+                if inc is not None:
+                    path, digest, raw_text = inc
+                    if raw_text is None:
+                        if digest != "(missing)":
+                            print("%s [include:%s] (bytes not stored — over the "
+                                  "%d-byte cap)" % (sign, path, CAP))
+                        continue
+                    for k, v in include_programs(raw_text):
+                        print("%s [include:%s] %s=%s" % (sign, path, k, v))
+                    continue
+                key, sep, val = r.partition(b"\n")
+                scope, k = scope_of(key.decode("utf-8", "replace"))
+                if not scope or not program_key(k.lower()):
+                    continue
+                print("%s [%s] %s=%s"
+                      % (sign, scope, k,
+                         esc(val.decode("utf-8", "replace")) if sep else ""))
     else:
         sys.stderr.write("loom: internal error: unknown config mode '%s'\n" % mode)
         raise SystemExit(2)
@@ -1163,10 +1318,21 @@ config_snapshot() { # config_snapshot [<task-worktree>] -> the path of a temp du
   # write to the LOCAL scope (`extensions.worktreeconfig=true`), which this
   # same pin refuses — a dormant `config.worktree` cannot be brought to life
   # without the change that does it being caught.
-  wtcfg="$(git -C "$ROOT" config --local --get extensions.worktreeConfig 2>/dev/null || true)"
+  #
+  # Read as a BOOL, by git, rather than string-matched by us. git decides
+  # whether the extension is on with its own `git_config_bool`, which is
+  # case-insensitive and accepts `true/yes/on/1` AND a VALUELESS key
+  # (`[extensions]\n\tworktreeConfig` is true) — none of which a
+  # `case "$wtcfg" in true|yes|on|1)` list matches. `True`, `ON` or the
+  # valueless form therefore turned the two worktree scopes OFF in the
+  # snapshot while git went on reading them, which is a hole rather than a
+  # cosmetic mismatch: a `core.hooksPath` in `config.worktree` was live and
+  # unpinned. `--type=bool` makes git answer the question git asks, and it
+  # prints exactly `true` or `false`.
+  wtcfg="$(git -C "$ROOT" config --local --type=bool --get extensions.worktreeConfig 2>/dev/null || true)"
   case "$wtcfg" in
-    true|yes|on|1) wtcfg=yes ;;
-    *)             wtcfg="" ;;
+    true) wtcfg=yes ;;
+    *)    wtcfg="" ;;
   esac
   [ -z "$wtcfg" ] \
     || git -C "$ROOT" config --worktree --list --null > "$d/worktree-main" 2>/dev/null || true
@@ -1221,8 +1387,12 @@ config_write_sidecar() { # config_write_sidecar <task> <dump>
 # thing being pinned: it names a file somewhere else, whose bytes are now part
 # of this task's baseline and whose next edit is a refusal. The operator should
 # know that file exists before they meet the refusal.
-config_summary() { # config_summary <dump>
-  local out n m targets
+# <what> names what the include targets are being pinned TO, because the two
+# callers pin two different things: `loom new` pins a task, and `loom pin-config`
+# pins the REPOSITORY's baseline, which outlives every task. Saying "this task"
+# in the second case names a thing that does not exist.
+config_summary() { # config_summary <dump> [<what>]
+  local out n m targets what="${2:-this task}"
   out="$(config_py summary "$1" 2>/dev/null)" || return 0
   n="$(printf '%s\n' "$out" | sed -n 1p)"
   m="$(printf '%s\n' "$out" | sed -n 2p)"
@@ -1230,7 +1400,7 @@ config_summary() { # config_summary <dump>
   targets="$(printf '%s\n' "$out" | sed -n '3,$p')"
   [ -n "$targets" ] || return 0
   echo "loom: WARN: this repository's git config pulls in other files (include.path /" >&2
-  echo "loom: WARN: includeIf.<cond>.path). Their bytes are pinned to this task too, so" >&2
+  echo "loom: WARN: includeIf.<cond>.path). Their bytes are pinned to $what too, so" >&2
   echo "loom: WARN: an edit to one is a refusal — and an included file can carry every" >&2
   echo "loom: WARN: key .git/config can, core.hooksPath and credential.helper included:" >&2
   printf '%s\n' "$targets" | sed 's|^|loom: WARN:   |' >&2
@@ -1258,6 +1428,8 @@ config_programs() { # config_programs <dump>
   echo "loom: WARN: checkout, 'git add', commit, a merge, a fetch, a push or any" >&2
   echo "loom: WARN: subcommand at all. They are the BASELINE now: loom refuses a" >&2
   echo "loom: WARN: change to them and vouches for none of them." >&2
+  echo "loom: WARN: An [include:<path>] line is a key inside a file the config PULLS IN —" >&2
+  echo "loom: WARN: '--list' shows an include as a pointer and never the keys behind it." >&2
   printf '%s\n' "$out" | sed 's|^|loom: WARN:   |' >&2
 }
 
@@ -4315,7 +4487,7 @@ your session. Then re-record it deliberately:
   rm -f "$f"
   echo "loom: recorded this repository's git config baseline" >&2
   echo "  $(repo_config_file)"
-  config_summary  "$(repo_config_sidecar)"
+  config_summary  "$(repo_config_sidecar)" "this baseline"
   config_programs "$(repo_config_sidecar)"
 }
 
@@ -4418,7 +4590,7 @@ file outside .agents/."
 # git 2.34), plus the cone and index keys newer git adds beside it. Nothing
 # else; loom writes nothing else there.
 scout_mirror_config_check() { # scout_mirror_config_check <mirror>
-  local wt="$1" rec k bad=""
+  local wt="$1" rec k bad="" gd cfgf
   while IFS= read -r -d '' rec; do
     k="${rec%%$'\n'*}"
     case "$k" in
@@ -4428,19 +4600,33 @@ scout_mirror_config_check() { # scout_mirror_config_check <mirror>
   $k" ;;
     esac
   done < <(git -C "$wt" config --worktree --list --null 2>/dev/null || true)
-  [ -z "$bad" ] || die "the scout mirror has keys in its OWN worktree-scope config that loom
+  [ -z "$bad" ] || {
+    # The FILE, named by git rather than spelled out. `worktrees/_scout` is the
+    # name git happens to give the mirror's git dir today; it is git's to
+    # choose (a collision, a prune-and-recreate, a rename), and a refusal that
+    # tells the operator to `rm -f` a path that is not the one being complained
+    # about is a refusal that gets ignored or, worse, obeyed.
+    gd="$(git -C "$wt" rev-parse --git-dir 2>/dev/null || true)"
+    case "$gd" in ""|/*) ;; *) gd="$wt/$gd" ;; esac
+    if [ -n "$gd" ]; then
+      cfgf="$gd/config.worktree"
+    else
+      cfgf="(git cannot name the mirror's git directory — see 'git worktree list')"
+    fi
+    die "the scout mirror has keys in its OWN worktree-scope config that loom
 did not write:$bad
   $wt
-  $GITCOMMON/worktrees/_scout/config.worktree
+  $cfgf
 That scope is read for every git command run in the mirror and for nothing
 else, so it is invisible to the repository config baseline — and the mirror is
 where 'loom scout' does a working-tree update (sparse-checkout, clean, reset),
 which is what runs a planted filter.<d>.smudge. loom writes only
 core.sparseCheckout there. Read it, then clear it:
   git -C $wt config --worktree --list
-  rm -f $GITCOMMON/worktrees/_scout/config.worktree
+  rm -f $cfgf
 or remove the mirror entirely and let the next scout rebuild it:
   git worktree remove --force $wt"
+  }
 }
 
 scout_root() {
