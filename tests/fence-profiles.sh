@@ -4443,6 +4443,40 @@ git -C "$CS" reset -q --hard
 git branch -D agent/0130-cs > /dev/null 2>&1 || true
 rm -f "$cs_hook" "$TMP/stubs/loom"
 
+# --- (ct) N2: a trunk link with a trailing space, and one with a newline ------
+# The inherited-link sparse escaping escaped `\ * ? [` but not a TRAILING SPACE
+# (gitignore strips it, so the fenced-out pattern missed the real link and it
+# stayed on disk) and could not express a NEWLINE at all. The trailing-space one
+# is now fenced out (worktree usable); the newline one is refused up front.
+ct_ts='backend/trail '                    # note the trailing space
+ln -s /etc "$ct_ts"
+git add "$ct_ts"
+git commit -qm "(ct) a trunk link whose name ends in a space"
+out="$("$LOOM" new 0131-ct 2>&1)"; rc=$?
+want_eq   "(ct) loom new succeeds on a trunk with a trailing-space escaping link" "$rc" "0"
+want_in   "(ct) ... WARNing, naming it"                           "$out" "backend/trail"
+CT="$WTU/0131-ct"
+want_gone "(ct) ... and the link is fenced OUT of the worktree"    "$CT/$ct_ts"
+want_file "(ct) ... while the working surface is present"          "$CT/backend/main.go"
+want_gone "(ct) ... and the ordinary fence still holds (ios fenced)" "$CT/ios/App.swift"
+"$LOOM" drop 0131-ct > /dev/null 2>&1 || true
+git branch -D agent/0131-ct > /dev/null 2>&1 || true
+git rm -q --cached "$ct_ts" > /dev/null 2>&1; rm -f "$ct_ts"
+git commit -qm "(ct) and the trailing-space link removed"
+# ... and a NEWLINE in the name, which no sparse pattern line can carry.
+ct_nl="$(printf 'backend/new\nline')"
+ln -s /etc "$ct_nl"
+git add "$ct_nl"
+git commit -qm "(ct) a trunk link whose name holds a newline"
+out="$("$LOOM" new 0132-ct2 2>&1)"; rc=$?
+want_fail   "(ct) loom new REFUSES a trunk link whose name holds a NEWLINE" "$rc"
+want_in     "(ct) ... up front, saying NEWLINE"                   "$out" "NEWLINE"
+want_in     "(ct) ... and naming it"                              "$out" "backend/new"
+want_absent "(ct) ... creating no worktree"                       "$WTU/0132-ct2"
+git branch -D agent/0132-ct2 > /dev/null 2>&1 || true
+git rm -q --cached "$ct_nl" > /dev/null 2>&1; rm -f "$ct_nl"
+git commit -qm "(ct) and the newline link removed"
+
 # --- (j)/(t)/(cg) doctor lists the profiles, touches no network, and counts -
 # (cg): `local pname pprov prel role m mp bad` inside the [fence_profiles] loop
 # re-declared the function's own FAILURE COUNTER (`local ok=0 warn=0 bad=0`).

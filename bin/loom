@@ -3249,7 +3249,7 @@ via git plumbing."
 # the flag as a literal pattern), so set the mode with `init --no-cone`
 # (>= 2.25, worktree-scoped config) and let `set` inherit it.
 fence_apply() { # fence_apply <worktree>
-  local wt="$1" g lp esc
+  local wt="$1" g lp esc trail
   local -a pats=()
   load_fence
   # The trunk's own escaping symlinks (round 17, B2): not this branch's doing,
@@ -3261,7 +3261,13 @@ fence_apply() { # fence_apply <worktree>
   while IFS= read -r g; do [ -n "$g" ] && pats+=("!$g"); done <<< "$FENCE_PATTERNS"
   for lp in ${LINK_FENCE[0]+"${LINK_FENCE[@]}"}; do
     esc="${lp//\\/\\\\}"; esc="${esc//\*/\\*}"; esc="${esc//\?/\\?}"; esc="${esc//[/\\[}"
-    pats+=("!/$esc")
+    # gitignore/sparse patterns strip UNescaped trailing spaces, so a link named
+    # `backend/trail ` would be fenced by `backend/trail` and the real link left
+    # on disk. Escape every trailing space as `\ `. (A NEWLINE cannot be
+    # expressed in a pattern line at all — link_fence_load refuses it up front.)
+    trail=""
+    while [ "${esc% }" != "$esc" ]; do esc="${esc% }"; trail="$trail\\ "; done
+    pats+=("!/$esc$trail")
   done
   if [ "${#pats[@]}" -eq 0 ]; then
     # Nothing left to fence. With a profile active that can mean it released
@@ -3558,7 +3564,7 @@ tree_escaping_links() { # tree_escaping_links <dir> <rev> [<base>] -> offending 
 LINK_FENCE=()
 LINK_FENCE_SEEN=""      # the base $LINK_FENCE was computed for; "" = not yet
 link_fence_load() { # link_fence_load <dir> <base>
-  local d="$1" base="$2" p out
+  local d="$1" base="$2" p out lf=$'\n'
   if [ -z "$base" ]; then LINK_FENCE=(); LINK_FENCE_SEEN=""; return 0; fi
   [ "$LINK_FENCE_SEEN" = "$base" ] && return 0
   LINK_FENCE=()
@@ -3568,7 +3574,17 @@ link_fence_load() { # link_fence_load <dir> <base>
   links_py escaping "$d" "$base" > "$out" \
     || die "cannot read the symlinks at this task's base commit — refusing to guess"
   while IFS= read -r -d '' p; do
-    [ -n "$p" ] && LINK_FENCE+=("$p")
+    [ -n "$p" ] || continue
+    # A NEWLINE cannot be expressed in a sparse-checkout pattern line, so an
+    # inherited escaping link whose path holds one could not be fenced out — it
+    # would be left on disk and the doorway open. Refuse up front, naming it.
+    case "$p" in
+      *"$lf"*) die "a tracked symlink at this task's base has a NEWLINE in its path and
+cannot be fenced out of a worktree — refusing:
+  $(printf '%q' "$p")
+Remove it from the trunk (or rename it) and re-run." ;;
+    esac
+    LINK_FENCE+=("$p")
   done < "$out"
   rm -f "$out"
   LINK_FENCE_SEEN="$base"
