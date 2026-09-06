@@ -3413,6 +3413,53 @@ ${note}These are yours to write. The pre-commit guard is a seatbelt and 'git com
 hand, or reclassify the zone deliberately in .agents/zones.toml."
 }
 
+# [hand] paths in what `loom run` is ABOUT TO COMMIT, applied by loom itself
+# rather than left to the pre-commit hook.
+#
+# The hook is the seatbelt and it is not always fastened: `loom install-hooks`
+# is a separate step, so in a fresh clone there is no hook at all — and there
+# `loom run` committed an implementer's edit to `.agents/gate.sh`, `loom check`
+# handed the reviewer a diff of it without comment, and only `loom land`
+# refused. The refusal has to be where the commit is made. Same zones as the
+# guard (the MAIN checkout's, via zones_py) and the same release exemption, so
+# a profiled task may still commit what its profile released.
+#
+# Called with the index already staged, and it deliberately does not unstage:
+# nothing was committed, the work is still there, and `git diff --cached` in
+# the worktree is how you read what stopped it.
+hand_reconcile_staged() { # hand_reconcile_staged <worktree> <task>
+  local wt="$1" task="$2" f z violations="" note="" out
+  out="$(mktemp "${TMPDIR:-/tmp}/loom-staged.XXXXXX")" \
+    || die "cannot create a temporary file for the staged path list"
+  tmp_track "$out"
+  # A NUL-delimited stream cannot survive a command substitution, and a git
+  # that failed must not read as "nothing is staged" — so it goes through a
+  # file, exactly as history_paths does. The temp is swept by cfg_cleanup, so
+  # the refusals below do not remove it inline (which would be a write into
+  # the file this loop is reading).
+  git -C "$wt" diff --no-ext-diff --no-textconv --cached -z --name-only > "$out" 2>/dev/null \
+    || die "cannot read what is staged in $wt — refusing to commit what loom cannot judge"
+  while IFS= read -r -d '' f; do
+    [ -n "$f" ] || continue
+    z="$(zone_of "$f")" || die "zone lookup failed for $f — refusing to guess"
+    if [ "$z" = hand ] && ! is_released "$f"; then
+      violations="$violations
+  $f"
+    fi
+  done < "$out"
+  rm -f "$out"
+  [ -n "$violations" ] || return 0
+  [ -n "$FENCE_PROFILE" ] && note="Fence profile '$FENCE_PROFILE' releases only: $FENCE_RELEASED
+"
+  die "the implementer's work for task $task touches hand-zone paths:$violations
+${note}These are yours to write, so loom is not committing them — nothing landed on
+$(branch_of "$task"). The pre-commit hook says the same thing when it is
+installed ('loom install-hooks'); this refusal does not depend on it.
+The work is still in the worktree and still staged. Read it:
+  git -C $wt diff --cached
+then put those paths back and re-run, or reassign the task."
+}
+
 # One sentence for the implementer prompt when a profile is in force, so the
 # agent knows the normally-fenced paths in front of it are deliberate.
 profile_note() {
@@ -4558,7 +4605,12 @@ inside the worktree after the implementer's turn. Inspect it, do not re-run."
       # which switches set -e off, and a failed add/commit (sparse-checkout
       # refusal, a hook, nothing to commit) would otherwise print "committed"
       # over an unchanged branch.
-      ( cd "$wt" && git add -A && git commit -q -m "agent($task): $title" ) \
+      ( cd "$wt" && git add -A ) \
+        || die "cannot stage the implementer's work in $wt — nothing landed on $br"
+      # BEFORE the commit, and by loom rather than by the hook: `loom
+      # install-hooks` is a separate step, so a fresh clone has no guard at all.
+      hand_reconcile_staged "$wt" "$task"
+      ( cd "$wt" && git commit -q -m "agent($task): $title" ) \
         || die "commit failed in $wt (nothing to commit, or git refused) — nothing landed on $br"
       echo "loom: committed on $br — review with: loom check $task && loom diff $task"
       return 0
@@ -4604,6 +4656,12 @@ cmd_check() {
   pin_branch_tip "$task"
   base="$(security_base "$task")"
   fence_reconcile_history "$task" "$base" "$FENCE_PROFILE"
+  # ... and the [hand] history, on the same range and for the same reason. It
+  # used to run only at `loom land`, so a branch carrying a `--no-verify` commit
+  # to `.agents/gate.sh` or `.agents/zones.toml` was handed to a reviewer as an
+  # ordinary diff — reviewed, approved, and refused only at the very end. A
+  # reviewer is never handed a hand-zone diff as if it were authorised.
+  hand_reconcile_history "$ROOT" "$base" "$PINNED_TIP"
   # BEFORE the patch, for the same reason the history check is: writing it runs
   # `git diff` in this repository, and a `diff.<d>.textconv` or a
   # `filter.<d>.clean` named by a config planted since `loom new` is a program
@@ -4749,6 +4807,7 @@ cmd_loop() {
     pin_branch_tip "$task"
     base="$(security_base "$task")"
     fence_reconcile_history "$task" "$base" "$FENCE_PROFILE"
+    hand_reconcile_history "$ROOT" "$base" "$PINNED_TIP"
     cmd_check "$task" ${passthru[0]+"${passthru[@]}"}
     verdict="$(grep '^VERDICT:' "$review" 2>/dev/null | tail -1 || true)"
     # No verdict line at all means a truncated or derailed review, not a
@@ -4815,6 +4874,7 @@ cmd_diff() {
   pin_branch_tip "$task"
   base="$(security_base "$task")"
   fence_reconcile_history "$task" "$base" "$FENCE_PROFILE"
+  hand_reconcile_history "$ROOT" "$base" "$PINNED_TIP"   # same range, same reason
   require_recorded_config "$task" diff       # same reason as `loom check`
   # Same order and the same reason as `loom check`: the directory is resolved
   # before a byte of the patch is written, and the patch goes to what it

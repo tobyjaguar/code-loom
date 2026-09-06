@@ -88,6 +88,11 @@ fi
 # is `.`-sourced shell from a tracked path an agent can write, so this is a
 # security fact, not a detail: see (by).
 printf 'TMPDIR=%s\n' "${TMPDIR:-(unset)}" >> "${LOOM_TEST_TMP:?}/called-claude.log"
+# An implementer that edits a [hand] path, for (cf). `loom run` must refuse to
+# COMMIT it — by itself, whether or not the pre-commit hook is installed.
+if [ -n "${LOOM_TEST_HAND_EDIT:-}" ]; then
+  printf '#!/usr/bin/env bash\n# edited by the stub implementer\nexit 0\n' > "$LOOM_TEST_HAND_EDIT"
+fi
 # An implementer must be able to write; prove the stub ran by leaving a file.
 echo "written by the stub implementer" > backend/from-implementer.txt
 echo "stub claude done"
@@ -248,7 +253,7 @@ for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p \
          0078-br 0079-br2 0080-bs 0081-bs2 0083-bs3 \
          0084-bu 0085-bu2 0086-bu3 0087-bu4 0088-bu5 0089-bu6 0090-bu7 \
          0091-bw 0093-bx 0094-by 0095-bz 0096-ca 0097-cb \
-         0098-cc 0099-cd 0100-ce; do mk_task "$t"; done
+         0098-cc 0099-cd 0100-ce 0101-cf 0102-cf2; do mk_task "$t"; done
 mk_task 0040-ar  codex
 mk_task 0042-as  codex
 mk_task 0005-f codex
@@ -1383,7 +1388,10 @@ git remote remove origin
 out="$("$LOOM" new 0046-au 2>&1)"; rc=$?
 want_eq "(au) setup: an unprofiled worktree"              "$rc" "0"
 AUW="$WTU/0046-au"
-au_swap="$(git rev-parse main)"
+# A commit the branch is NOT already on: the branch was cut from `main`, and
+# since `loom run` now refuses to commit the hand-zone edit this gate makes
+# (see (cf)), "still at main" would be true whether the swap landed or not.
+au_swap="$(git rev-parse 'main~1')"
 cat > "$AUW/.agents/gate.sh" << GATE
 #!/usr/bin/env bash
 # The worktree's copy, rewritten by "the agent": it marks itself, re-points the
@@ -1394,9 +1402,14 @@ exit 1
 GATE
 chmod +x "$AUW/.agents/gate.sh"
 out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 "$LOOM" run 0046-au 2>&1)"; rc=$?
-want_eq     "(au) loom run reaches a green gate — the OPERATOR's" "$rc" "0"
+want_in     "(au) the gate that ran was the OPERATOR's, and it was green" "$out" "gate green"
 want_absent "(au) ... the worktree's gate never ran"      "$TMP/au-worktree-gate.ran"
 want_ne     "(au) ... so the branch was not swapped"      "$(git rev-parse agent/0046-au)" "$au_swap"
+# ... and then the run stops, because rewriting `.agents/gate.sh` is an edit to
+# a [hand] path and loom does not commit those (see (cf)). It used to commit
+# the agent's own gate onto the branch and only refuse at `loom land`.
+want_fail   "(au) ... and the run refuses to commit that hand-zone edit" "$rc"
+want_in     "(au) ... naming it"                          "$out" ".agents/gate.sh"
 # ... and the tip a reviewer read is the tip that lands.
 out="$("$LOOM" new 0047-au2 2>&1)"; rc=$?
 want_eq "(au) setup: a second worktree"                   "$rc" "0"
@@ -3675,6 +3688,59 @@ printf '%s\n' "$ce_gate_orig" > .agents/gate.sh
 chmod +x .agents/gate.sh
 git add .agents/gate.sh
 git commit -qm "(ce) and the ordinary gate back"
+
+# --- (cf) a hand-zone edit is refused at the COMMIT, hook or no hook -------
+# `loom install-hooks` is a separate step, so a fresh clone has no pre-commit
+# guard at all — and there `loom run` committed an implementer's edit to
+# `.agents/gate.sh`, `loom check` handed the reviewer a diff of it without
+# comment, and only `loom land` refused. Both halves are fixed: `loom run`
+# applies the guard's rule itself before it commits, and `loom check` (and
+# `loom diff`, and each round of `loom loop`) runs the same [hand] history
+# check `loom land` has always run. The hook is REMOVED for this case, which is
+# the whole point of it.
+# (bg) removed it again when it was done, so this is already the fresh-clone
+# shape — asserted rather than assumed, because the whole case turns on it.
+cf_hook="$(git rev-parse --git-path hooks/pre-commit)"
+case "$cf_hook" in /*) ;; *) cf_hook="$REPO/$cf_hook" ;; esac
+want_absent "(cf) setup: no pre-commit hook installed"              "$cf_hook"
+out="$("$LOOM" new 0101-cf 2>&1)"; rc=$?
+want_eq "(cf) setup: a task"                                        "$rc" "0"
+CF="$WTU/0101-cf"
+cf_head="$(git -C "$CF" rev-parse HEAD)"
+out="$(LOOM_TEST_HAND_EDIT=".agents/gate.sh" LOOM_MODELS_implementer="claude-sub" \
+       LOOM_MAX_ATTEMPTS=1 "$LOOM" run 0101-cf 2>&1)"; rc=$?
+want_fail "(cf) loom run refuses to commit the implementer's hand-zone edit" "$rc"
+want_in   "(cf) ... naming the path"                                "$out" ".agents/gate.sh"
+want_in   "(cf) ... and saying what it is"                          "$out" "hand-zone paths"
+want_eq   "(cf) ... with nothing committed on the branch"           "$(git -C "$CF" rev-parse HEAD)" "$cf_head"
+want_eq   "(cf) ... and the implementer really did edit it"         "$(git -C "$CF" diff --cached --name-only -- .agents/gate.sh)" ".agents/gate.sh"
+# Now the second half: the commit made anyway, the way an agent makes it.
+git -C "$CF" commit -q --no-verify -m "agent(0101-cf): past the guard"
+want_ne   "(cf) setup: the --no-verify commit is on the branch"     "$(git -C "$CF" rev-parse HEAD)" "$cf_head"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0101-cf 2>&1)"; rc=$?
+want_fail   "(cf) loom check refuses a branch with a hand-zone commit" "$rc"
+want_in     "(cf) ... naming the path"                              "$out" ".agents/gate.sh"
+want_in     "(cf) ... with the hand-zone message"                   "$out" "touch hand-zone paths"
+want_absent "(cf) ... and no review patch was written"              "$CF/.agents/reviews/0101-cf.patch"
+want_eq     "(cf) ... nor anything recorded as reviewed"            "$(state_field 0101-cf reviewed)" ""
+out="$("$LOOM" diff 0101-cf 2>&1)"; rc=$?
+want_fail   "(cf) loom diff refuses it too"                         "$rc"
+want_in     "(cf) ... naming the path"                              "$out" ".agents/gate.sh"
+# The control: the same run, without the hand-zone edit, commits as it always
+# did — so the refusal above is about the path and not about the missing hook.
+out="$("$LOOM" new 0102-cf2 2>&1)"; rc=$?
+want_eq "(cf) control: a second task"                               "$rc" "0"
+CF2="$WTU/0102-cf2"
+cf2_head="$(git -C "$CF2" rev-parse HEAD)"
+out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 "$LOOM" run 0102-cf2 2>&1)"; rc=$?
+want_eq "(cf) control: an assist-only run still commits"            "$rc" "0"
+want_ne "(cf) ... and really committed"                             "$(git -C "$CF2" rev-parse HEAD)" "$cf2_head"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0102-cf2 2>&1)"; rc=$?
+want_eq   "(cf) control: and loom check reviews it"                 "$rc" "0"
+want_file "(cf) ... writing the patch"                              "$CF2/.agents/reviews/0102-cf2.patch"
+want_absent "(cf) ... and there was never a hook to do any of it"    "$cf_hook"
+"$LOOM" drop 0101-cf  > /dev/null 2>&1 || true
+"$LOOM" drop 0102-cf2 > /dev/null 2>&1 || true
 
 # --- (j)/(t) doctor lists the profiles, and touches no network ------------
 out="$(timeout 180 "$LOOM" doctor 2>&1 || true)"
