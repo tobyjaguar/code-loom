@@ -125,8 +125,11 @@ that judge the agent's own work:
 * `.gitattributes` (the repo root's, and every nested one — git reads a
   `.gitattributes` in any directory) is the **file half** of filter- and
   merge-driver execution. The driver itself lives in `.git/config`, which
-  `loom` now pins to the task: a change to the repository's local git config is
-  refused, and `--accept-config` is the one escape. The *attribute* that selects
+  `loom` now pins to the task: a change to the repository's git config — all
+  three scopes and the include closure — is refused, and `--accept-config` is
+  the one escape. (The repository also carries a baseline of its own for the
+  roles that have no task, `loom plan` and `loom scout`; `loom pin-config`
+  records it.) The *attribute* that selects
   a driver for a path lives in the tree, where an agent writes it — `filter=x`
   on one path, plus a `filter.x.clean` anywhere in the config chain (your
   `~/.gitconfig` included), is a program git runs on checkout, `git add` and

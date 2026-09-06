@@ -301,7 +301,10 @@ enough":
   `show-ref`, `merge-base`, `rev-list`, `update-ref`, `add`, `commit`,
   `checkout`, `reset`, `diff`, `log`, `show`, `ls-remote`, `symbolic-ref`,
   `sparse-checkout` and `patch-id` all ran the planted pager; only `rev-parse`
-  and `config` did not. Both levers that do win are used — `GIT_PAGER=cat` (the
+  did not. `git config` **splits**: `config --get` does not page, but
+  `config --list` **does** (measured in a pty, git 2.34.1) — and `--list` is the
+  form the config pin itself reads with, so `pager.config=cat` is load-bearing
+  rather than belt-and-braces. Both levers that do win are used — `GIT_PAGER=cat` (the
   complete one: it beats `pager.<cmd>` for every subcommand, including ones loom
   does not run today) and one `pager.<cmd>=cat` per subcommand loom runs (the
   floor). `--no-pager` on every call site also works and was rejected: ~100
@@ -324,6 +327,28 @@ hides behind a pointer:
 | `worktree-main` | `$GIT_COMMON_DIR/config.worktree` | the main checkout's own scope; a `core.hooksPath` here runs **your** hooks, in **your** checkout, during `loom land`'s merge |
 | `worktree-task` | `$GIT_COMMON_DIR/worktrees/<wt>/config.worktree` | the task worktree's own scope — `git config --worktree <k> <v>` from inside the agent's tree |
 | `include` | every file an `include.path` / `includeIf.<cond>.path` names, recursively | whoever can write that file, which is not necessarily anyone in this repository |
+
+**`includeIf` conditions are not evaluated, on purpose.** git decides whether an
+`includeIf.<cond>.path` applies by testing `<cond>` — `gitdir:`, `onbranch:`,
+`hasconfig:` — against the repository at the moment it reads the config. `loom`
+does not test it: **every** `includeIf` target is resolved, digested and pinned,
+whatever its condition says. That **over-refuses** by construction — an edit to
+a file whose condition does not currently match is still a refusal — and that is
+the direction to be wrong in. The conditions are evaluated against state that
+moves (the branch you are on, the directory the command ran in, the config
+itself), so a closure that honoured them would be a closure that changed shape
+under the agent, and "the include stopped applying" would look identical to "the
+include was never there".
+
+**An included file's BYTES are pinned, not only its digest.** A digest alone
+made an edit to an included file print `include:<path>:<sha-a>` against
+`include:<path>:<sha-b>` — a refusal with nothing in it to read, in the one case
+where the changed bytes are not in a file `git config --list` will show. The
+record is `include:<path>:<sha256>` plus the target's own bytes, so the same
+change renders as a `-`/`+` **content** diff. Path and bytes are escaped on the
+way *in*, with the escaper values are rendered with, because the sidecar is
+NUL-framed with a newline between a record's halves and an included config file
+may contain both.
 
 Both `config.worktree` files are live whenever `extensions.worktreeConfig` is
 enabled — which **loom itself enables**, on the first `git sparse-checkout init`
@@ -366,10 +391,17 @@ A change is a dead stop that prints the `-`/`+` lines and names the one escape,
 baseline. **`loom new` refuses `--accept-config`**: it is the command that
 *pins*, so it has nothing to accept, and swallowing the flag would read as "the
 config was re-pinned". It says what it pinned instead — one line,
-`loom: pinned N local + M worktree config entries`, and a WARN naming the
-targets whenever an `include.path`/`includeIf` is present, because an included
-file's bytes are now part of this task's baseline and the operator should meet
-that fact before they meet the refusal. **`loom drop` deliberately does not
+`loom: pinned N local + M worktree config entries`, a WARN naming the targets
+whenever an `include.path`/`includeIf` is present (an included file's bytes are
+now part of this task's baseline, and the operator should meet that fact before
+they meet the refusal), and a second WARN naming **every pinned key that names a
+program git runs** — `core.hooksPath`, `credential.*`, `core.askPass`,
+`filter.*`, `merge.*.driver`, `diff.*.textconv`/`.command`, `gpg.program`,
+`pager.*`, `core.attributesFile`, `core.sshCommand`,
+`include.*`/`includeIf.*` — values escaped, tagged with the scope each came
+from. That list is residual 1 below, printed at the one moment it is being
+adopted; an operator who is never shown it has no way to know they accepted it.
+`loom pin-config` prints both blocks too. **`loom drop` deliberately does not
 check the pin at all**: it runs no model, publishes nothing, and removes the
 worktree, the branch and the record — refusing to clean up because the config
 moved would strand released paths on disk, which is the opposite of what the
@@ -414,6 +446,76 @@ and it is a residual by construction rather than an oversight:
    guard is a seatbelt. An *uncommitted* one still selects a driver for a
    working-tree update, which is why the pin is read before the reconcile.
 
+#### The roles with no task, and the repository baseline
+
+The pin above is **per task**, and two roles do not have one: `loom plan`'s
+architect, which runs in `$ROOT` — your own checkout — and `loom scout`, which
+runs in the shared `$WT_ROOT/_scout` mirror. Both are model launches, and the
+scout is a **working-tree update** as well: `fence_apply` -> `sparse-checkout
+set`, the `clean` and the `reset --hard`/`checkout` beside it each materialise
+paths, and materialising a path runs the **smudge** side of whatever `filter.<d>`
+a `.gitattributes` in the mirror selects — with the driver read out of the
+**shared** `.git/config`, one `git config` from inside any agent's worktree. So
+the whole argument for the pin applied to `loom scout`, and `loom scout` had no
+pin.
+
+The **repository** therefore has a baseline of its own, beside the task records
+and never inside one:
+
+```
+${XDG_CONFIG_HOME:-~/.config}/loom/repos/<key>/config            the digest, 0600
+${XDG_CONFIG_HOME:-~/.config}/loom/repos/<key>/config.gitconfig  the dump it was
+                                                                 taken over, 0600
+```
+
+covering the scopes that belong to the **repository** — `local` and
+`worktree-main` — and their include closure. The `worktree-task` scope is
+deliberately absent: there is no task here, and folding one in would make the
+baseline move whenever any task's worktree gained a sparse rule.
+
+- **Written** wherever a task is pinned (`loom new`, `--accept-config`, and
+  `land --pr`'s re-pin after its own `--set-upstream-to`), and by
+  **`loom pin-config`**, the explicit operator command — and the answer for a
+  repository with no tasks at all. Its grammar is the same consent shape as
+  everything else here: bare, it records a missing baseline, says so when the
+  baseline is current, and prints the diff and **refuses** when it is not;
+  `loom pin-config --accept-config` prints the same diff and re-records.
+- **Read** by `scout_root` before it touches the mirror at all, by `cmd_plan`
+  before the architect runs, and by `run_role` before every task-less launch,
+  per *attempt*. A missing baseline is its own refusal, in its own words.
+- **Not removed by `loom drop`.** It is a fact about the repository rather than
+  about a task, and a `loom scout` after the last task was dropped still has to
+  be judged against something.
+
+`git config --worktree` is an **alias for `--local`** when
+`extensions.worktreeConfig` is off, so the two worktree scopes are read only
+when git would read them. That is fail-closed, not a relaxation: turning the
+extension on is itself a write to the local scope, which this same pin refuses.
+
+`scout_root` re-pins the repository baseline after **creating** the mirror, for
+the same reason `loom new` re-pins after its own worktree setup — the first
+`sparse-checkout init` in a repository writes `extensions.worktreeConfig` to the
+shared `.git/config`. The baseline was checked at the top of that function,
+before anything was created, so a config an agent moved is refused above and
+never reaches the re-pin.
+
+#### The scout mirror is disposable
+
+`$WT_ROOT/_scout` is shared by every task and every provider, which makes
+anything that survives a call a channel between them.
+
+- Its **own worktree-scope config**, `$GIT_COMMON_DIR/worktrees/_scout/config.worktree`,
+  is the one scope no baseline can cover — it is not `local`, not the main
+  checkout's, and not any task's — and `git -C <mirror> config --worktree` writes
+  it. `loom` **refuses** a mirror whose private scope holds anything but the
+  sparse keys git's own `sparse-checkout` writes. Refusing rather than
+  deleting-and-recreating the scope is deliberate: both neutralise the plant,
+  only one tells the operator that something wrote there.
+- `reset --hard` never touches an **untracked** file, so a previous run's
+  scratch — or a copy of a fenced path made with `git show HEAD:core/lib.rs >
+  notes.txt`, which the index never sees — sat in the mirror for the next
+  provider to read. `git clean -xdff` now runs before the reset.
+
 `remote.origin.url` / `.fetch` / the push URL keep their own named checks on
 top of the pin, because "the remote was re-aimed" is a clearer message than "the
 config changed"; they are pinned in the operator record at `loom new` and
@@ -422,6 +524,42 @@ re-checked before `loom rebase` fetches and before `loom land --pr` pushes.
 A repository whose `.gitattributes` and filter drivers you would not run is a
 repository to give an agent a separate clone of, not a sparse checkout — the
 same answer caveat 1 gives for exfiltration.
+
+### A worktree is judged only once it is proved to be ours
+
+Every check above reads a worktree through `git -C "$wt" …`, and *which
+repository that answers for* is decided by one line of text in a file the agent
+owns. `$wt/.git` in a linked worktree is not a directory; it is a file holding
+`gitdir: <path>`. Rewrite it and the directory stops being this repository's
+worktree: every later `git -C "$wt" …` reads a git directory of the writer's
+choosing — its config (filter drivers, `core.hooksPath`, `credential.helper`),
+its hooks, its refs, its objects — while the path, the task id and the branch
+name go on reading exactly as they did.
+
+Nothing caught it, and the shape of the trap is why: a decoy repository built
+with the **same branch name** answers `git -C "$wt" symbolic-ref HEAD` with
+`refs/heads/agent/<task>` (measured), so `require_wt_on_branch` — the check
+whose whole job is "is this tree the branch's tree" — passed it. `loom drop`
+could not clean up afterwards either: git refuses to remove a worktree it does
+not own, the removal was written `|| true`, and the command printed `dropped`
+over a directory that was still there with the released paths still in it.
+
+`require_wt_is_ours` asks git three things and compares each against a path this
+process resolved at startup, realpath'd on both sides (so a repo under a
+symlinked `/tmp` cancels out while a symlink planted at one of them does not):
+
+1. `--git-common-dir` is this repository's shared `.git`;
+2. `--show-toplevel` is the directory we asked about — not a tree elsewhere
+   that a moved gitdir or a `core.worktree` re-aimed it at;
+3. `--git-dir` is under `$GIT_COMMON_DIR/worktrees/`, i.e. git knows it as a
+   linked worktree **of this repository**.
+
+It runs at the top of `require_wt_on_branch` (which covers `require_worktree`,
+`loom run` and `loom loop`), in `loom drop` **before** `git worktree remove`,
+and in `scout_root` for the mirror. And `loom drop` no longer prints `dropped`
+on faith: the directory is asserted **gone** before the record and the branch
+are touched, and if anything remains loom prints what and exits 1 — leaving the
+operator record, which is the only thing that says what that directory is.
 
 ### Fence profiles
 

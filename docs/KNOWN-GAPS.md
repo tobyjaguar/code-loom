@@ -361,7 +361,9 @@ matter slightly more than they did.
 ## 6. `.git/config` is shared, and some of its keys name programs
 
 **Status: narrowed in round 7, pinned in round 8, widened to every scope git
-actually reads in round 9, and a residual by construction.** This one cannot be
+actually reads in round 9, extended in round 10 to the roles that have no task
+(and to the one scope no task pin could reach), and a residual by
+construction.** This one cannot be
 closed from outside git; what follows is the boundary, drawn honestly.
 
 **Where.** `bin/loom:393` (the `GIT_CONFIG_PARAMETERS` export) and
@@ -460,6 +462,36 @@ entries`, plus a WARN naming the targets whenever an include is present.
 publishes nothing, and removes the worktree, branch and record, so refusing to
 clean up over a moved config would strand released paths on disk.
 
+*The include closure carries BYTES, and `includeIf` conditions are not
+evaluated.* A digest alone made an edit to an included file print
+`include:<path>:<sha-a>` against `include:<path>:<sha-b>` — a refusal with
+nothing in it to read, in the one case where the changed bytes are in no file
+`git config --list` will show. The record now carries the target's own bytes
+beside its sha, so the change is a `-`/`+` **content** diff; path and bytes are
+escaped on the way in, because the sidecar is NUL-framed with a newline between
+a record's halves and a config file may contain both. And **every**
+`includeIf.<cond>.path` target is pinned whatever `<cond>` says: `loom` does not
+test `gitdir:` / `onbranch:` / `hasconfig:`. That **over-refuses** by design, and
+that is the direction to be wrong in — the conditions are evaluated against
+state that moves under the agent (the branch, the directory, the config itself),
+so "the include stopped applying" and "the include was never there" would look
+identical.
+
+*Two roles had no task, so they had no pin.* `loom plan`'s architect runs in
+`$ROOT` and `loom scout` runs in the shared `$WT_ROOT/_scout` mirror, and the
+scout's run is a **working-tree update** — `fence_apply` -> `sparse-checkout
+set`, a `clean`, a `reset --hard` — which is exactly what runs a planted
+`filter.<d>.smudge`, with the driver read out of the shared `.git/config`. The
+repository now has a **baseline of its own**, `$STATE_DIR/config` plus
+`config.gitconfig` beside it (0600), over the `local` and `worktree-main` scopes
+and their include closure. It is written wherever a task is pinned and by the
+new **`loom pin-config`** (bare: record, or print the diff and refuse;
+`--accept-config`: print the diff and re-record), and it is checked by
+`scout_root` before it touches the mirror, by `cmd_plan` before the architect
+runs, and by `run_role` before every task-less launch, per attempt. `loom drop`
+does not remove it: it is the repository's fact, not a task's
+(`tests/fence-profiles.sh` (bp)).
+
 *Why the ordering is part of it.* `fence_reconcile` -> `fence_apply` ->
 `git sparse-checkout set` is a **working-tree update**: git materialises every
 path the new pattern list admits, and materialising a path runs the **smudge**
@@ -486,10 +518,24 @@ re-point it under a running task without the next command refusing.
    `--accept-config` was used to re-record. That flag is an operator act with
    the same weight as `--fence-profile`, and `loom` vouches for none of what it
    accepts.
-2. **The operator's own `~/.gitconfig` and the system config, and any git config
-   scope outside the three the pin covers.** None is in the shared `.git`, none
-   is writable from a worktree, and none is pinned — they are the operator's;
-   `core.sshCommand` is deliberately read from there.
+2. **The operator's own `~/.gitconfig` and the system config.** Neither is in
+   the shared `.git`, neither is writable from a worktree, and neither is
+   pinned — they are the operator's; `core.sshCommand` is deliberately read
+   from there.
+
+   This entry used to say "and any git config scope outside the three the pin
+   covers … none is in the shared `.git`", and that was **wrong**. One such
+   scope was: `$GIT_COMMON_DIR/worktrees/_scout/config.worktree`, the shared
+   `_scout` mirror's own worktree scope. It is in the shared `.git`, it is
+   written by one `git -C <mirror> config --worktree`, and it belongs to no task
+   — so no task pin covered it and the repository baseline cannot either. It is
+   handled by its own check now: `loom scout` **refuses** a mirror whose private
+   scope holds anything but the sparse keys git's own `sparse-checkout` writes.
+   Refusing rather than silently deleting and recreating the scope is
+   deliberate — both neutralise the plant, only one tells the operator that
+   something wrote there. The mirror is also `git clean -xdff`'d before every
+   reset, because it is shared by every task and every provider and `reset
+   --hard` never touches an untracked file (`tests/fence-profiles.sh` (bp)).
 3. **In-tree `.gitattributes`** — the file half of filter/merge-driver
    selection. It is a `[hand]` path in the shipped template (`.gitattributes`
    and `**/.gitattributes`), so `loom land` refuses a branch that changed it;

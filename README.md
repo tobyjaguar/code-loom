@@ -110,6 +110,10 @@ $EDITOR ~/.config/loom/env         # paste keys here: ZHIPU_API_KEY=... etc.
                                    # so keys never live in a repo or profile
 
 loom doctor                        # verify binaries, keys, and MODEL IDS
+loom pin-config                    # record this repository's git config as the
+                                   # baseline `loom plan` and `loom scout` are
+                                   # judged against (`loom new` writes it too,
+                                   # so this is for a repo with no tasks yet)
 ```
 
 `claude` must be logged in to your Anthropic subscription (it already is if
@@ -469,8 +473,12 @@ part of the branch that still changes your runs:
   in `git config --local --list`**. `loom new` records `config=<sha256 of all of
   that, sorted>` in the operator record, with the full list beside it as
   `<task>.gitconfig` (each entry tagged with its scope, plus one
-  `include:<path>:<sha256>` line per included file) so a mismatch is shown as a
-  diff that names the scope. It is recomputed and compared **before the first
+  `include:<path>:<sha256>` record per included file — carrying the target's
+  own **bytes**, so an edit to it is a `-`/`+` content diff and not a pair of
+  digests) so a mismatch is shown as a diff that names the scope. Every
+  `includeIf.<cond>.path` target is pinned **whatever the condition says**:
+  `loom` does not evaluate `gitdir:` / `onbranch:` / `hasconfig:`, which
+  over-refuses on purpose. It is recomputed and compared **before the first
   fence operation of every command**, **before every model launch** (per
   *attempt*, not per command), before `land`'s merge and its push, before
   `rebase`'s fetch and again before its replay, and before `check` and `diff`
@@ -478,8 +486,14 @@ part of the branch that still changes your runs:
   escape — it prints what changed and re-records it as the baseline, and
   **`loom new` refuses it**, because `new` is the command that pins and so has
   nothing to accept. `loom new` also prints one line saying what it pinned
-  (`loom: pinned N local + M worktree config entries`) and WARNs, naming the
-  targets, when the config pulls other files in. `loom` writes config on your
+  (`loom: pinned N local + M worktree config entries`), WARNs naming the
+  targets when the config pulls other files in, and WARNs again naming every
+  pinned key that names a **program git runs** — `core.hooksPath`,
+  `credential.*`, `core.askPass`, `filter.*`, `merge.*.driver`,
+  `diff.*.textconv`/`.command`, `gpg.program`, `pager.*`, `core.attributesFile`,
+  `core.sshCommand`, `include.*`/`includeIf.*` — values escaped, tagged with the
+  scope each came from. Those keys are what the pin ADOPTS as the baseline, and
+  this is the one moment an operator is shown them. `loom` writes config on your
   behalf in exactly two places and both re-pin themselves (`loom new`'s first
   `sparse-checkout init`, which adds `extensions.worktreeConfig` locally and
   `core.sparseCheckout` at worktree scope; and `land --pr`'s
@@ -494,8 +508,45 @@ part of the branch that still changes your runs:
   config moved would strand the released paths on disk — the opposite of what
   the check is for. What the pin leaves trusted — the config as it stood at
   `loom new` or as `--accept-config` re-recorded it, your `~/.gitconfig` and the
-  system config, and git scopes outside those three — is enumerated in
-  `docs/KNOWN-GAPS.md` gap 6.
+  system config — is enumerated in `docs/KNOWN-GAPS.md` gap 6.
+- **...and the REPOSITORY has a baseline too, for the roles with no task.**
+  `loom plan`'s architect runs in your own checkout and `loom scout` runs in the
+  shared `_scout` mirror; neither has a task record, so neither read a pin — and
+  the scout's run is a *working-tree update*, which is exactly what runs a
+  planted `filter.<d>.smudge`. `loom` records `$STATE_DIR/config` (+
+  `config.gitconfig` beside it) over the `local` and `worktree-main` scopes and
+  their include closure, wherever a task is pinned and whenever you run
+  **`loom pin-config`**:
+
+  ```sh
+  loom pin-config                  # record one; or say it is current; or print
+                                   # the diff and REFUSE
+  loom pin-config --accept-config  # print the diff and re-record it
+  ```
+
+  `loom scout` reads it before it touches the mirror, `loom plan` before the
+  architect runs, and `run_role` before every task-less launch. `loom drop` does
+  not remove it — it is the repository's fact, not a task's.
+- **The scout mirror is disposable.** It is shared by every task and every
+  provider, so `loom scout` `git clean -xdff`s it before every reset (a
+  `reset --hard` never removes an untracked file, so one run's scratch was the
+  next provider's reading), and it **refuses** a mirror whose own
+  worktree-scope config — `$GIT_COMMON_DIR/worktrees/_scout/config.worktree`,
+  the one scope no baseline can cover — holds anything but the sparse keys git
+  writes there.
+- **A worktree is judged only once it is proved to be ours.** `$wt/.git` in a
+  linked worktree is a one-line FILE in a directory the agent owns; rewrite it
+  and every `git -C "$wt" …` afterwards reads a repository of the writer's
+  choosing — its filters, its `core.hooksPath`, its refs — while a decoy built
+  with the same branch name goes on answering `symbolic-ref HEAD` correctly, so
+  the "is this tree on its branch" check passed it. `require_wt_is_ours` compares
+  `--git-common-dir`, `--show-toplevel` and `--git-dir` against this repository
+  (realpath'd on both sides) before `run`, `check`, `diff`, `land`, `rebase`,
+  `loop` and `drop` touch a worktree, and before the scout mirror is used. And
+  `loom drop` no longer prints `dropped` on faith: git refuses to remove a
+  worktree it does not own, so the directory is asserted **gone** before the
+  record and the branch are — and if anything remains, loom says what and
+  exits 1.
 - **`loom rebase` resolves its refs instead of looking them up.** `origin/main`
   and `main` are not ref names, they are things git *resolves*, and the order is
   `refs/<n>` > `refs/tags/<n>` > `refs/heads/<n>` > `refs/remotes/<n>`. So a
@@ -567,7 +618,7 @@ loom diff   0007-c --fence-profile codex
 loom rebase 0007-c --fence-profile codex
 loom land   0007-c --fence-profile codex
 
-# and, separately, when the repository's local git config has changed since
+# and, separately, when the repository's git config has changed since
 # `loom new` — `--accept-config` prints the diff and re-records it:
 loom run    0007-c --fence-profile codex --accept-config
 ```
