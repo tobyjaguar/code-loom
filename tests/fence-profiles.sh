@@ -247,7 +247,8 @@ for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p \
          0072-bm 0073-bn 0074-bo 0075-bp 0076-bq 0077-bq2 \
          0078-br 0079-br2 0080-bs 0081-bs2 0083-bs3 \
          0084-bu 0085-bu2 0086-bu3 0087-bu4 0088-bu5 0089-bu6 0090-bu7 \
-         0091-bw 0093-bx 0094-by 0095-bz 0096-ca 0097-cb; do mk_task "$t"; done
+         0091-bw 0093-bx 0094-by 0095-bz 0096-ca 0097-cb \
+         0098-cc; do mk_task "$t"; done
 mk_task 0040-ar  codex
 mk_task 0042-as  codex
 mk_task 0005-f codex
@@ -3511,6 +3512,49 @@ printf '%s\n' "$cb_tracked" | while read -r f; do
   [ -n "$f" ] && git add -f -- "$f"
 done
 git commit -qm "and back to the harness's own shape"
+
+# --- (cc) a refs/replace ref blinds every diff cut from the recorded base ---
+# The base is a literal OID in a file outside every repository, so moving a REF
+# no longer collapses a range. An OID names an OBJECT, though, and
+# `refs/replace/<oid>` makes git hand out a different object under that name to
+# every rev-parse, diff and merge — by default, and from any linked worktree,
+# because refs/replace/* lives in the shared .git. One `git replace -f <base>
+# <forged commit>` emptied the fence history check, the [hand] history check
+# and the review patch at once: `loom check` recorded a review of a 0-byte
+# patch and `loom land --pr` published a fenced commit (the external review
+# reproduced it to origin). loom now runs every git with replacement OFF, and
+# refuses outright while such a ref exists.
+out="$("$LOOM" new 0098-cc 2>&1)"; rc=$?
+want_eq "(cc) setup: a task"                                        "$rc" "0"
+CC="$WTU/0098-cc"
+echo "cc work" > "$CC/backend/cc.txt"
+git -C "$CC" add backend/cc.txt
+git -C "$CC" commit -qm "work on cc"
+CC_BASE="$(state_field 0098-cc base)"
+# Planted from INSIDE the worktree, with the worktree's own git — the position
+# an agent is actually in.
+CC_FAKE="$(git -C "$CC" commit-tree "$(git -C "$CC" rev-parse 'HEAD^{tree}')" -m 'forged base')"
+git -C "$CC" replace -f "$CC_BASE" "$CC_FAKE"
+want_eq "(cc) the replacement ref is in the SHARED .git, planted from the worktree" \
+        "$(git for-each-ref --format='%(refname)' refs/replace/)" "refs/replace/$CC_BASE"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0098-cc 2>&1)"; rc=$?
+want_fail   "(cc) loom check refuses beside a replacement ref"      "$rc"
+want_in     "(cc) ... naming the ref"                               "$out" "refs/replace/"
+want_in     "(cc) ... and the OID it redirects"                     "$out" "$CC_BASE"
+want_in     "(cc) ... and how to remove it"                         "$out" "git replace -d"
+want_absent "(cc) ... with no review patch written"                 "$CC/.agents/reviews/0098-cc.patch"
+want_eq     "(cc) ... and nothing recorded as reviewed"             "$(state_field 0098-cc reviewed)" ""
+out="$("$LOOM" land 0098-cc 2>&1)"; rc=$?
+want_fail   "(cc) loom land refuses too"                            "$rc"
+want_in     "(cc) ... naming the ref as well"                       "$out" "refs/replace/"
+# The control: remove the replacement and the same command goes through, with a
+# patch that carries the agent's edit — so the refusal above was about the ref.
+git -C "$CC" replace -d "$CC_BASE"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0098-cc 2>&1)"; rc=$?
+want_eq   "(cc) control: with the ref gone, loom check goes ahead"  "$rc" "0"
+want_file "(cc) ... and writes a review patch"                      "$CC/.agents/reviews/0098-cc.patch"
+want_in   "(cc) ... which carries the agent's edit"                 "$(cat "$CC/.agents/reviews/0098-cc.patch")" "backend/cc.txt"
+"$LOOM" drop 0098-cc > /dev/null 2>&1 || true
 
 # --- (j)/(t) doctor lists the profiles, and touches no network ------------
 out="$(timeout 180 "$LOOM" doctor 2>&1 || true)"

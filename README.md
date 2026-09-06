@@ -290,6 +290,14 @@ part of the branch that still changes your runs:
   them could collapse the range a fence check looked at to nothing. That also
   fixes a false refusal in the other direction: your own unpushed commits on
   `main` used to count as the branch's.
+  The record is outside the repository; the OBJECTS it names are not, and that
+  is a separate lever — `refs/replace/<oid>` redirects the object an OID names
+  for every git command, and those refs live in the shared `.git` too. So
+  `loom` turns replacement off for every git it runs
+  (`core.useReplaceRefs=false` and `GIT_NO_REPLACE_OBJECTS=1`) **and** refuses
+  outright, naming each ref, if the repository has any: a replacement planted
+  while agents were running emptied all three checks at once, and it is not a
+  thing to run beside.
   `loom new` writes the record, `loom rebase` re-points it (the one command that
   moves a base, and it is yours), `loom drop` deletes it, and every check reads
   it. A missing record, a base that does not resolve, a base that is not an
@@ -843,7 +851,11 @@ The *base* is the operator record described above, and the *endpoint* is
 command**, and used as that sha for the history check, the review patch, the
 merge and the push. Neither comes from the
 worktree, and neither comes from anything in `.git` — that is the same sentence
-as three paragraphs up, and it cost a whole class of bypass (a `loombase`
+as three paragraphs up, with the one caveat the sentence cannot carry on its
+own: an OID is a *name for an object*, and `refs/replace/*` in the shared
+`.git` renames objects. Replacement is therefore off for every git `loom` runs,
+and a replacement ref that exists at all is a refusal (above). It cost a whole
+class of bypass (a `loombase`
 pointed at the branch's own tip, or an `origin/main` moved there with `git
 update-ref`, makes every one of those diffs empty; a detached worktree hides
 the last commit from every check measured off `HEAD`). There is no second,
