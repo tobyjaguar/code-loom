@@ -4477,6 +4477,32 @@ git branch -D agent/0132-ct2 > /dev/null 2>&1 || true
 git rm -q --cached "$ct_nl" > /dev/null 2>&1; rm -f "$ct_nl"
 git commit -qm "(ct) and the newline link removed"
 
+# --- (cu) N3: an UNMERGED index with a 120000 entry is refused, not resolved --
+# `link_map` read `ls-files -s` and kept the LAST stage's target for a path
+# staged at 1/2/3 — so a conflict whose stage-3 side looks inside hid a stage-2
+# side that escapes. It refuses an unmerged symlink now, naming the path.
+out="$("$LOOM" new 0133-cu 2>&1)"; rc=$?
+want_eq "(cu) setup: a task"                                       "$rc" "0"
+CU="$WTU/0133-cu"
+echo "cu work" > "$CU/backend/cu.txt"
+git -C "$CU" add backend/cu.txt
+git -C "$CU" commit -qm "work on cu"
+# Stage an unmerged 120000 entry by hand: stage 2 -> /etc (escapes), stage 3 ->
+# docs (inside). last-wins used to pick the inside side and wave it through.
+cu_etc="$(printf '/etc'  | git -C "$CU" hash-object -w --stdin)"
+cu_docs="$(printf 'docs' | git -C "$CU" hash-object -w --stdin)"
+printf '120000 %s 2\tbackend/culink\n120000 %s 3\tbackend/culink\n' "$cu_etc" "$cu_docs" \
+  | git -C "$CU" update-index --index-info
+want_ne "(cu) setup: the index really is unmerged at backend/culink" \
+        "$(git -C "$CU" ls-files -u -- backend/culink)" ""
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0133-cu 2>&1)"; rc=$?
+want_fail "(cu) loom check refuses an unmerged symlink in the index"  "$rc"
+want_in   "(cu) ... naming the path"                              "$out" "backend/culink"
+want_in   "(cu) ... as UNMERGED, not resolved to the inside side"  "$out" "UNMERGED"
+git -C "$CU" reset -q --hard
+"$LOOM" drop 0133-cu > /dev/null 2>&1 || true
+git branch -D agent/0133-cu > /dev/null 2>&1 || true
+
 # --- (j)/(t)/(cg) doctor lists the profiles, touches no network, and counts -
 # (cg): `local pname pprov prel role m mp bad` inside the [fence_profiles] loop
 # re-declared the function's own FAILURE COUNTER (`local ok=0 warn=0 bad=0`).

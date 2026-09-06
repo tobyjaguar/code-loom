@@ -3420,6 +3420,14 @@ def link_map(what, soft=False):
         f = head.split(b" ")
         if len(f) < 3 or f[0] != b"120000":
             continue
+        # An UNMERGED index stages the same path at 1/2/3 with DIFFERENT targets;
+        # keeping one (last wins) silently picks a side, and the inside-looking
+        # side would wave an escaping link through. `ls-files -s` carries the
+        # stage in field 3 (0 = merged). Refuse, naming the path.
+        if what == ":index" and f[2] != b"0":
+            die("the index of %s has an UNMERGED symlink at %s (conflict stage %s) — "
+                "refusing to guess which side it points at; resolve the conflict "
+                "first" % (d, dec(path), dec(f[2])))
         shas.append(f[shafield])
         paths.append(path)
     if not shas:
