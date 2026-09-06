@@ -2826,7 +2826,23 @@ cmd_rebase() { # rebase agent/<task> onto origin/main and re-point its base
   # used to be accepted and skip the fetch entirely — only `origin/*` ever got a
   # refspec — replaying the base onto refs/remotes/upstream/main, a ref in the
   # shared .git that loom cannot refresh and nothing else updates either.
-  local up_kind="" fetch_br=""
+  #
+  # And the upstream is resolved to a FULLY-QUALIFIED ref here, once, because
+  # `origin/main` and `main` are not ref names — they are things git RESOLVES,
+  # in an order that puts an agent's forgery first. Measured with git 2.34
+  # (gitrevisions "Specifying revisions", the six-step lookup):
+  #   refs/<name>  beats  refs/tags/<name>  beats  refs/heads/<name>  beats
+  #   refs/remotes/<name>
+  # so `refs/heads/origin/main` (a local branch literally named "origin/main"),
+  # and `refs/origin/main`, both outrank the refs/remotes/origin/main this
+  # command fetched and means — and a TAG named `main` outranks the local
+  # BRANCH `main` that the `show-ref --verify refs/heads/main` check above just
+  # proved exists. Every one of those is one `git update-ref` from inside a
+  # worktree. git prints "warning: refname '<x>' is ambiguous" and carries on.
+  #
+  # $up_ref is what every git command below is given; $upstream stays the name
+  # the operator typed and is what the messages say.
+  local up_kind="" fetch_br="" up_ref=""
   case "$upstream" in
     origin/?*)
       git remote get-url origin >/dev/null 2>&1 || die "loom rebase: '$upstream' names the 'origin' remote, and this repository has none.
@@ -2834,10 +2850,12 @@ refs/remotes/origin/${upstream#origin/} is then a purely local ref that nothing
 refreshes — one 'git update-ref' inside any worktree from naming any commit —
 and a rebase onto it would move task $task's base onto whatever it says. Add the
 remote, or name a local branch:  loom rebase $task <branch>"
-      up_kind=origin; fetch_br="${upstream#origin/}" ;;
+      up_kind=origin; fetch_br="${upstream#origin/}"
+      up_ref="refs/remotes/origin/$fetch_br" ;;
     *)
       if git show-ref --verify --quiet "refs/heads/$upstream"; then
         up_kind=local
+        up_ref="refs/heads/$upstream"
       else
         case "$upstream" in
           */*) die "loom rebase: '$upstream' is not an upstream loom can replay a base onto.
@@ -2898,17 +2916,23 @@ fetched. Fix the fetch (network, credentials, the remote URL) and re-run."
     echo "loom: refs/remotes/*, never refs/heads/*), so it is exactly as current as your" >&2
     echo "loom: own last pull of it." >&2
   fi
-  git -C "$wt" rebase "$upstream" >&2 || die "rebase onto $upstream failed — resolve in $wt, then re-run"
-  mb="$(git merge-base "$br" "$upstream")" \
+  # $up_ref, not $upstream, and $(branch_ref "$task"), not $br: every one of
+  # these five reads is a REF LOOKUP, and both names resolve through the
+  # ambiguous order described where $up_ref is set. `agent/<task>` has the same
+  # problem — `refs/heads/agent/<task>` is what pin_branch_tip, the merge and
+  # the push already use, and a tag or a `refs/agent/<task>` would otherwise
+  # answer here instead.
+  git -C "$wt" rebase "$up_ref" >&2 || die "rebase onto $upstream failed — resolve in $wt, then re-run"
+  mb="$(git merge-base "$(branch_ref "$task")" "$up_ref")" \
     || die "$br and $upstream have no common ancestor after the rebase — inspect $wt"
   new_base=""
-  if git merge-base --is-ancestor "$old_base" "$upstream"; then
+  if git merge-base --is-ancestor "$old_base" "$up_ref"; then
     # The old base already landed upstream (the plan/task commit was merged
     # by an earlier PR): nothing was replayed, the merge-base IS the base.
     new_base="$mb"
   elif [ -n "$old_pid" ]; then
     # The old base was replayed onto the upstream: find it by patch-id.
-    for c in $(git rev-list --reverse "$mb..$br"); do
+    for c in $(git rev-list --reverse "$mb..$(branch_ref "$task")"); do
       if [ "$(git show --no-ext-diff --no-textconv "$c" | git patch-id --stable | cut -d' ' -f1)" = "$old_pid" ]; then new_base="$c"; break; fi
     done
   fi
@@ -2918,7 +2942,7 @@ fetched. Fix the fetch (network, credentials, the remote URL) and re-run."
   fi
   new_base="$(git rev-parse --verify --quiet "$new_base^{commit}")" \
     || die "the new base does not resolve — refusing to record it for $task"
-  git merge-base --is-ancestor "$new_base" "$br" \
+  git merge-base --is-ancestor "$new_base" "$(branch_ref "$task")" \
     || die "the new base $(git rev-parse --short "$new_base") is not an ancestor of $br — refusing to
 record a base this branch does not descend from. Inspect $wt, do not re-run."
   # WHAT CAME UNDER THE BASE. Everything in old_base..new_base is about to stop
