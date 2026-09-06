@@ -277,6 +277,9 @@ cat "${XDG_CONFIG_HOME:-$HOME/.config}/loom/repos/"*"/tasks/<some-task>"
 #   reviewed=<tip loom check last reviewed>
 #   origin=<remote.origin.url at loom new>
 #   fetch=<remote.origin.fetch at loom new>
+#   pushurl=<`git remote get-url --push origin` at loom new — where a push
+#            actually goes, which remote.origin.pushurl and a
+#            url.<x>.pushInsteadOf rewrite both move without touching `origin`>
 ```
 
 Then read [`docs/KNOWN-GAPS.md`](KNOWN-GAPS.md) in the harness repo, in full:

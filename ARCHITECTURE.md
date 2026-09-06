@@ -234,20 +234,90 @@ confused agent asks instead of digging.
    existing worktrees in `loom ls` as stale and `loom drop` them.
 
 Fencing `.agents/**` is refused outright, as is any pattern that would remove
-`zones.toml`, `gate.sh` or the `reviews/` directory. Removing `zones.toml` from
-a worktree would make every path resolve to `assist` and `loom guard` exit 0 —
-the fence would quietly disarm the hand-zone boundary; removing `gate.sh` would
-make the gate exit 127 and burn every retry; and removing `reviews/` would put
-the gate log outside the sparse-checkout definition, so `git add -A` fails
-after a green gate and nothing is committed.
+`zones.toml`, `gate.sh`, the `reviews/` directory or `.opencode/`. Removing
+`zones.toml` from a worktree would make every path resolve to `assist` and
+`loom guard` exit 0 — the fence would quietly disarm the hand-zone boundary;
+removing `gate.sh` would make the gate exit 127 and burn every retry; removing
+`reviews/` would put the gate log outside the sparse-checkout definition, so
+`git add -A` fails after a green gate and nothing is committed; and removing
+`.opencode/` would take away every role prompt and the provider identity
+(`provider.<name>.options.baseURL`) that a fence profile's `providers` list is
+built on.
 
-The three control-plane files an agent must be able to READ and must never
-COMMIT — `.agents/zones.toml`, `.agents/gate.sh` and `.agents/loom.env` — are
-`[hand]` paths in the shipped template, which is what makes `loom land` refuse a
-branch that changed them. They are each an input to the checks that judge the
-agent's own work: the zones and the fence, the script whose exit status means
-"commit it" and "land it", and a file `loom` `.`-sources as shell in your
-environment on every invocation.
+The four control-plane paths an agent must be able to READ and must never
+COMMIT — `.agents/zones.toml`, `.agents/gate.sh`, `.agents/loom.env` and
+`.opencode/**` — are `[hand]` paths in the shipped template, which is what makes
+`loom land` refuse a branch that changed them. They are each an input to the
+checks that judge the agent's own work: the zones and the fence, the script
+whose exit status means "commit it" and "land it", a file `loom` `.`-sources as
+shell in your environment on every invocation, and the config that decides which
+host answers as a given provider together with the prompt every role runs under.
+
+### What `loom` trusts in `.git/config`, and what it does not
+
+A linked worktree shares the git directory with the main checkout, so
+`.git/config` is writable by anything running in an agent's tree —
+`git -C <worktree> config core.pager /tmp/x` is one command. Several of its keys
+name a **program git then runs**, in your session, the next time `loom` touches
+the repository. `loom` therefore exports its own `GIT_CONFIG_PARAMETERS` (the
+variable `git -c` uses, which outranks every config *file*) for every git
+subprocess it spawns — including `git -C <worktree> …`, the operator's
+`.agents/gate.sh`, and any hook git runs underneath them:
+
+```
+core.pager=cat          core.fsmonitor=false     protocol.ext.allow=never
+core.editor=true        sequence.editor=true     core.sshCommand=<your global one, or `ssh`>
+remote.origin.uploadpack=git-upload-pack         remote.origin.receivepack=git-receive-pack
+```
+
+and it clears git's own environment (`GIT_DIR`, `GIT_WORK_TREE`,
+`GIT_OBJECT_DIRECTORY*`, `GIT_CONFIG_*`, `GIT_SSH_COMMAND`, `GIT_PROXY_COMMAND`,
+`GIT_EXTERNAL_DIFF`, `GIT_PAGER`, `GIT_EDITOR`, `GIT_ASKPASS`, …) once both env
+files have been sourced, because `.agents/loom.env` is `.`-sourced shell from a
+tracked path (KNOWN-GAPS 3). Two measured exceptions to "the variable is
+enough":
+
+- **`diff.external` cannot be neutralised that way.** An empty value is not
+  "unset", it is a command named `""`, and `git -c diff.external= diff` dies
+  with `cannot run : No such file or directory` on every hunk. `--no-ext-diff`
+  (with `--no-textconv`) on each diff-producing command is the lever that works,
+  and it covers per-attribute `diff.<driver>.command` too.
+- **`remote.<n>.uploadpack` / `receivepack` do not obey it either.** git
+  collects those into a list and keeps the **first** value — a config file is
+  read before `GIT_CONFIG_PARAMETERS`, so the config wins ("more than one
+  receivepack given, using the first"). The lock is `--upload-pack=` on the
+  fetch and `--receive-pack=` on the push, which do win; the config parameter is
+  only a floor.
+
+**What is still trusted, honestly enumerated.** Neutralising every config key
+git can run a program from is not achievable from outside git, so the list
+below is the residual, not an oversight:
+
+1. **`core.hooksPath`** — deliberately *not* overridden, because the operator's
+   hooks must run: `loom install-hooks` puts the hand-zone guard in one. The
+   cost is stated plainly: a worktree that re-points `core.hooksPath` disarms
+   that guard (which `git commit --no-verify` already does, so the guard was
+   always a seatbelt), and it also decides which `pre-merge-commit` /
+   `commit-msg` / `post-merge` hook runs **in your checkout** during
+   `loom land`'s merge. `loom land`'s check of the branch's COMMITS is the lock;
+   the hook is not.
+2. **`filter.<driver>.clean` / `.smudge`**, selected by a tracked
+   `.gitattributes` — run on checkout, `git add` and commit. `loom` creates
+   worktrees and commits in them, so these run.
+3. **`diff.<driver>.textconv`** and **`merge.<driver>.driver`**, also selected
+   by `.gitattributes` — the first is covered on `loom`'s own diffs by
+   `--no-textconv`, the second runs on a conflicted merge.
+4. **`core.attributesFile` / `core.excludesFile`**, and `.gitattributes` /
+   `.gitignore` themselves.
+5. **`gpg.program`**, if `commit.gpgsign` is on.
+6. **`remote.origin.url` / `.fetch` / the push URL** — trusted only in the sense
+   that a *change* to any of them is refused: all three are pinned in the
+   operator record at `loom new` and re-checked before `loom rebase` fetches and
+   before `loom land --pr` pushes.
+
+A repository whose `.gitattributes` and filter drivers you would not run is a
+repository to give an agent a separate clone of, not a sparse checkout — the
+same answer caveat 1 gives for exfiltration.
 
 ### Fence profiles
 
@@ -407,6 +477,7 @@ Semantics:
                                          reviewed=<tip loom check last read>
                                          origin=<remote.origin.url at loom new>
                                          fetch=<remote.origin.fetch at loom new>
+                                         pushurl=<the PUSH url of origin, ditto>
   ```
 
   written 0700/0600, by `loom new` alone; re-pointed by `loom rebase` (an operator
@@ -416,16 +487,24 @@ Semantics:
   because the key is the **main** checkout's path via `git rev-parse
   --git-common-dir`) and by `loom ls`.
 
-  Those are all seven fields, and they are the whole file: one field per line,
+  Those are all eight fields, and they are the whole file: one field per line,
   each field once, every key in that fixed list. `state_put` refuses anything
-  else on the way in and `state_read` refuses it on the way out, because two of
-  the values arrive from `.git/config` — `origin` via `git remote get-url`,
-  `fetch` via `git config` — where a worktree can put a NEWLINE inside a value
-  and forge a second field. `reviewed` is written above those two on purpose,
-  so that even a reader taking the first match for a duplicated key takes the
-  honest one. `reviewed` is what `loom check` stamps and `loom land` refuses to
-  publish anything else against; `origin`/`fetch` are what `loom rebase` and
+  else on the way in and `state_read` refuses it on the way out, because three
+  of the values arrive from `.git/config` — `origin` via `git remote get-url`,
+  `fetch` via `git config`, `pushurl` via `git remote get-url --push` — where a
+  worktree can put a NEWLINE inside a value and forge a second field.
+  `reviewed` is written above those three on purpose, so that even a reader
+  taking the first match for a duplicated key takes the honest one. `reviewed`
+  is what `loom check` stamps and `loom land` refuses to publish anything else
+  against; `origin`/`fetch`/`pushurl` are what `loom rebase` and
   `loom land --pr` check before they contact a remote at all.
+
+  `pushurl` is a separate fact from `origin` and not a duplicate of it: a
+  `remote.origin.pushurl`, and a `url.<decoy>.pushInsteadOf = <the real
+  origin>` rewrite, each send a push somewhere else while `git remote get-url
+  origin` goes on answering the URL the record pinned. `loom land --pr` is the
+  one command in this system that publishes an agent's commits to a host, so
+  where a push actually GOES is pinned in its own right.
 
   The location is the point. Everything under `.git/` is writable from any
   linked worktree — config *and* refs — so none of it can carry a security

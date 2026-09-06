@@ -1,10 +1,11 @@
 # Known gaps
 
-Holes an adversarial review found in the harness. Two of the five are **closed
+Holes an adversarial review found in the harness. Two of the six are **closed
 on this branch** (gaps 1 and 5) and are kept here because each closure has a
 cost or a residual worth naming; the rest are **not fixed**, and are written
 down so that the fence-profile work is not mistaken for closing them and so
-they are not re-discovered from scratch.
+they are not re-discovered from scratch. Gap 6 is round 7's: it is a residual by
+construction rather than a hole nobody got to.
 
 None of them is *caused* by fence profiles — but gap 4's consequence is
 **widened** by profiles, because a worktree under a profile holds paths the
@@ -63,6 +64,19 @@ own. That is not worth plugging: the entire hook is dominated by `git commit
 --no-verify`, which needs no environment at all. The guard is a seatbelt;
 `loom land`'s checks of the commits are the lock.
 
+**Two more seatbelt limits, recorded rather than fixed.**
+
+- **The installed hook exits 0 when `loom` is not on `PATH`.** It says so on
+  stderr and carries on, so a repo whose `PATH` has lost `loom` commits
+  hand-zone paths with no guard at all. That is main's decision and it stays:
+  the alternative — failing every commit in a repo where the harness is simply
+  not installed — is worse, and `loom doctor` FAILs on the pre-rename `aw`
+  variant of exactly this branch for exactly this reason. Read it as: the
+  guard's *absence* is a `doctor` finding, not a commit-time error.
+- **`core.hooksPath` decides whether the hook runs at all**, and it lives in the
+  shared `.git/config` (gap 6). One `git config core.hooksPath /dev/null` from
+  inside a worktree disarms the guard — a strictly cheaper `--no-verify`.
+
 ---
 
 ## 2. `loom plan` runs the architect unfenced, in your own tree
@@ -95,10 +109,22 @@ say so out loud.
 if [ -f "$ROOT/.agents/loom.env" ]; then set -a; . "$ROOT/.agents/loom.env"; set +a; fi
 ```
 
-`.agents/**` matches no zone in the shipped `zones.toml`, and unmatched paths
-resolve to **assist** — so an agent may edit it, and this file is `.`-sourced,
-in your shell, with your environment. `$(…)` in it executes. The same file is
-present in every agent worktree.
+This file is `.`-sourced, in your shell, with your environment: `$(…)` in it
+executes, on every single `loom` invocation. The same file is present in every
+agent worktree, and it is a *tracked* file, so an agent branch can carry a
+change to it.
+
+What has changed since this gap was first written is only the review boundary
+around that fact, and it is worth being exact about how thin it is.
+`.agents/loom.env` is a `[hand]` path in the **shipped** `zones.toml` template
+now (it was not — `.agents/**` matched no zone at all, and unmatched paths
+resolve to `assist`), so in a repo that uses the template the pre-commit guard
+blocks the commit and `loom land` refuses the branch's commits. That is a
+review boundary and nothing more: a consuming repo that has not copied the entry
+has neither (`docs/fence-profile-consumer-snippet.md` § 1b), the guard is
+skippable with `--no-verify`, and **the file still runs as shell when you type
+any `loom` command**, landed or not — a change sitting uncommitted in your own
+checkout has never needed to pass a review at all.
 
 **Why it is not urgent.** It only fires for a repo that has a `loom.env` at all,
 it is a tracked file (so the change shows up in the diff you review), and an
@@ -132,25 +158,60 @@ variable no longer exists. The base every history check uses is the **operator
 record** (`${XDG_CONFIG_HOME:-$HOME/.config}/loom/repos/<key>/tasks/<task>`),
 written by `loom new`, which no file in the repository takes part in.
 
-**A third set is cleared rather than restored**: git's own environment —
-`GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`,
-`GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_NAMESPACE`,
-`GIT_CEILING_DIRECTORIES` — unset once both env files have been sourced. This
-file is `.`-sourced under `set -a`, so one `GIT_DIR=` line in a landed
-`loom.env` re-aimed every git subprocess `loom` runs: measured, the recorded
-base became a decoy repository's `HEAD` and the worktree was cut from the
-decoy. No caller wins this one either; `loom` has already `cd`'d to `$ROOT`.
+**A third set is cleared rather than restored**: git's own environment, unset
+once both env files have been sourced. This file is `.`-sourced under `set -a`,
+so one `GIT_DIR=` line in a landed `loom.env` re-aimed every git subprocess
+`loom` runs: measured, the recorded base became a decoy repository's `HEAD` and
+the worktree was cut from the decoy. Two halves:
+
+- **the LOCATION variables** — `GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE`,
+  `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
+  `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_NAMESPACE`,
+  `GIT_CEILING_DIRECTORIES`, plus the `GIT_AUTHOR_*`/`GIT_COMMITTER_*`
+  identity;
+- **the CONFIG variables**, which are a code channel rather than a location one:
+  `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT` and every
+  `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` still standing, `GIT_CONFIG_GLOBAL`,
+  `GIT_CONFIG_SYSTEM`, `GIT_SSH_COMMAND`, `GIT_PROXY_COMMAND`,
+  `GIT_EXTERNAL_DIFF`, `GIT_PAGER`, `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`,
+  `GIT_ASKPASS` and `SSH_ASKPASS`. Each of the last eight names a program git
+  runs; the first four inject config at the highest precedence git has.
+
+`loom` then exports **its own** `GIT_CONFIG_PARAMETERS` over the top — see
+gap 6 and ARCHITECTURE.md § 5 for what is in it and what it cannot reach.
+
+**One carve-out, and it is git's, not a caller's.** `GIT_INDEX_FILE` (with
+`GIT_DIR`, `GIT_WORK_TREE`, `GIT_PREFIX` and the identity variables) is
+snapshotted **before either env file is sourced** and restored **after** the
+unset — the same shape the `OPENCODE_*` set has. Without that, round 6's
+blanket unset broke `loom guard`: git runs a pre-commit hook with a
+**temporary** index for `git commit -a`, `git commit -- <path>`, `--only` and
+`--include`, and names it in `$GIT_INDEX_FILE`. Unset, `cmd_guard`'s
+`git diff --cached --name-only` read the standard index, found nothing staged,
+and exited 0 in silence — measured: a `git commit -a` touching a hand-zone path
+committed cleanly, with the guard printing nothing at all
+(`tests/fence-profiles.sh` (bg)). A landed `loom.env` still cannot inject any of
+them, because the snapshot was taken before it was read; a *caller* that exports
+`GIT_DIR` itself is indistinguishable from git doing so and wins, which is the
+same rule `OPENCODE_CONFIG` has and the same residual gap 1 already concedes for
+the hook's `$XDG_CONFIG_HOME`.
 
 **What the record now carries, and what that is worth.** It is not just the
 base any more. `base` is the commit every fence and hand history check is
 measured from; `reviewed` is the tip `loom check` last handed to a reviewer,
-and `loom land` refuses to publish any other; `origin` and `fetch` are the
-remote URL and refspec the task was created against, and `loom rebase` /
-`loom land --pr` refuse a changed one before they contact a remote at all. The
-file is validated on both sides — one field per line, each field once, every
-key in a fixed list, no control character in any value — because `origin` and
-`fetch` arrive from `.git/config`, where a newline inside a value would append
-a second field to it.
+and `loom land` refuses to publish any other; `origin`, `fetch` and `pushurl`
+are the remote URL, the refspec and the **push destination** the task was
+created against, and `loom rebase` / `loom land --pr` refuse a changed one
+before they contact a remote at all. `pushurl` is round 7's, and it is a
+separate fact from `origin` on purpose: `remote.origin.pushurl`, and a
+`url.<decoy>.pushInsteadOf = <the real origin>` rewrite, each redirect a push
+while `git remote get-url origin` goes on answering the URL the record pinned —
+so a `loom land --pr` published the branch to a host of the worktree's choosing
+and reported success (`tests/fence-profiles.sh` (bh)). The file is validated on
+both sides — one field per line, each field once, every key in a fixed list, no
+control character in any value — because all three of those arrive from
+`.git/config`, where a newline inside a value would append a second field to
+it.
 
 **This gap is the residual all of that concedes.** The directory is in `$HOME`,
 and the capability this gap describes — an agent that can write files in your
@@ -294,3 +355,60 @@ and only the third was ever narrow:
 
 Closing this one does not close those, and the same file is the reason they
 matter slightly more than they did.
+
+---
+
+## 6. `.git/config` is shared, and some of its keys name programs
+
+**Status: narrowed in round 7, and a residual by construction.** This one
+cannot be closed from outside git; what follows is the boundary, drawn honestly.
+
+**Where.** `bin/loom:315` (the `GIT_CONFIG_PARAMETERS` export) and the
+`--no-ext-diff` / `--upload-pack=` / `--receive-pack=` spelled out at the diff,
+fetch and push call sites.
+
+**What it is.** A linked worktree shares the git directory with the main
+checkout, so `.git/config` is writable from inside an agent's tree with one
+command. Several of its keys do not describe a preference, they name a
+**program git runs** — in your session, the next time `loom` touches the
+repository: `core.pager`, `core.fsmonitor`, `core.sshCommand`, `diff.external`,
+`remote.<n>.uploadpack` / `receivepack`, `core.editor`, `sequence.editor`, and
+per-`.gitattributes` `filter.*` / `diff.*.textconv` / `merge.*.driver`. Measured
+against the pre-fix dispatcher, a `core.fsmonitor`, a `diff.external` and a
+`remote.origin.receivepack` planted from a worktree all executed during an
+ordinary `loom check` / `loom diff` / `loom land --pr`
+(`tests/fence-profiles.sh` (bi)).
+
+**What closes most of it.** `loom` exports its own `GIT_CONFIG_PARAMETERS` —
+the variable `git -c` uses, which outranks every config *file* — for every git
+subprocess it spawns, and clears git's own `GIT_*` environment first (gap 3).
+Two keys do not obey that variable, and both were measured rather than assumed:
+
+- `diff.external=` (empty) is **not** "unset"; it is a command named `""`, and
+  `git -c diff.external= diff` dies on every hunk. `--no-ext-diff`
+  (`--no-textconv` alongside it) is the lever that works.
+- `remote.<n>.uploadpack` / `receivepack` are collected into a list where git
+  keeps the **first**, and config files are read before the variable — so the
+  config wins. `--upload-pack=` / `--receive-pack=` on the fetch and the push
+  are the lock.
+
+**What is still trusted.** ARCHITECTURE.md § 5 ("What `loom` trusts in
+`.git/config`") enumerates it: `core.hooksPath` deliberately (the operator's
+hooks must run — and the price is that a worktree can re-point it, disarming the
+guard and choosing which hooks run in *your* checkout during `loom land`'s
+merge), plus the `.gitattributes`-selected `filter.*` / `merge.*.driver` /
+`diff.*.textconv` drivers, `core.attributesFile` / `core.excludesFile`, and
+`gpg.program` under `commit.gpgsign`. `remote.origin.url`, `.fetch` and the push
+URL are trusted only in the sense that a *change* is refused: all three are in
+the operator record and re-checked before a fetch and before a push.
+
+**The cost, stated.** `loom diff` no longer pages by default — `core.pager` is
+pinned to `cat`, so a pager is operator-side now
+(`export LOOM_DIFF_CMD="less -R"`). `core.sshCommand` is pinned to the value in
+your **global/system** git config when you have one, and to a bare `ssh`
+otherwise, so a repo-local identity file is ignored while a personal one is not.
+
+**Suggested fix for the rest.** There isn't a variable-shaped one. The honest
+answer for a repository whose `.gitattributes` and filter drivers you would not
+want to run is the same as caveat 1's answer to exfiltration: give the agent a
+separate clone, not a sparse checkout.

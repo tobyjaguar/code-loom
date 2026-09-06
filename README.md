@@ -360,47 +360,101 @@ part of the branch that still changes your runs:
   `.agents/reviews/` is excluded, because that is where `loom check` and `loom diff`
   write the review patch themselves — **gitignore that directory** in a
   consuming repo.
-- **`loom rebase` will not bury upstream commits under your base.** A rebase is
-  the one command that moves a recorded base, and everything between the old
-  base and the new one stops being the branch's work — it slides *under* the
-  base, where no fence check, no hand check and no review patch looks again.
-  `refs/remotes/origin/main` is one `git update-ref` from any commit, and unlike
-  your own `main` (the branch you are standing on, which moves in front of you)
-  a moved `origin/main` is visible nowhere. So the range `old_base..new_base` is
-  mapped through the **full** `[fence]` and `[hand]` — a profile releases paths
-  for the *task's* commits, and nobody released anything for what arrives from
-  upstream — and a hit refuses the rebase, leaving the base where it was and
-  the branch where it was. `--accept-upstream` is the operator saying "I have
-  read those commits and I accept them under the base". Either way the range is
-  printed whenever the base moves — `git log --oneline old_base..new_base` and
-  the fenced/hand path lists, empty or not — because consent to bury commits is
-  only consent if you were shown them. In an active
-  repo it will fire on your *own* hand-zone commits merged upstream while the
-  task ran — that is the intended shape, not a bug: the flag is a one-word
-  confirmation, not an override. A failed `git
-  fetch` is a refusal for the same reason: replaying onto a stale upstream
-  succeeds quietly.
-- **The remote is pinned to the task — the URL *and* the refspec.**
-  `remote.origin.url` and `remote.origin.fetch` are both recorded at `loom new`;
-  `loom rebase` (before it fetches) and `loom land --pr` (before it pushes) refuse
-  when either differs. Remote config is in the shared `.git/config`, and the
-  refspec is the quieter of the two: pointed at `refs/remotes/decoy/*` it makes
-  `git fetch origin` succeed while updating nothing under
-  `refs/remotes/origin/`, so a forged `origin/main` survives the fetch and the
-  rebase replays onto it. `loom rebase` therefore writes the refspec out itself
-  — `git fetch origin +refs/heads/<b>:refs/remotes/origin/<b>` — instead of
-  trusting the config to say what a fetch is for.
+- **`loom rebase` will not bury ANY upstream commits under your base without
+  your word.** A rebase is the one command that moves a recorded base, and
+  everything between the old base and the new one stops being the branch's work
+  — it slides *under* the base, where no fence check, no hand check and no
+  review patch looks again. `refs/remotes/origin/main` is one `git update-ref`
+  from any commit, and unlike your own `main` (the branch you are standing on,
+  which moves in front of you) a moved `origin/main` is visible nowhere. So a
+  non-empty `old_base..new_base` needs `--accept-upstream` — **whatever it
+  contains.** The gate used to be "the range touches a fenced or a hand-zone
+  path", which let a range of merge commits, or one touching only the assist
+  zone, move the base in silence; burial is a *review* question, not a fence
+  one, and "it touches nothing I check" is not the same statement as "it is
+  nothing". The whole range is printed whenever the base moves, on the refusal
+  and under the flag alike: the fenced and hand-zone lists first (mapped through
+  the **full** `[fence]` and `[hand]` — a profile releases paths for the *task's*
+  commits, and nobody released anything for what arrives from upstream), then
+  `git log --oneline old_base..new_base`, then **every path those commits
+  touch**. In an active repo this fires on your own commits merged upstream
+  while the task ran — that is the intended shape, not a bug: the flag is a
+  one-word confirmation, not an override.
+- **A rebase replays onto `origin/<branch>` or onto a local branch, and nothing
+  else.** loom moves the recorded base, so it has to be able to *refresh* what
+  it replays onto first. `origin/<b>` is fetched here with an explicit refspec
+  naming both ends, and requires an `origin` remote — without one,
+  `refs/remotes/origin/<b>` is a purely local ref that nothing refreshes and one
+  `git update-ref` from anything. A local branch is allowed and loom says out
+  loud that nothing was fetched (a fetch updates `refs/remotes/*`, never
+  `refs/heads/*`). Any other remote-tracking ref is refused: `loom rebase T
+  upstream/main` used to skip the fetch entirely — only `origin/*` ever got a
+  refspec — and replay the base onto whatever `refs/remotes/upstream/main` said.
+  A failed `git fetch` is a refusal for the same reason: replaying onto a stale
+  upstream succeeds quietly.
+- **The remote is pinned to the task — the URL, the refspec *and* the push
+  destination.** All three are recorded at `loom new`; `loom rebase` (before it
+  fetches) and `loom land --pr` (before it pushes) refuse when any of them
+  differs. Remote config is in the shared `.git/config`, and the two beyond the
+  URL are the quiet ones:
+  - the **refspec** pointed at `refs/remotes/decoy/*` makes `git fetch origin`
+    succeed while updating nothing under `refs/remotes/origin/`, so a forged
+    `origin/main` survives the fetch and the rebase replays onto it.
+    `loom rebase` therefore writes the refspec out itself —
+    `git fetch origin +refs/heads/<b>:refs/remotes/origin/<b>` — instead of
+    trusting the config to say what a fetch is for;
+  - the **push URL** is not `remote.origin.url` at all. A
+    `remote.origin.pushurl`, or a `url.<decoy>.pushInsteadOf = <the real
+    origin>` rewrite, sends the push somewhere else while `git remote get-url
+    origin` goes on answering exactly what the record pinned — and
+    `loom land --pr` is the one command here that publishes an agent's commits
+    to a host. It is recorded as `git remote get-url --push origin`, which is
+    the effective answer after both. `protocol.ext.allow=never` is set for every
+    git subprocess loom spawns as well, so an `ext::<program>` URL is dead
+    twice over.
 - **The operator record is one field per line, and `loom` wrote every one of
   them.** `origin` and `fetch` arrive from `.git/config`, where a value may
   contain a newline — so a URL of `https://…` + newline + `reviewed=<sha>` used
   to append a second field to the record. `state_put` refuses a control
   character in any value and a key outside the fixed list
-  (`base profile branch created origin fetch reviewed`); `state_read` refuses a
+  (`base profile branch created origin fetch pushurl reviewed`); `state_read` refuses a
   file with a duplicated field, an unknown key or a line that is not
   `<key>=<value>`, instead of taking the first match and carrying on.
 - **`loom run` with no operator record refuses before the model runs.** It used to
   run one and commit, with the refusal arriving at `loom check` and the content
   already on the branch.
+- **Repo-local git config is not a code channel.** `.git/config` is in the
+  shared git directory, so `git -C <worktree> config core.pager /tmp/x` is one
+  command from inside an agent's tree — and `core.pager`, `core.fsmonitor`,
+  `core.sshCommand`, `diff.external`, `remote.<n>.uploadpack`/`receivepack`,
+  `core.editor` and `sequence.editor` each name a **program git runs**, in your
+  session, the next time you type a `loom` command. `loom` now exports its own
+  `GIT_CONFIG_PARAMETERS` (the variable `git -c` uses, which outranks every
+  config *file*) for every git subprocess it spawns, clears git's own `GIT_*`
+  environment first — the config half of it too: `GIT_CONFIG_*`,
+  `GIT_SSH_COMMAND`, `GIT_PROXY_COMMAND`, `GIT_EXTERNAL_DIFF`, `GIT_PAGER`,
+  `GIT_EDITOR`, `GIT_ASKPASS`, … — and spells out `--no-ext-diff`,
+  `--upload-pack=` and `--receive-pack=` at the diff, fetch and push call sites,
+  because those three keys do not obey the variable (measured; see
+  `ARCHITECTURE.md` § 5). `core.hooksPath` is deliberately **not** overridden —
+  your hooks have to run — and what that leaves trusted is enumerated in
+  `docs/KNOWN-GAPS.md` gap 6. **Two costs:** `loom diff` no longer pages by
+  default (`export LOOM_DIFF_CMD="less -R"` if you want one), and a repo-local
+  `core.sshCommand` is ignored — your global one is not.
+- **The pre-commit guard reads the index git hands it.** git runs a hook with a
+  **temporary** index for `git commit -a`, `git commit -- <path>`, `--only` and
+  `--include`, and names it in `$GIT_INDEX_FILE`. Clearing git's environment
+  (the bullet above) took that away, so `loom guard`'s `git diff --cached` read
+  the standard index, found nothing staged, and exited 0 without printing
+  anything — a `git commit -a` on a hand-zone path went straight through.
+  `$GIT_INDEX_FILE` (with `GIT_DIR`, `GIT_WORK_TREE`, `GIT_PREFIX` and the
+  author/committer identity) is snapshotted **before** either env file is
+  sourced and restored **after** the unset, so git's own values survive and a
+  landed `loom.env` still cannot inject them.
+- **`loom ls` says when a record is unreadable.** It used to read the profile
+  field with `2>/dev/null || true`, so a record loom refuses to believe — a
+  duplicated field, an unknown key, a line that is not `<key>=<value>` — listed
+  as an ordinary task with a blank profile column.
 - **opencode's config variables never come out of the tree.** `OPENCODE_CONFIG`,
   `OPENCODE_CONFIG_DIR`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_PERMISSION` and
   `OPENCODE_DISABLE_PROJECT_CONFIG` are snapshotted before `.agents/loom.env` is
@@ -647,12 +701,14 @@ Two optional conveniences ship with it, and deleting either breaks nothing:
 Gate output stays in native tool format, so any editor's error parser can read
 `.agents/reviews/<task>-gate.log` directly.
 
-`loom diff` shows a patch through git's own pager by default. Point
-`LOOM_DIFF_CMD` at whatever you prefer — the patch path is appended as the last
-argument:
+`loom diff` streams the patch **unpaged** by default: `core.pager` names a
+program git runs and it lives in the shared `.git/config`, so `loom` pins it to
+`cat` for every git subprocess it spawns (see `docs/KNOWN-GAPS.md` gap 6). A
+pager is operator-side — point `LOOM_DIFF_CMD` at whatever you prefer, and the
+patch path is appended as the last argument:
 
 ```sh
-export LOOM_DIFF_CMD="delta"          # or: bat, less -R, code --wait, $EDITOR
+export LOOM_DIFF_CMD="less -R"        # or: delta, bat, code --wait, $EDITOR
 ```
 
 ## Migrating from `aw`
@@ -679,8 +735,10 @@ guarding hand zones. `loom doctor` reports that as a FAIL.
 
 Two behaviour changes ride along with the rename:
 
-- `loom diff` streams through git's pager instead of opening `$EDITOR -R`. To
-  keep the old behaviour: `export LOOM_DIFF_CMD="$EDITOR -R"`.
+- `loom diff` streams the patch to stdout instead of opening `$EDITOR -R`, and
+  it does not page it (`core.pager` is pinned to `cat` — gap 6). To get a pager
+  or the old behaviour: `export LOOM_DIFF_CMD="less -R"` /
+  `export LOOM_DIFF_CMD="$EDITOR -R"`.
 - The Neovim layer is gone. If you copied `nvim/loom.lua` or
   `nvim/codecompanion.lua` into your editor config, remove them — they call
   `aw`.
