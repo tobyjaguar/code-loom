@@ -4265,6 +4265,44 @@ new_abort() {
   NEW_WT=""; NEW_BR=""; NEW_STATE=""
 }
 
+# ------------------------------------------------------------------- the gate
+# The OPERATOR's gate script, run with a task worktree as its cwd — never
+# `$wt/.agents/gate.sh`, which is a file the implementer edits (and, under a
+# profile, may even be allowed to commit). Both callers go through here:
+# `loom run` (per attempt, output to a log) and `loom land` (straight to the
+# terminal).
+#
+# The SCRIPT is yours. What it RUNS is not: a gate that calls `make`, `cargo
+# test`, `go test` or `npm test` executes the repository's build, and the
+# repository's build is what the agent has just been editing. It used to
+# inherit the operator's whole environment — measured by the external review:
+# 56 variables, `ZHIPU_API_KEY` among them. So every variable whose NAME looks
+# like a credential is dropped for the length of the gate.
+#
+# The list is built from the environment itself (`compgen -e`, the exported
+# names) and matched by pattern, so a provider variable added later is covered
+# without an edit here. It is `env -u`, deliberately, and never `env -i`: a
+# build needs PATH, HOME, GOPATH, CARGO_HOME, LANG and a dozen more, and a gate
+# that cannot find its toolchain is a gate nobody keeps.
+run_gate() { # run_gate <worktree> [<logfile>]
+  local wt="$1" log="${2:-}" n rc=0
+  local -a strip=()
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    case "$n" in
+      *_API_KEY|*_TOKEN|*_SECRET|*_PASSWORD|\
+      ANTHROPIC_*|OPENAI_*|CODEX_*|OPENCODE_*|ZAI_*|ZHIPU_*|DEEPSEEK_*|MOONSHOT_*)
+        strip+=(-u "$n") ;;
+    esac
+  done < <(compgen -e 2>/dev/null || true)
+  if [ -n "$log" ]; then
+    ( cd "$wt" && env ${strip[0]+"${strip[@]}"} "$STATE_MAIN_ROOT/.agents/gate.sh" > "$log" 2>&1 ) || rc=$?
+  else
+    ( cd "$wt" && env ${strip[0]+"${strip[@]}"} "$STATE_MAIN_ROOT/.agents/gate.sh" ) || rc=$?
+  fi
+  return "$rc"
+}
+
 cmd_new() {
   require_roots
   local task="" prof="" decl a
@@ -4497,13 +4535,9 @@ fix failures until it exits 0. Write brief notes on what you did to \
     rdir="$(reviews_dir "$wt")" \
       || die "refusing to carry on in $wt: its .agents/reviews could not be resolved
 inside the worktree after the implementer's turn. Inspect it, do not re-run."
-    # The OPERATOR's gate script, with the worktree as its cwd. `.agents/gate.sh`
-    # inside the worktree is a file the implementer edits (the claude leg even
-    # allowlists running it), so the copy that decides "green, commit it" must
-    # not be the agent's — a gate that rewrites itself to `exit 0`, or that
-    # `git update-ref`s the branch on the way past, is one line of shell. The
-    # implementer still runs the worktree's copy for its own iteration; this is
-    # the one whose verdict `loom` acts on.
+    # The OPERATOR's gate script, with the worktree as its cwd, and with the
+    # provider keys stripped out of its environment — see `run_gate`, which is
+    # the one place both gate sites go through.
     #
     # Its output goes to a temp, then to the AUTHORITATIVE copy beside the
     # operator record, and only then into the worktree — `> "$rdir/…"` follows
@@ -4513,7 +4547,7 @@ inside the worktree after the implementer's turn. Inspect it, do not re-run."
       || die "cannot create a temporary file for the gate log"
     tmp_track "$gatetmp"
     gate_rc=0
-    ( cd "$wt" && "$STATE_MAIN_ROOT/.agents/gate.sh" > "$gatetmp" 2>&1 ) || gate_rc=$?
+    run_gate "$wt" "$gatetmp" || gate_rc=$?
     gatelog="$(state_artifact "$task" "$task-gate.log" "$gatetmp")" \
       || die "cannot write the operator's copy of the gate log for $task"
     place_file "$wt" ".agents/reviews/$task-gate.log" "$gatetmp" > /dev/null
@@ -4893,10 +4927,9 @@ Landing would publish commits nobody read. Re-run the review, then land:
   [ -n "$FENCE_PROFILE" ] && echo "loom: fence profile '$FENCE_PROFILE' — this diff may touch $FENCE_RELEASED"
   if [ -z "$force" ]; then
     echo "loom: running gate in worktree before landing"
-    # The OPERATOR's gate, with the worktree as its cwd — never $wt/.agents/gate.sh,
-    # which is a file the implementer edits (and, under a profile, may even be
-    # allowed to commit).
-    ( cd "$wt" && "$STATE_MAIN_ROOT/.agents/gate.sh" ) || die "gate is red in $br — fix it or land with: loom land $task --force"
+    # The same helper `loom run` uses: the operator's copy of the script, the
+    # worktree as its cwd, and no provider key in its environment.
+    run_gate "$wt" || die "gate is red in $br — fix it or land with: loom land $task --force"
   fi
 
   if [ "$mode" = pr ]; then

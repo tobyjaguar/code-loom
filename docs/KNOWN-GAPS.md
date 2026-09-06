@@ -153,6 +153,23 @@ merely a risk, it is a bypass:
   branch that changed it. That is a review boundary, not a sandbox: the file
   still runs as shell when you invoke `loom`.
 
+**And the gate is the same class of fact.** `.agents/gate.sh` is a `[hand]`
+path and `loom` runs the *operator's* copy of it, never the worktree's — but
+what the script itself runs is the repository's build (`make`, `cargo test`,
+`go test`, `npm test`), and the repository's build is exactly what the agent
+has been editing. A gate is therefore **your build, executing as you, on the
+agent's code**, at two points: after every implementer attempt in `loom run`,
+and once more before `loom land` merges or pushes. What loom does about it is
+narrow and worth stating plainly, so nobody reads more into it: every exported
+variable whose NAME matches `*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`,
+or a provider prefix (`ANTHROPIC_*`, `OPENAI_*`, `CODEX_*`, `OPENCODE_*`,
+`ZAI_*`, `ZHIPU_*`, `DEEPSEEK_*`, `MOONSHOT_*`) is dropped for the length of
+the gate (`run_gate`, `env -u`). The rest of the environment stays — `PATH`,
+`HOME`, `GOPATH`, `CARGO_HOME` and everything else a build needs to exist at
+all — and there is no sandbox. Keeping a credential out of a variable name that
+matches those patterns, or out of the environment entirely, is not something
+loom can do for you.
+
 There used to be a second, `LOOM_BASE_REF`: the ref the security base was
 measured from, snapshotted before the file was sourced and restored after. That
 variable no longer exists. The base every history check uses is the **operator

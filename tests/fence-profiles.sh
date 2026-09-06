@@ -248,7 +248,7 @@ for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p \
          0078-br 0079-br2 0080-bs 0081-bs2 0083-bs3 \
          0084-bu 0085-bu2 0086-bu3 0087-bu4 0088-bu5 0089-bu6 0090-bu7 \
          0091-bw 0093-bx 0094-by 0095-bz 0096-ca 0097-cb \
-         0098-cc 0099-cd; do mk_task "$t"; done
+         0098-cc 0099-cd 0100-ce; do mk_task "$t"; done
 mk_task 0040-ar  codex
 mk_task 0042-as  codex
 mk_task 0005-f codex
@@ -3619,6 +3619,62 @@ out="$("$LOOM" new 0099-cd 2>&1)"; rc=$?
 want_eq   "(cd) control: the ordinary root still works"             "$rc" "0"
 want_file "(cd) ... and the worktree is there"                      "$WTU/0099-cd/backend/main.go"
 "$LOOM" drop 0099-cd > /dev/null 2>&1 || true
+
+# --- (ce) the gate runs without the provider keys in its environment -------
+# The gate SCRIPT is the operator's copy, which the previous round settled. But
+# a gate that runs `make` / `cargo test` / `go test` executes the repository's
+# BUILD, and that is what the agent has been editing — so it used to be the
+# agent's build with the operator's whole environment behind it (56 variables,
+# `ZHIPU_API_KEY` among them, as the external review measured). Both gate sites
+# now go through `run_gate`, which drops every variable whose NAME looks like a
+# credential and keeps everything a build actually needs.
+ce_gate_orig="$(cat .agents/gate.sh)"
+cat > .agents/gate.sh << 'GATE'
+#!/usr/bin/env bash
+env > "${LOOM_TEST_TMP:?}/ce-gate-env.log"
+exit 0
+GATE
+chmod +x .agents/gate.sh
+git add .agents/gate.sh
+git commit -qm "(ce) a gate that reports its own environment"
+out="$("$LOOM" new 0100-ce 2>&1)"; rc=$?
+want_eq "(ce) setup: a task"                                        "$rc" "0"
+CE="$WTU/0100-ce"
+: > "$TMP/ce-gate-env.log"
+out="$(ZHIPU_API_KEY=FAKE-KEY DEEPSEEK_API_KEY=FAKE-KEY MY_SECRET=FAKE-KEY \
+       GITHUB_TOKEN=FAKE-KEY ADMIN_PASSWORD=FAKE-KEY \
+       LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 \
+       "$LOOM" run 0100-ce 2>&1)"; rc=$?
+want_eq "(ce) loom run reaches a green gate"                        "$rc" "0"
+ce_run="$(cat "$TMP/ce-gate-env.log")"
+want_ne     "(ce) the gate ran and reported its environment"        "$ce_run" ""
+want_not_in "(ce) run: no ZHIPU_API_KEY in the gate's environment"  "$ce_run" "ZHIPU_API_KEY="
+want_not_in "(ce) run: no DEEPSEEK_API_KEY either"                  "$ce_run" "DEEPSEEK_API_KEY="
+want_not_in "(ce) run: nor a *_SECRET of the operator's"            "$ce_run" "MY_SECRET="
+want_not_in "(ce) run: nor a *_TOKEN"                               "$ce_run" "GITHUB_TOKEN="
+want_not_in "(ce) run: nor a *_PASSWORD"                            "$ce_run" "ADMIN_PASSWORD="
+want_in     "(ce) run: PATH is still there — this is env -u, not env -i" "$ce_run" "PATH="
+want_in     "(ce) run: and HOME"                                    "$ce_run" "HOME="
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0100-ce 2>&1)"; rc=$?
+want_eq "(ce) setup: it is reviewed"                                "$rc" "0"
+: > "$TMP/ce-gate-env.log"
+out="$(ZHIPU_API_KEY=FAKE-KEY DEEPSEEK_API_KEY=FAKE-KEY MY_SECRET=FAKE-KEY \
+       GITHUB_TOKEN=FAKE-KEY ADMIN_PASSWORD=FAKE-KEY \
+       "$LOOM" land 0100-ce 2>&1)"; rc=$?
+want_eq "(ce) loom land runs the gate and lands"                    "$rc" "0"
+ce_land="$(cat "$TMP/ce-gate-env.log")"
+want_ne     "(ce) the landing gate ran too"                         "$ce_land" ""
+want_not_in "(ce) land: no ZHIPU_API_KEY in the gate's environment" "$ce_land" "ZHIPU_API_KEY="
+want_not_in "(ce) land: no DEEPSEEK_API_KEY either"                 "$ce_land" "DEEPSEEK_API_KEY="
+want_not_in "(ce) land: nor a *_SECRET of the operator's"           "$ce_land" "MY_SECRET="
+want_not_in "(ce) land: nor a *_TOKEN"                              "$ce_land" "GITHUB_TOKEN="
+want_not_in "(ce) land: nor a *_PASSWORD"                           "$ce_land" "ADMIN_PASSWORD="
+want_in     "(ce) land: PATH is still there"                        "$ce_land" "PATH="
+want_in     "(ce) land: and HOME"                                   "$ce_land" "HOME="
+printf '%s\n' "$ce_gate_orig" > .agents/gate.sh
+chmod +x .agents/gate.sh
+git add .agents/gate.sh
+git commit -qm "(ce) and the ordinary gate back"
 
 # --- (j)/(t) doctor lists the profiles, and touches no network ------------
 out="$(timeout 180 "$LOOM" doctor 2>&1 || true)"
