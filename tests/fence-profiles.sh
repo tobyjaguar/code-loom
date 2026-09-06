@@ -247,7 +247,7 @@ for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p \
          0072-bm 0073-bn 0074-bo 0075-bp 0076-bq 0077-bq2 \
          0078-br 0079-br2 0080-bs 0081-bs2 0083-bs3 \
          0084-bu 0085-bu2 0086-bu3 0087-bu4 0088-bu5 0089-bu6 0090-bu7 \
-         0091-bw 0093-bx 0094-by; do mk_task "$t"; done
+         0091-bw 0093-bx 0094-by 0095-bz 0096-ca 0097-cb; do mk_task "$t"; done
 mk_task 0040-ar  codex
 mk_task 0042-as  codex
 mk_task 0005-f codex
@@ -3352,6 +3352,165 @@ want_eq "(by) ... with no loom temp left in that directory either" \
         "$(find "$TMP/by-agent-tmp" -mindepth 1 2>/dev/null | tr '\n' ' ')" ""
 rm -f .agents/loom.env
 "$LOOM" drop 0094-by > /dev/null 2>&1 || true
+
+# --- (bz) an unreadable directory is a refusal, not a clean tree ------------
+# `wt_dirty` asks two questions about `.agents/reviews`, and a mode of 0300
+# (`-wx------`) used to make both of them answer "clean". Measured, git 2.34.1:
+# the directory still takes a `cd` and a `pwd -P`, but a shell glob over it
+# matches NOTHING — so `reviews_entries_plain` walked an empty list, answered
+# "all plain", the `:(exclude).agents/reviews` pathspec stayed on, and every
+# plant inside was excluded from the one command that was meant to see it.
+# Dropping the exclusion would not have saved it either: `git status --porcelain
+# -- .` over a tree with an unreadable directory prints `warning: could not open
+# directory ...: Permission denied` on STDERR, exits 0, and lists nothing from
+# inside — which the old `2>/dev/null` turned into a clean tree. So the MODE is
+# a refusal now, and (the general form) so is any `git status` stderr at all.
+out="$("$LOOM" new 0095-bz 2>&1)"; rc=$?
+want_eq "(bz) setup: a task"                                        "$rc" "0"
+BZ="$WTU/0095-bz"
+echo "bz work" > "$BZ/backend/bz.txt"
+git -C "$BZ" add backend/bz.txt
+git -C "$BZ" commit -qm "work on bz"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0095-bz 2>&1)"; rc=$?
+want_eq "(bz) setup: it is reviewed"                                "$rc" "0"
+printf 'not this tree\n' > "$TMP/bz-decoy.txt"
+ln -s "$TMP/bz-decoy.txt" "$BZ/.agents/reviews/bz-decoy-link.txt"
+chmod 0300 "$BZ/.agents/reviews"
+# The fact the whole case rests on: at this mode the entry walk sees nothing.
+want_eq "(bz) a glob over the unreadable directory matches nothing" \
+        "$(for e in "$BZ"/.agents/reviews/*; do printf '%s\n' "$e"; done)" \
+        "$BZ/.agents/reviews/*"
+out="$("$LOOM" land 0095-bz 2>&1)"; rc=$?
+chmod 0755 "$BZ/.agents/reviews"
+want_fail "(bz) loom land refuses an unreadable reviews directory"  "$rc"
+want_in   "(bz) ... naming it, with its mode"                       "$out" \
+          "$BZ/.agents/reviews is mode 300"
+want_in   "(bz) ... and saying it will not guess"                   "$out" "refusing to guess"
+want_ne   "(bz) ... with the branch not merged into main" \
+          "$(git rev-parse HEAD)" "$(git rev-parse refs/heads/agent/0095-bz)"
+want_eq   "(bz) ... nor its commits reachable from it" \
+          "$(git merge-base --is-ancestor refs/heads/agent/0095-bz HEAD 2>/dev/null && echo merged || echo no)" "no"
+# The second leg, one level up: `.agents` itself. An untracked plant under a
+# `.agents` at 0300 vanishes from `git status` the same way (modifications to
+# TRACKED files still show, which is what made this shape look survivable).
+rm -f "$BZ/.agents/reviews/bz-decoy-link.txt"
+printf 'plant\n' > "$BZ/.agents/bz-plant"
+chmod 0300 "$BZ/.agents"
+out="$("$LOOM" land 0095-bz 2>&1)"; rc=$?
+chmod 0755 "$BZ/.agents"
+want_fail "(bz) loom land refuses an unreadable .agents too"        "$rc"
+want_in   "(bz) ... naming that one"                                "$out" "$BZ/.agents is mode 300"
+want_ne   "(bz) ... with the branch still not merged" \
+          "$(git rev-parse HEAD)" "$(git rev-parse refs/heads/agent/0095-bz)"
+want_eq   "(bz) ... nor its commits reachable from it either" \
+          "$(git merge-base --is-ancestor refs/heads/agent/0095-bz HEAD 2>/dev/null && echo merged || echo no)" "no"
+# The control: modes restored, plants gone, and landing goes ahead — so the two
+# refusals above were about the mode and not about anything else in this tree.
+rm -f "$BZ/.agents/bz-plant"
+out="$("$LOOM" land 0095-bz 2>&1)"; rc=$?
+want_eq "(bz) control: with the modes restored, loom land goes ahead" "$rc" "0"
+want_in "(bz) ... saying so"                                        "$out" "landed 0095-bz"
+
+# --- (ca) status.showUntrackedFiles=no, as the PINNED baseline -------------
+# The config pin is a CHANGE check, so a key already in the repository's config
+# when the task is pinned is the baseline and is trusted from there on. That is
+# fine for a key that names a program — the operator is told, once — and it was
+# not fine for this one: measured, git 2.34.1, `status.showUntrackedFiles=no`
+# empties step one of `wt_dirty` (an untracked plant reads as a clean tree) and
+# makes step two die `fatal: Unsupported combination of ignored and
+# untracked-files arguments`, rc=128 — which the old `2>/dev/null | grep … ||
+# true` swallowed whole. Both halves of the tripwire answered "clean" and
+# landing went ahead. `GIT_CONFIG_PARAMETERS` outranks every config FILE
+# (`--global` included, which the pin does not read at all), so the key is
+# pinned to `normal` there and spelled out as `--untracked-files=normal` on both
+# calls; step two's git now runs into a variable with its own `|| die`.
+git config status.showUntrackedFiles no
+# ... and the REPOSITORY baseline moved with it, so the operator records that
+# deliberately before `loom new` will touch it (see (bs)).
+"$LOOM" pin-config --accept-config > /dev/null 2>&1
+out="$("$LOOM" new 0096-ca 2>&1)"; rc=$?
+want_eq "(ca) setup: a task pinned with the key already in the config" "$rc" "0"
+CA="$WTU/0096-ca"
+echo "ca work" > "$CA/backend/ca.txt"
+git -C "$CA" add backend/ca.txt
+git -C "$CA" commit -qm "work on ca"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0096-ca 2>&1)"; rc=$?
+want_eq "(ca) setup: it is reviewed"                                "$rc" "0"
+# The plants: one ordinary untracked file on the working surface, which is what
+# step one exists to see, and one link in the reviews directory, which is what
+# drops the exclusion and runs step two at all.
+echo "loose" > "$CA/backend/loose-ca.txt"
+printf 'not this tree\n' > "$TMP/ca-decoy.txt"
+ln -s "$TMP/ca-decoy.txt" "$CA/.agents/reviews/ca-decoy-link.txt"
+# The key really is live in this repository: the worktree's own git says nothing.
+want_eq "(ca) the repo's own git status is blind to both plants" \
+        "$(git -C "$CA" status --porcelain -- . 2>&1)" ""
+out="$("$LOOM" land 0096-ca 2>&1)"; rc=$?
+want_fail "(ca) loom land refuses anyway"                           "$rc"
+want_in   "(ca) ... naming the loose file step one was blinded to"  "$out" "loose-ca.txt"
+want_in   "(ca) ... and the reviews plant"                          "$out" "ca-decoy-link.txt"
+want_ne   "(ca) ... with the branch not merged into main" \
+          "$(git rev-parse HEAD)" "$(git rev-parse refs/heads/agent/0096-ca)"
+want_eq   "(ca) ... nor its commits reachable from it" \
+          "$(git merge-base --is-ancestor refs/heads/agent/0096-ca HEAD 2>/dev/null && echo merged || echo no)" "no"
+rm -f "$CA/.agents/reviews/ca-decoy-link.txt" "$CA/backend/loose-ca.txt"
+git config --unset status.showUntrackedFiles
+"$LOOM" pin-config --accept-config > /dev/null 2>&1
+"$LOOM" drop 0096-ca > /dev/null 2>&1 || true
+
+# --- (cb) the pure README shape: nothing tracked inside the reviews dir -----
+# (bw) proved step two fires in a repo that gitignores `.agents/reviews/` — but
+# it proved it in THIS repo, and its assertion that the message NAMES the plant
+# passes only because something inside that directory is tracked. Measured, git
+# 2.34.1: git descends into an ignored directory for `--ignored=matching` only
+# when a tracked file makes it, and with the directory gitignored and nothing
+# tracked inside it the whole listing collapses to the single line
+# `!! .agents/reviews/`, with and without `-uall`. The refusal still fired; it
+# named a directory where the operator needs a file. loom knows which entry it
+# refused on, so `wt_dirty` appends that line itself.
+#
+# The pure shape has to be MADE here: the harness tracks
+# `.agents/reviews/.gitkeep`, and two earlier cases landed gate logs in that
+# directory on main (0042-as, 0089-bu6). Any one of the three is enough to make
+# git descend, so the index is emptied of the directory — and refilled after.
+cb_tracked="$(git ls-files -- .agents/reviews)"
+git rm -q --cached -r -- .agents/reviews
+printf '.agents/reviews/\n' > .gitignore
+git add .gitignore
+git commit -qm "the pure README shape: reviews gitignored, nothing tracked in it"
+out="$("$LOOM" new 0097-cb 2>&1)"; rc=$?
+want_eq "(cb) setup: a task in the pure shape"                      "$rc" "0"
+CB="$WTU/0097-cb"
+echo "cb work" > "$CB/backend/cb.txt"
+git -C "$CB" add backend/cb.txt
+git -C "$CB" commit -qm "work on cb"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0097-cb 2>&1)"; rc=$?
+want_eq "(cb) setup: it is reviewed"                                "$rc" "0"
+want_eq "(cb) ... with nothing tracked inside the reviews directory" \
+        "$(git -C "$CB" ls-files -- .agents/reviews)" ""
+printf 'not this tree\n' > "$TMP/cb-decoy.txt"
+ln -s "$TMP/cb-decoy.txt" "$CB/.agents/reviews/cb-decoy-link.txt"
+want_eq "(cb) git collapses the whole directory to one line" \
+        "$(git -C "$CB" status --porcelain --ignored=matching -- .agents/reviews 2>&1)" \
+        "!! .agents/reviews/"
+out="$("$LOOM" land 0097-cb 2>&1)"; rc=$?
+want_fail "(cb) loom land refuses"                                  "$rc"
+want_in   "(cb) ... carrying git's collapsed line"                  "$out" "!! .agents/reviews/"
+want_in   "(cb) ... and loom's own line, naming the entry"          "$out" "cb-decoy-link.txt"
+want_in   "(cb) ... and why it is not loom's scratch"               "$out" "not loom's plain scratch"
+want_ne   "(cb) ... with the branch not merged into main" \
+          "$(git rev-parse HEAD)" "$(git rev-parse refs/heads/agent/0097-cb)"
+want_eq   "(cb) ... nor its commits reachable from it" \
+          "$(git merge-base --is-ancestor refs/heads/agent/0097-cb HEAD 2>/dev/null && echo merged || echo no)" "no"
+rm -f "$CB/.agents/reviews/cb-decoy-link.txt"
+"$LOOM" drop 0097-cb > /dev/null 2>&1 || true
+git rm -q .gitignore
+# ... and every path that directory had in the index goes back into it. They
+# are all still on disk: `git rm --cached` only unstaged them.
+printf '%s\n' "$cb_tracked" | while read -r f; do
+  [ -n "$f" ] && git add -f -- "$f"
+done
+git commit -qm "and back to the harness's own shape"
 
 # --- (j)/(t) doctor lists the profiles, and touches no network ------------
 out="$(timeout 180 "$LOOM" doctor 2>&1 || true)"
