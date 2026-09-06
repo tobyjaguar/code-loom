@@ -86,7 +86,7 @@ providers = ["claude", "codex"]
 scope v1 and cannot be gated locally at all, and `spike/**` is unreviewed
 exploratory code including live-key harnesses.
 
-## 1b. `.agents/zones.toml` — four paths that belong in `[hand]`
+## 1b. `.agents/zones.toml` — five paths that belong in `[hand]`
 
 Check that `[hand].paths` in the consuming repo lists the control plane itself,
 and add what is missing:
@@ -96,9 +96,11 @@ and add what is missing:
   ".agents/zones.toml",
   ".agents/loom.env",
   ".opencode/**",
+  ".gitattributes",
+  "**/.gitattributes",
 ```
 
-An agent may **propose** a change to any of the four — that is what the hand
+An agent may **propose** a change to any of them — that is what the hand
 zone means — and may never commit one, because each is an input to the checks
 that judge the agent's own work:
 
@@ -119,6 +121,17 @@ that judge the agent's own work:
   points every opencode run at the **main checkout's** copy and turns the
   worktree's own project config off, so a rewritten worktree copy is inert
   *while the task runs*; a landed one is the copy every later task uses.
+
+* `.gitattributes` (the repo root's, and every nested one — git reads a
+  `.gitattributes` in any directory) is the **file half** of filter- and
+  merge-driver execution. The driver itself lives in `.git/config`, which
+  `loom` now pins to the task: a change to the repository's local git config is
+  refused, and `--accept-config` is the one escape. The *attribute* that selects
+  a driver for a path lives in the tree, where an agent writes it — `filter=x`
+  on one path, plus a `filter.x.clean` anywhere in the config chain (your
+  `~/.gitconfig` included), is a program git runs on checkout, `git add` and
+  commit. A landed `.gitattributes` is the copy every later task checks out
+  under.
 
 `loom land` checks the branch's commits against `[hand]` regardless of what the
 guard did, so this is the entry that actually holds. None of `.agents/gate.sh`,

@@ -33,6 +33,15 @@ paths = [
   #              that could commit it could widen its own zone.
   #   loom.env   is `.`-sourced as shell, in your environment, on every `loom`
   #              invocation (docs/KNOWN-GAPS.md § 3).
+  #   .gitattributes
+  #              is the FILE HALF of filter/merge-driver execution. A driver
+  #              lives in .git/config (which loom pins to the task — a change is
+  #              refused, `--accept-config` is the escape); the attribute that
+  #              SELECTS it for a path lives here, in the tree, where an agent
+  #              writes it. `filter=x` on one path plus a `filter.x.clean`
+  #              anywhere in the config chain is a program git runs on checkout,
+  #              `git add` and commit — and a landed .gitattributes is the copy
+  #              every later task checks out under.
   #   .opencode/ is the provider IDENTITY and every role prompt.
   #              `provider.<name>.options.baseURL` in opencode.json decides
   #              which host answers as "deepseek", which is the fact a fence
@@ -46,10 +55,14 @@ paths = [
   # is not. Three of them may not be FENCED either — `loom` refuses a [fence]
   # pattern covering zones.toml, gate.sh or .opencode/, because a worktree (or
   # a harness) without them disarms the very checks that judge the agent.
+  # `.gitattributes` is listed twice on purpose: the repo-root one, and every
+  # nested one, since git reads a .gitattributes in any directory.
   ".agents/gate.sh",
   ".agents/zones.toml",
   ".agents/loom.env",
   ".opencode/**",
+  ".gitattributes",
+  "**/.gitattributes",
 ]
 
 [assist]
