@@ -4009,15 +4009,19 @@ cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
   # with rename detection on (git's default since 2.9), and the path being moved
   # out is the one this guard exists to see. Off, git reports a delete plus an
   # add, which is both sides — the same spelling history_paths uses.
+  # -z: with core.quotePath on (git's default) a non-ASCII name comes back
+  # C-quoted (`.opencode/"\303\244.md"`), which zone_of would then judge as a
+  # DIFFERENT path than the one being committed. history_paths and
+  # hand_reconcile_staged already read this stream NUL-delimited; so does this.
   local violations="" file z
-  while IFS= read -r file; do
+  while IFS= read -r -d '' file; do
     [ -n "$file" ] || continue
     z="$(zone_of "$file")" || { echo "pre-commit: zone lookup failed — refusing to guess" >&2; exit 1; }
     if [ "$z" = hand ] && ! is_released "$file"; then
       violations="$violations
   $file"
     fi
-  done < <(git -C "$INVOKED_ROOT" diff --no-ext-diff --no-textconv --cached --no-renames --name-only)
+  done < <(git -C "$INVOKED_ROOT" diff --no-ext-diff --no-textconv --cached -z --no-renames --name-only)
   if [ -n "$violations" ]; then
     echo "BLOCKED: agent branch '$branch' touches hand-zone paths:$violations" >&2
     echo "" >&2

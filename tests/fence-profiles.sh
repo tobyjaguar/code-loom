@@ -3796,9 +3796,11 @@ want_absent "(cf) ... and there was never a hook to do any of it"    "$cf_hook"
 # `ln -s ../../core backend/allofit` at an ASSIST path was a legal commit:
 # check reviewed it, land merged it (`create mode 120000 backend/allofit`), and
 # every worktree loom built afterwards read `core/` straight through it. The
-# fence removes PATHS and cannot remove a doorway to one. Judged lexically —
-# absolute targets, and `..`s that climb above the tree root — because under a
-# fence the entry may not be checked out at all, so nothing is realpath'd.
+# fence removes PATHS and cannot remove a doorway to one. Targets are resolved
+# within the tree's OWN link map (B1) — never realpath'd, since under a fence the
+# entry may not be checked out at all — so an absolute target, a `..` that climbs
+# above the tree root, or a chain that composes into one is caught, and only what
+# the branch turned into a doorway (B18-1) is refused.
 out="$("$LOOM" new 0103-ch 2>&1)"; rc=$?
 want_eq "(ch) setup: a task"                                        "$rc" "0"
 CH="$WTU/0103-ch"
@@ -4413,6 +4415,33 @@ want_in   "(cr) ... as the branch's own doing"                    "$out" "on thi
 git branch -D agent/0129-cr4 > /dev/null 2>&1 || true
 git rm -q --cached backend/up > /dev/null 2>&1; rm -f backend/up
 git commit -qm "(cr) and the trunk inside-link removed"
+
+# --- (cs) N1: a non-ASCII hand-zone path slips the guard when C-quoted --------
+# `cmd_guard` read `git diff --cached --no-renames --name-only` WITHOUT -z, so
+# with core.quotePath on (git's default) a non-ASCII name came back double-quoted
+# and C-escaped (`".opencode/\303\244.md"`, leading quote and all) — which no
+# longer starts with `.opencode/`, so zone_of judged it OUTSIDE [hand] and the
+# hook let it through. It reads the stream NUL-delimited now, like history_paths
+# and hand_reconcile_staged, and names the DEQUOTED path.
+cs_hook="$(git rev-parse --git-path hooks/pre-commit)"
+case "$cs_hook" in /*) ;; *) cs_hook="$REPO/$cs_hook" ;; esac
+ln -sf "$LOOM" "$TMP/stubs/loom"          # the hook calls `loom guard` by name
+out="$("$LOOM" install-hooks 2>&1)"; rc=$?
+want_eq "(cs) setup: the hook installs"                            "$rc" "0"
+out="$("$LOOM" new 0130-cs 2>&1)"; rc=$?
+want_eq "(cs) setup: a task"                                       "$rc" "0"
+CS="$WTU/0130-cs"
+cs_head="$(git -C "$CS" rev-parse HEAD)"
+cs_name=$'.opencode/\303\244.md'          # .opencode/ä.md — [hand] by zones.toml
+out="$( { cd "$CS" && printf 'x\n' > "$cs_name" && git add -A \
+          && git commit -qm "agent(0130-cs): a non-ASCII hand path"; } 2>&1 )"; rc=$?
+want_fail "(cs) loom guard BLOCKS a C-quoted non-ASCII hand path"  "$rc"
+want_in   "(cs) ... naming it DEQUOTED, not C-quoted"             "$out" "$cs_name"
+want_eq   "(cs) ... with nothing committed"                       "$(git -C "$CS" rev-parse HEAD)" "$cs_head"
+git -C "$CS" reset -q --hard
+"$LOOM" drop 0130-cs > /dev/null 2>&1 || true
+git branch -D agent/0130-cs > /dev/null 2>&1 || true
+rm -f "$cs_hook" "$TMP/stubs/loom"
 
 # --- (j)/(t)/(cg) doctor lists the profiles, touches no network, and counts -
 # (cg): `local pname pprov prel role m mp bad` inside the [fence_profiles] loop
