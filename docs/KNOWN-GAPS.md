@@ -33,9 +33,9 @@ new t5` fenced the new task with the agent's `zones.toml` (an emptied one means
 no fence at all) and `.`-sourced the agent's `.agents/loom.env` as shell, in
 your environment.
 
-**What closes it.** `bin/loom:152` (`ROOT="$(cd "$(dirname "$_common")" …)"`,
-from `git rev-parse --git-common-dir` at `bin/loom:148`) and `bin/loom:177`
-(`AGENTS_DIR="$ROOT/.agents"`); the guard's own reads are `bin/loom:2446`
+**What closes it.** `bin/loom:159` (`ROOT="$(cd "$(dirname "$_common")" …)"`,
+from `git rev-parse --git-common-dir` at `bin/loom:155`) and `bin/loom:184`
+(`AGENTS_DIR="$ROOT/.agents"`); the guard's own reads are `bin/loom:2838`
 onward. `$ROOT` is now the **main checkout** for every command:
 `git rev-parse --git-common-dir` answers `.git` from the main checkout and the
 absolute path of the main `.git` from a linked worktree, so its parent is the
@@ -46,7 +46,7 @@ profiles), `loom.env`, `.opencode/`, and `.agents/gate.sh`.
 One thing still comes from the invoking tree, and only one: **`loom guard`'s
 subject.** The commit is happening in that worktree, so the branch, the staged
 file list and the tree the reconciler inspects are read from `$INVOKED_ROOT`
-(`bin/loom:144`)
+(`bin/loom:151`)
 while the zones they are judged by come from `$ROOT`. `loom` says so in one line
 whenever the two differ. `tests/fence-profiles.sh` (av) asserts both halves:
 `loom new` from inside a worktree with an emptied `zones.toml` still applies the
@@ -81,7 +81,7 @@ own. That is not worth plugging: the entire hook is dominated by `git commit
 
 ## 2. `loom plan` runs the architect unfenced, in your own tree
 
-**Where.** `bin/loom:3862`, in `cmd_plan` (`bin/loom:3843`):
+**Where.** `bin/loom:4384`, in `cmd_plan` (`bin/loom:4357`):
 `run_role architect "$ROOT" "$prompt"` (and the
 interactive leg, `claude --append-system-prompt … "$prompt"`, likewise in
 `$ROOT`). The architect's chain at every tier ends in cheap third-party
@@ -103,7 +103,7 @@ say so out loud.
 
 ## 3. `.agents/loom.env` is sourced as shell
 
-**Where.** `bin/loom:251`:
+**Where.** `bin/loom:258`:
 
 ```sh
 if [ -f "$ROOT/.agents/loom.env" ]; then set -a; . "$ROOT/.agents/loom.env"; set +a; fi
@@ -240,7 +240,7 @@ that one form or the README changes with it.
 used to read "granted for the whole worktree root". It is not that any more;
 what is left is a confirmation.
 
-**Where.** `bin/loom:1501`, in `run_headless` (`bin/loom:1414`), the opencode leg:
+**Where.** `bin/loom:1886`, in `run_headless` (`bin/loom:1799`), the opencode leg:
 
 ```sh
 perm="$(printf '{"external_directory":{"%s/*":"allow","%s/**":"allow"}}' "$wd" "$wd")"
@@ -310,7 +310,7 @@ OPENCODE_CONFIG=$ROOT/.opencode/opencode.json     # (and OPENCODE_CONFIG_DIR)
 OPENCODE_DISABLE_PROJECT_CONFIG=1
 ```
 
-`run_headless`'s opencode leg (`bin/loom:1532`) sets the **disable
+`run_headless`'s opencode leg (`bin/loom:1917`) sets the **disable
 unconditionally**, on every opencode invocation — implementer, reviewer, scout
 and architect alike — and names the operator's config only when one exists.
 That is a round-4 correction: the disable used to be conditional on
@@ -366,12 +366,18 @@ actually reads in round 9, extended in round 10 to the roles that have no task
 construction.** This one cannot be
 closed from outside git; what follows is the boundary, drawn honestly.
 
-**Where.** `bin/loom:393` (the `GIT_CONFIG_PARAMETERS` export) and
-`bin/loom:403` (`GIT_PAGER=cat`); `bin/loom:740` onward (the config pin:
+**Where.** `bin/loom:400` (the `GIT_CONFIG_PARAMETERS` export) and
+`bin/loom:410` (`GIT_PAGER=cat`); `bin/loom:747` onward (the task pin:
 `config_sidecar`, `config_py`, `config_snapshot`, `config_wt`,
-`config_summary`, `require_recorded_config`);
-and the `--no-ext-diff` / `--upload-pack=` / `--receive-pack=` spelled out at
-the diff, fetch and push call sites.
+`config_summary`, `config_programs` at `bin/loom:1241`,
+`require_recorded_config`); `bin/loom:1377` onward (the REPOSITORY baseline:
+`repo_config_file`, `repo_config_read`, `repo_config_write`,
+`repo_config_repin`, and `require_recorded_config_repo` at `bin/loom:1440`),
+read from `scout_root` (`bin/loom:4437`) and `cmd_plan`, written by
+`cmd_pin_config` (`bin/loom:4253`); `scout_mirror_config_check`
+(`bin/loom:4411`) for the one scope neither pin can cover; and the
+`--no-ext-diff` / `--upload-pack=` / `--receive-pack=` spelled out at the diff,
+fetch and push call sites.
 
 **What it is.** A linked worktree shares the git directory with the main
 checkout, so `.git/config` is writable from inside an agent's tree with one
@@ -457,7 +463,13 @@ operation of every command**, before every model launch (per *attempt*), before
 `-`/`+` lines; `--accept-config` is the only escape, and it prints the same diff
 and re-records. `loom new` **refuses** `--accept-config` (it is the command that
 pins) and instead says what it pinned: `loom: pinned N local + M worktree config
-entries`, plus a WARN naming the targets whenever an include is present.
+entries`, a WARN naming the targets whenever an include is present, and a second
+WARN naming every pinned key that names a **program git runs** —
+`core.hooksPath`, `credential.*`, `core.askPass`, `filter.*`, `merge.*.driver`,
+`diff.*.textconv`/`.command`, `gpg.program`, `pager.*`, `core.attributesFile`,
+`core.sshCommand`, `include.*`/`includeIf.*` — values escaped, tagged with the
+scope each came from. That is residual 1 below, printed at the one moment it is
+being adopted. `loom pin-config` prints both blocks too.
 `loom drop` deliberately does not check the pin at all — it runs no model,
 publishes nothing, and removes the worktree, branch and record, so refusing to
 clean up over a moved config would strand released paths on disk.
