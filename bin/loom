@@ -2782,7 +2782,17 @@ cmd_rebase() { # rebase agent/<task> onto origin/main and re-point its base
   # commit an agent likes, and unlike `refs/heads/main` (which is the branch the
   # operator is standing on, and moves in front of them) a moved `origin/main`
   # shows NOWHERE. So loom reads what actually came under the base and refuses to
-  # bury a fenced or hand-zone path in it without being told to.
+  # bury ANY of it without being told to.
+  #
+  # "Any" is round 7's correction, and it is the honest rule. The gate used to
+  # be "the range touches a fenced or a hand-zone path": a range of merge
+  # commits, or one touching only the assist zone, moved the base in silence.
+  # But burial is not a fence question — it is a REVIEW question. What goes
+  # under the base leaves the review surface entirely, and "it touches nothing
+  # I check" is not the same statement as "it is nothing". So a non-empty
+  # old_base..new_base needs the operator's word, whatever it contains; the
+  # fenced and hand-zone hits are still named first, because they are the ones
+  # that ought to stop a reader.
   scan_fence_flag "$@"
   local task="" upstream="" accept="" a
   local wt br old_base old_pid new_base mb c dirty bad_f bad_h
@@ -2797,6 +2807,50 @@ cmd_rebase() { # rebase agent/<task> onto origin/main and re-point its base
   done
   [ -n "$task" ] || die "usage: loom rebase <task-id> [<upstream>] [--fence-profile <name>] [--accept-upstream]"
   upstream="${upstream:-origin/main}"
+  # WHICH upstream a rebase may replay onto. The list is two entries long, and
+  # it is that short for one reason: this command MOVES the recorded base, so
+  # loom has to be able to REFRESH what it replays onto before it does.
+  #
+  #   origin/<branch>   fetched below with an explicit refspec naming BOTH ends,
+  #                     so the remote's own answer overwrites whatever
+  #                     refs/remotes/origin/<branch> said. Requires an 'origin':
+  #                     without one that ref is refreshed by nothing at all, and
+  #                     is simply a local ref an agent can `git update-ref` to
+  #                     any commit it likes.
+  #   <a local branch>  a ref in this repository, which a fetch does not touch
+  #                     (a fetch updates refs/remotes/*, never refs/heads/*).
+  #                     Allowed, because it is YOUR ref and it moves in front of
+  #                     you — but loom says out loud that nothing was fetched.
+  #
+  # Every other remote-tracking ref is refused. `loom rebase T upstream/main`
+  # used to be accepted and skip the fetch entirely — only `origin/*` ever got a
+  # refspec — replaying the base onto refs/remotes/upstream/main, a ref in the
+  # shared .git that loom cannot refresh and nothing else updates either.
+  local up_kind="" fetch_br=""
+  case "$upstream" in
+    origin/?*)
+      git remote get-url origin >/dev/null 2>&1 || die "loom rebase: '$upstream' names the 'origin' remote, and this repository has none.
+refs/remotes/origin/${upstream#origin/} is then a purely local ref that nothing
+refreshes — one 'git update-ref' inside any worktree from naming any commit —
+and a rebase onto it would move task $task's base onto whatever it says. Add the
+remote, or name a local branch:  loom rebase $task <branch>"
+      up_kind=origin; fetch_br="${upstream#origin/}" ;;
+    *)
+      if git show-ref --verify --quiet "refs/heads/$upstream"; then
+        up_kind=local
+      else
+        case "$upstream" in
+          */*) die "loom rebase: '$upstream' is not an upstream loom can replay a base onto.
+A rebase moves this task's recorded base, so loom must be able to refresh what it
+replays onto first:
+  only origin/<b> or a local branch; loom cannot refresh '${upstream%%/*}'." ;;
+          *)   die "loom rebase: '$upstream' is neither 'origin/<branch>' nor a branch in this
+repository. A rebase moves this task's recorded base, so loom must be able to
+refresh what it replays onto first:
+  only origin/<b> or a local branch; loom cannot refresh '$upstream'." ;;
+        esac
+      fi ;;
+  esac
   require_fence_flag "$task" rebase   # a rebase must not silently change the fence
   wt="$(require_worktree "$task")"; br="$(branch_of "$task")"
   fence_reconcile "$wt" "$FENCE_PROFILE"
@@ -2828,17 +2882,21 @@ $(printf '%s\n' "$dirty" | sed 's/^/  /')"
   # '+' makes the remote's answer overwrite whatever is there. The recorded
   # `fetch` field (checked by require_recorded_origin above) refuses a changed
   # refspec outright; this makes the fetch not depend on it in the first place.
-  if git remote get-url origin >/dev/null 2>&1; then
-    local fetch_br="" fetch_spec=""
-    case "$upstream" in
-      origin/?*) fetch_br="${upstream#origin/}"
-                 fetch_spec="+refs/heads/$fetch_br:refs/remotes/origin/$fetch_br" ;;
-    esac
-    # shellcheck disable=SC2086  # $fetch_spec is one word or none, deliberately
-    git fetch -q origin $fetch_spec >&2 \
-      || die "git fetch origin${fetch_spec:+ $fetch_spec} failed, so '$upstream' may be stale — and a
+  #
+  # `--upload-pack` is spelled out for the same reason `git push` spells out
+  # `--receive-pack`: git keeps the FIRST `remote.<n>.uploadpack` it sees, so a
+  # value in the shared .git/config outranks the GIT_CONFIG_PARAMETERS floor
+  # loom exports, and this is the command that runs a program on the far side.
+  if [ "$up_kind" = origin ]; then
+    local fetch_spec="+refs/heads/$fetch_br:refs/remotes/origin/$fetch_br"
+    git fetch -q --upload-pack=git-upload-pack origin "$fetch_spec" >&2 \
+      || die "git fetch origin $fetch_spec failed, so '$upstream' may be stale — and a
 rebase onto a stale upstream moves this task's base onto commits you have not
 fetched. Fix the fetch (network, credentials, the remote URL) and re-run."
+  else
+    echo "loom: '$upstream' is a LOCAL branch — nothing was fetched (a fetch updates" >&2
+    echo "loom: refs/remotes/*, never refs/heads/*), so it is exactly as current as your" >&2
+    echo "loom: own last pull of it." >&2
   fi
   git -C "$wt" rebase "$upstream" >&2 || die "rebase onto $upstream failed — resolve in $wt, then re-run"
   mb="$(git merge-base "$br" "$upstream")" \
@@ -2864,24 +2922,29 @@ fetched. Fix the fetch (network, credentials, the remote URL) and re-run."
     || die "the new base $(git rev-parse --short "$new_base") is not an ancestor of $br — refusing to
 record a base this branch does not descend from. Inspect $wt, do not re-run."
   # WHAT CAME UNDER THE BASE. Everything in old_base..new_base is about to stop
-  # being reviewable: it is upstream now. Judged through the FULL [fence] and
-  # the FULL [hand] — a fence profile releases paths for the TASK's own commits,
-  # and nobody consented to a release for whatever arrived from upstream.
+  # being reviewable: it is upstream now. The fenced and hand-zone hits are
+  # computed through the FULL [fence] and the FULL [hand] — a fence profile
+  # releases paths for the TASK's own commits, and nobody consented to a release
+  # for whatever arrived from upstream.
   #
-  # In an active repo this fires often, and that is the intended shape rather
-  # than a bug: your OWN commits to the hand zone, merged upstream while the
-  # task ran, are a hit. --accept-upstream is a one-word confirmation that you
-  # have read what is landing underneath, not an override of a security rule.
+  # The whole range is printed UNCONDITIONALLY whenever the base moves — on the
+  # refusal and under `--accept-upstream` alike, hits or no hits — and it is
+  # printed in full: the fenced list, the hand list, `git log --oneline`, and
+  # every path those commits touch. Consent to bury commits is only consent if
+  # the operator was shown what they are.
   #
-  # Printed UNCONDITIONALLY whenever the base actually moves — on the refusal
-  # and under `--accept-upstream` alike, and whether or not anything fenced is
-  # in there. Consent to bury commits is only consent if the operator was shown
-  # what they are: the accept leg used to print the subjects and never the
-  # fenced/hand path lists, because it never computed them, and both legs were
-  # gated on the range touching at least one path — so a range of merge commits
-  # slid under the base in silence.
+  # And the CONSENT is required for any non-empty range, not only one with a
+  # hit. In an active repo that fires often, and that is the intended shape
+  # rather than a bug: your own commits merged upstream while the task ran are
+  # exactly what goes under the base. `--accept-upstream` is a one-word "I have
+  # read those" — not an override of a security rule, and not a fence question.
   history_paths "$ROOT" "$old_base" "$new_base"
   if [ "$new_base" != "$old_base" ]; then
+    local buried
+    buried="$(git rev-list --count "$old_base..$new_base" 2>/dev/null)" \
+      || die "cannot count the commits between $(git rev-parse --short "$old_base") and
+$(git rev-parse --short "$new_base") — refusing to move a base over a range loom
+cannot read."
     bad_f="$(zones_py_full history-fence ${HIST_PATHS[0]+"${HIST_PATHS[@]}"})" \
       || die "cannot tell what the commits under the new base touch — refusing to guess"
     bad_h="$(zones_py_full history-hand ${HIST_PATHS[0]+"${HIST_PATHS[@]}"})" \
@@ -2890,16 +2953,26 @@ record a base this branch does not descend from. Inspect $wt, do not re-run."
       echo "loom: these commits go UNDER task $task's base — upstream, where no fence"
       echo "loom: check, no hand check and no review patch looks at them again:"
       echo ""
-      echo "  $(git rev-parse --short "$old_base")..$(git rev-parse --short "$new_base") ($upstream):"
-      git log --oneline "$old_base..$new_base" 2>/dev/null | sed 's/^/    /'
-      echo ""
+      # The hits first: they are the ones that ought to stop a reader.
       echo "  fenced paths:"
       if [ -n "$bad_f" ]; then printf '%s\n' "$bad_f" | sed 's/^/    /'; else echo "    (none)"; fi
       echo "  hand-zone paths:"
       if [ -n "$bad_h" ]; then printf '%s\n' "$bad_h" | sed 's/^/    /'; else echo "    (none)"; fi
       echo ""
+      echo "  $buried commit(s), $(git rev-parse --short "$old_base")..$(git rev-parse --short "$new_base") ($upstream):"
+      git log --oneline "$old_base..$new_base" 2>/dev/null | sed 's/^/    /'
+      echo ""
+      # ... and then everything, because a path in neither list is still a path
+      # that stops being reviewable.
+      echo "  every path those commits touch:"
+      if [ "${#HIST_PATHS[@]}" -gt 0 ]; then
+        printf '%s\n' "${HIST_PATHS[@]}" | sort -u | sed 's/^/    /'
+      else
+        echo "    (none)"
+      fi
+      echo ""
     } >&2
-    if [ -n "$bad_f$bad_h" ] && [ -z "$accept" ]; then
+    if [ "${buried:-0}" -gt 0 ] && [ -z "$accept" ]; then
       # Put the branch back first. The rebase has already replayed it, and a
       # branch left sitting on the refused upstream carries those commits in
       # `old_base..tip` — so every later command, INCLUDING the
@@ -2909,8 +2982,11 @@ record a base this branch does not descend from. Inspect $wt, do not re-run."
       git -C "$wt" reset --hard "$PINNED_TIP" >/dev/null 2>&1 \
         || echo "loom: WARNING: could not put $br back at $PINNED_TIP after refusing this
 rebase — the branch is left on $upstream. Inspect $wt." >&2
-      die "the commits listed above would go UNDER task $task's base, and they touch paths
-loom will not bury silently. 'origin/main' is one 'git update-ref' away from any
+      die "the $buried commit(s) listed above would go UNDER task $task's base, where no
+fence check, no hand check and no review patch looks at them again. loom does not
+bury commits without being told to — including commits that touch nothing fenced
+and nothing in [hand], because 'it touches nothing I check' is not the same
+statement as 'it is nothing'. 'origin/main' is one 'git update-ref' away from any
 commit, and unlike your own 'main' a moved 'origin/main' is visible nowhere.
 Nothing changed: the base was not moved and the branch is back at
 $(git rev-parse --short "$PINNED_TIP"). Read those commits, then either accept

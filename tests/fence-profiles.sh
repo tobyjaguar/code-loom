@@ -1181,7 +1181,10 @@ as_base_before="$(state_field 0042-as base)"
 echo "later" > backend/as-main.txt
 git add backend/as-main.txt
 git commit -qm "main moves on"
-out="$("$LOOM" rebase 0042-as main --fence-profile codex 2>&1)"; rc=$?
+# --accept-upstream, because "main moves on" is a real commit going under this
+# task's base — and round 7 made burial need the operator's word whatever the
+# buried range touches, not only when it touches a fenced or hand-zone path.
+out="$("$LOOM" rebase 0042-as main --fence-profile codex --accept-upstream 2>&1)"; rc=$?
 want_eq "(as) loom rebase succeeds"                         "$rc" "0"
 want_in "(as) ... and says it re-pointed the base"        "$out" "rebased onto main; base"
 want_eq "(as) the recorded base is now main's tip"        "$(state_field 0042-as base)" "$(git rev-parse HEAD)"
@@ -1221,15 +1224,20 @@ git -C "$ATW" add backend/at.txt
 git -C "$ATW" commit -qm "benign work"
 at_base_before="$(state_field 0043-at base)"
 at_tip_before="$(git rev-parse agent/0043-at)"
-# an upstream commit touching a fenced path, planted on origin/main by the agent
+# an upstream commit touching a fenced path. This repo has no 'origin' yet, and
+# round 7 refuses `origin/<b>` in a repo with no origin remote — refs/remotes/
+# origin/main there is a purely local ref nothing refreshes, which is exactly
+# the forgery this case used to plant. So the upstream here is a LOCAL branch,
+# which is the other thing loom will replay onto; the forged-origin story now
+# lives in (ba)/(ba2), against a real remote, where the explicit refspec is what
+# defeats it.
 git checkout -q -b at-upstream
 echo "// the upstream touched the core" >> core/lib.rs
 git add core/lib.rs
 git commit -qm "upstream: a fenced change"
 at_up="$(git rev-parse HEAD)"
 git checkout -q main
-git -C "$ATW" update-ref refs/remotes/origin/main "$at_up"   # the agent
-out="$("$LOOM" rebase 0043-at 2>&1)"; rc=$?
+out="$("$LOOM" rebase 0043-at at-upstream 2>&1)"; rc=$?
 want_eq "(at) rebase refuses to bury a fenced upstream commit under the base" "$rc" "1"
 want_in "(at) ... naming the path"                        "$out" "core/lib.rs"
 want_in "(at) ... and the commits it would bury"          "$out" "upstream: a fenced change"
@@ -1237,11 +1245,12 @@ want_in "(at) ... and the one escape"                     "$out" "--accept-upstr
 want_eq "(at) ... the recorded base did not move"         "$(state_field 0043-at base)" "$at_base_before"
 want_eq "(at) ... and the branch was put back where it was" \
         "$(git rev-parse agent/0043-at)" "$at_tip_before"
-out="$("$LOOM" rebase 0043-at --accept-upstream 2>&1)"; rc=$?
+out="$("$LOOM" rebase 0043-at at-upstream --accept-upstream 2>&1)"; rc=$?
 want_eq "(at) --accept-upstream proceeds"                 "$rc" "0"
 want_in "(at) ... printing what it buried"                "$out" "upstream: a fenced change"
+want_in "(at) ... and every path in the range, not only the hits" \
+        "$out" "every path those commits touch"
 want_eq "(at) ... and the base is now the upstream commit" "$(state_field 0043-at base)" "$at_up"
-git update-ref -d refs/remotes/origin/main
 # ... the same command, aimed at a remote the task was not created against.
 git remote add origin "$TMP/fake-origin-a"
 out="$("$LOOM" new 0044-at2 2>&1)"; rc=$?
@@ -1271,7 +1280,10 @@ echo "benign" > "$AT3W/backend/at3.txt"
 git -C "$AT3W" add backend/at3.txt
 git -C "$AT3W" commit -qm "benign work"
 at3_base_before="$(state_field 0045-at3 base)"
-out="$("$LOOM" rebase 0045-at3 main 2>&1)"; rc=$?
+# origin/<b>, not the local `main`: a local-branch upstream is not fetched at
+# all now (a fetch updates refs/remotes/*, never refs/heads/*), so it is the
+# origin/<b> leg that has a fetch to fail.
+out="$("$LOOM" rebase 0045-at3 origin/main 2>&1)"; rc=$?
 want_eq "(at) a failed fetch is a refusal"                "$rc" "1"
 want_in "(at) ... saying the upstream may be stale"       "$out" "may be stale"
 want_eq "(at) ... and the base did not move"              "$(state_field 0045-at3 base)" "$at3_base_before"
@@ -1549,7 +1561,9 @@ git commit -qm "upstream: the real main moved"
 ba2_up="$(git rev-parse HEAD)"
 git push -q origin main
 git -C "$BA2W" update-ref refs/remotes/origin/main "$ba2_tip"   # the agent forges
-out="$("$LOOM" rebase 0061-ba2 origin/main 2>&1)"; rc=$?
+# --accept-upstream because the real upstream commit really does go under the
+# base, and round 7 asks for the operator's word on any non-empty range.
+out="$("$LOOM" rebase 0061-ba2 origin/main --accept-upstream 2>&1)"; rc=$?
 want_eq "(ba) the explicit-refspec fetch overwrites the forged ref" "$rc" "0"
 want_eq "(ba) ... so the base is the REAL upstream tip"   "$(state_field 0061-ba2 base)" "$ba2_up"
 want_ne "(ba) ... never the branch's own tip"             "$(state_field 0061-ba2 base)" "$ba2_tip"
