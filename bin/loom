@@ -549,7 +549,13 @@ REPLACE_REFS_CHECKED=""
 require_no_replace_refs() { # require_no_replace_refs <command-name>
   [ -z "$REPLACE_REFS_CHECKED" ] || return 0
   local refs
-  refs="$(git -C "$ROOT" for-each-ref --format='%(refname) -> %(objectname)' refs/replace/ 2>/dev/null || true)"
+  # `|| true` used to end this line — the one permissive-on-error answer in the
+  # file, and on the query whose empty result means "no replacements". A git
+  # that failed is not an answer.
+  refs="$(git -C "$ROOT" for-each-ref --format='%(refname) -> %(objectname)' refs/replace/ 2>/dev/null)" \
+    || die "cannot list refs/replace/* in $ROOT. ${1:-This command} measures a branch from a
+commit OID and a replacement ref redirects one, so loom refuses to run beside
+refs it cannot read. Inspect the repository:  git replace -l"
   if [ -n "$refs" ]; then
     die "this repository has git REPLACEMENT refs. ${1:-This command} records or measures
 a branch from a commit OID, and these redirect one:
@@ -2125,7 +2131,14 @@ require_roots() {
   case "$WT_ROOT" in /*) ;; *) die "LOOM_WORKTREES must be an absolute path (got '$WT_ROOT')" ;; esac
   [ -n "$WT_ROOT" ] && [ "$WT_ROOT" != / ] \
     || die "LOOM_WORKTREES normalises to '$WT_ROOT', which is not a usable worktree root"
-  WT_ROOT="$(resolve_root "$WT_ROOT")"
+  # `|| exit 1`, and it is deliberate: resolve_root's `die` runs in the command
+  # SUBSTITUTION's subshell, so it printed its message and ended nothing. Without
+  # this the function carried on with an empty WT_ROOT and died a second time
+  # with a fabricated "the profiled worktree root … is inside " — two messages
+  # for one fault, and `loom doctor` (which runs this in a subshell and REPORTS
+  # what it says) printed both on its one FAIL line. `exit`, not `die`: the
+  # message has already been said.
+  WT_ROOT="$(resolve_root "$WT_ROOT")" || exit 1
   WT_ROOT_PROFILED="${WT_ROOT}-profiled"
   if [ -n "$WT_ROOT_PRESET" ] && [ "$WT_ROOT_PRESET" != "$WT_ROOT_PROFILED" ]; then
     die "WT_ROOT_PROFILED is preset to '$WT_ROOT_PRESET', but it is DERIVED from
@@ -2133,7 +2146,7 @@ LOOM_WORKTREES and must be '$WT_ROOT_PROFILED'. A profiled worktree holds paths
 the fence normally removes; where it lands is not something the environment or
 .agents/loom.env gets to redirect. Unset it, or set LOOM_WORKTREES instead."
   fi
-  WT_ROOT_PROFILED="$(resolve_root "$WT_ROOT_PROFILED")"
+  WT_ROOT_PROFILED="$(resolve_root "$WT_ROOT_PROFILED")" || exit 1
   # Neither root may contain the other, and neither may sit inside the repo: a
   # released path under $ROOT is in YOUR checkout, and a profiled worktree under
   # $WT_ROOT is exactly what the split root exists to prevent.

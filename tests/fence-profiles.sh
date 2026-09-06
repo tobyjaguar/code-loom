@@ -4203,6 +4203,42 @@ git -C "$CN2" reset -q --hard
 rm -f "$cn_hook" "$TMP/stubs/loom"
 want_absent "(cn) the hook is removed again"                        "$cn_hook"
 
+# --- (co) doctor reports the two dead stops it used to be silent about -------
+# A `refs/replace/*` ref and a trunk symlink out of the tree both stop (or
+# reshape) every real command, and doctor — the machine's acceptance test, whose
+# exit code people script against — said nothing about either. And a root it
+# cannot verify produced TWO messages on its one FAIL line: `require_roots`
+# carried on after resolve_root's `die` (which ends only the command
+# substitution) with an empty WT_ROOT, and died a second time with a fabricated
+# "the profiled worktree root … is inside ".
+co_base="$(git rev-parse HEAD)"
+co_fake="$(git commit-tree "$(git rev-parse 'HEAD^{tree}')" -m 'forged base')"
+git replace -f "$co_base" "$co_fake"
+out="$(timeout 180 "$LOOM" doctor 2>&1)"; rc=$?
+want_fail "(co) doctor exits non-zero beside a replacement ref"     "$rc"
+want_in   "(co) ... with a FAIL line for it"                        "$out" "FAIL     git REPLACEMENT ref"
+want_in   "(co) ... naming the ref itself"                          "$out" "refs/replace/$co_base"
+git replace -d "$co_base" > /dev/null
+out="$(timeout 180 "$LOOM" doctor 2>&1)"; rc=$?
+want_eq "(co) control: with it gone doctor is green again"          "$rc" "0"
+want_in "(co) ... and says so"                                      "$out" "no refs/replace/*"
+# The root, reported as exactly ONE message.
+out="$(timeout 180 env LOOM_WORKTREES="$CD_LINK" "$LOOM" doctor 2>&1)"; rc=$?
+co_root="$(printf '%s\n' "$out" | grep 'FAIL     worktree root' | head -1)"
+want_ne     "(co) doctor still reports an unverifiable root"        "$co_root" ""
+want_in     "(co) ... with the message resolve_root actually printed" "$co_root" "not where its name says it is"
+want_not_in "(co) ... and no fabricated second one"                 "$co_root" "is inside"
+want_not_in "(co) ... one message, so no second 'loom:' prefix"     "$co_root" "loom:"
+# The trunk link, warned about.
+ln -s /etc/hostname backend/hostname
+git add backend/hostname
+git commit -qm "(co) a trunk link, for the doctor line"
+out="$(timeout 180 "$LOOM" doctor 2>&1)"
+want_in "(co) doctor warns about a trunk symlink out of the tree" \
+        "$out" "WARN     trunk symlink points OUTSIDE the tree: backend/hostname"
+git rm -q --cached backend/hostname > /dev/null; rm -f backend/hostname
+git commit -qm "(co) and removed again"
+
 # --- (j)/(t)/(cg) doctor lists the profiles, touches no network, and counts -
 # (cg): `local pname pprov prel role m mp bad` inside the [fence_profiles] loop
 # re-declared the function's own FAILURE COUNTER (`local ok=0 warn=0 bad=0`).
