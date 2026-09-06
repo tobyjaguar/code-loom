@@ -5170,6 +5170,16 @@ checkout — inspect it, do not attach it:  git log --oneline $br"
             "config=$newconfig" "reviewed="
   config_write_sidecar "$task" "$newcfgdump"
   rm -f "$newcfgdump"
+  # The branch's OWN escaping links are judged from its HISTORY, BEFORE any
+  # checkout. `git worktree add --no-checkout` above populated the index but
+  # wrote no files; the explicit `git checkout` below would otherwise
+  # materialise a link the fence does NOT exclude (only the trunk's inherited
+  # ones are fenced out) on disk, open until fence_reconcile refused it a few
+  # lines down. This leg reads the tree of $br from $ROOT, so no worktree file
+  # need exist for it to run — a refusal here unwinds through the EXIT trap with
+  # nothing ever written to disk. (fence_reconcile's disk leg still runs below,
+  # as defence in depth.)
+  link_reconcile_history "$ROOT" "$newbase" "$br"
   # `has_fence` is not the only reason to build this tree through the sparse
   # rules: an escaping symlink the trunk carries is excluded the same way, and a
   # repository with no [fence] at all can still have one.
@@ -5183,10 +5193,11 @@ checkout — inspect it, do not attach it:  git log --oneline $br"
   # THE BRANCH IS JUDGED BEFORE THIS COMMAND SAYS IT IS ATTACHED. `loom attach`
   # used to build the worktree and stop there: a kept branch carrying
   # `backend/etc -> /etc` was checked out, the live link materialised on disk,
-  # and only the NEXT command refused — with the doorway already open. The disk
-  # leg (inside fence_reconcile) and the fence reconcile both run here, while
-  # the EXIT trap is still armed, so a refusal unwinds the worktree and the
-  # record this command just wrote.
+  # and only the NEXT command refused — with the doorway already open. The
+  # branch's own escaping links are now caught by the HISTORY leg above, before
+  # the checkout writes anything; this fence reconcile (with its disk leg) runs
+  # here too as defence in depth, while the EXIT trap is still armed, so any
+  # refusal unwinds the worktree and the record this command just wrote.
   fence_reconcile "$wt" "$FENCE_PROFILE"
   config_repin "$task" strict-new \
     || die "cannot pin this repository's git config for task $task"

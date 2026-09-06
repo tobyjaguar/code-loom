@@ -4515,6 +4515,26 @@ git -C "$CU" reset -q --hard
 "$LOOM" drop 0133-cu > /dev/null 2>&1 || true
 git branch -D agent/0133-cu > /dev/null 2>&1 || true
 
+# --- (cv) N6: attach judges the branch's OWN links BEFORE the checkout --------
+# `loom attach` checked the branch out (`git checkout`) and only THEN ran
+# fence_reconcile, so a kept branch's own escaping link was materialised on disk
+# for the window until the disk leg refused it. The HISTORY leg now runs before
+# the checkout: nothing is ever written to disk, and the refusal is the
+# history-leg one, which can only fire before the checkout.
+out="$("$LOOM" new 0134-cv 2>&1)"; rc=$?
+want_eq "(cv) setup: a task"                                       "$rc" "0"
+CV="$WTU/0134-cv"
+( cd "$CV" && ln -s /etc backend/cvetc && git add -A && git commit -qm "work on cv" )
+"$LOOM" drop 0134-cv --keep-branch > /dev/null 2>&1
+want_absent "(cv) setup: the worktree is gone and the branch is kept"  "$CV"
+out="$("$LOOM" attach 0134-cv 2>&1)"; rc=$?
+want_fail   "(cv) attach refuses a branch carrying its own escaping link"  "$rc"
+want_in     "(cv) ... naming it"                                  "$out" "backend/cvetc"
+want_in     "(cv) ... from the HISTORY leg, which runs before any checkout" "$out" "this branch's commits carry symlinks"
+want_absent "(cv) ... leaving no worktree"                        "$CV"
+want_absent "(cv) ... and no record"                              "$(state_of 0134-cv)"
+git branch -D agent/0134-cv > /dev/null 2>&1 || true
+
 # --- (j)/(t)/(cg) doctor lists the profiles, touches no network, and counts -
 # (cg): `local pname pprov prel role m mp bad` inside the [fence_profiles] loop
 # re-declared the function's own FAILURE COUNTER (`local ok=0 warn=0 bad=0`).
