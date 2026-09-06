@@ -80,8 +80,8 @@ claude                                               # first run: log in to your
                                                      # Claude subscription (browser)
 
 # 3. this repo + your target project
-git clone git@github.com:tobyjaguar/coding-harness.git
-cd coding-harness && ./install.sh /path/to/your/repo # creates ~/.config/loom/env
+git clone git@github.com:tobyjaguar/code-loom.git
+cd code-loom && ./install.sh /path/to/your/repo # creates ~/.config/loom/env
 $EDITOR ~/.config/loom/env                           # paste ZHIPU_API_KEY etc.
 
 # 4. verify everything — binaries, keys, hooks, live model IDs
@@ -272,7 +272,7 @@ those out; fix them by hand (the VS Code tasks and the `AGENTS.md` scout line
 are the two that actually invoke the command).
 
 ```sh
-cd /path/to/coding-harness && git pull
+cd /path/to/code-loom && git pull
 ./install.sh /path/to/your/repo
 cd /path/to/your/repo && loom doctor
 ```
