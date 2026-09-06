@@ -8,6 +8,11 @@ them and so they are not re-discovered from scratch. Gap 6 is round 7's,
 narrowed again in rounds 8 through 12: it is a residual by construction rather
 than a hole nobody got to.
 
+§ 11 is a different kind of entry: not a gap of its own, but the
+**reconciliation** of an INDEPENDENT external review (draft PR #7, pinned at
+`7da0cc4`) against this tip — every id it raised, what it is now, and which
+test case holds it.
+
 None of them is *caused* by fence profiles — but gap 4's consequence is
 **widened** by profiles, because a worktree under a profile holds paths the
 fence normally removes, and a grant that reaches another worktree therefore
@@ -34,9 +39,9 @@ new t5` fenced the new task with the agent's `zones.toml` (an emptied one means
 no fence at all) and `.`-sourced the agent's `.agents/loom.env` as shell, in
 your environment.
 
-**What closes it.** `bin/loom:159` (`ROOT="$(cd "$(dirname "$_common")" …)"`,
-from `git rev-parse --git-common-dir` at `bin/loom:155`) and `bin/loom:184`
-(`AGENTS_DIR="$ROOT/.agents"`); the guard's own reads are `bin/loom:3332`
+**What closes it.** `bin/loom:164` (`ROOT="$(cd "$(dirname "$_common")" …)"`,
+from `git rev-parse --git-common-dir` at `bin/loom:160`) and `bin/loom:189`
+(`AGENTS_DIR="$ROOT/.agents"`); the guard's own reads are `bin/loom:3701`
 onward. `$ROOT` is now the **main checkout** for every command:
 `git rev-parse --git-common-dir` answers `.git` from the main checkout and the
 absolute path of the main `.git` from a linked worktree, so its parent is the
@@ -47,7 +52,7 @@ profiles), `loom.env`, `.opencode/`, and `.agents/gate.sh`.
 One thing still comes from the invoking tree, and only one: **`loom guard`'s
 subject.** The commit is happening in that worktree, so the branch, the staged
 file list and the tree the reconciler inspects are read from `$INVOKED_ROOT`
-(`bin/loom:151`)
+(`bin/loom:156`)
 while the zones they are judged by come from `$ROOT`. `loom` says so in one line
 whenever the two differ. `tests/fence-profiles.sh` (av) asserts both halves:
 `loom new` from inside a worktree with an emptied `zones.toml` still applies the
@@ -82,7 +87,7 @@ own. That is not worth plugging: the entire hook is dominated by `git commit
 
 ## 2. `loom plan` runs the architect unfenced, in your own tree
 
-**Where.** `bin/loom:5386`, in `cmd_plan` (`bin/loom:5359`):
+**Where.** `bin/loom:5965`, in `cmd_plan` (`bin/loom:5938`):
 `run_role architect "$ROOT" "$prompt"` (and the
 interactive leg, `claude --append-system-prompt … "$prompt"`, likewise in
 `$ROOT`). The architect's chain at every tier ends in cheap third-party
@@ -104,7 +109,7 @@ say so out loud.
 
 ## 3. `.agents/loom.env` is sourced as shell
 
-**Where.** `bin/loom:280`:
+**Where.** `bin/loom:285`:
 
 ```sh
 if [ -f "$ROOT/.agents/loom.env" ]; then set -a; . "$ROOT/.agents/loom.env"; set +a; fi
@@ -262,7 +267,7 @@ that one form or the README changes with it.
 used to read "granted for the whole worktree root". It is not that any more;
 what is left is a confirmation.
 
-**Where.** `bin/loom:2378`, in `run_headless` (`bin/loom:2273`), the opencode leg:
+**Where.** `bin/loom:2487`, in `run_headless` (`bin/loom:2382`), the opencode leg:
 
 ```sh
 perm="$(printf '{"external_directory":{"%s/*":"allow","%s/**":"allow"}}' "$wd" "$wd")"
@@ -332,7 +337,7 @@ OPENCODE_CONFIG=$ROOT/.opencode/opencode.json     # (and OPENCODE_CONFIG_DIR)
 OPENCODE_DISABLE_PROJECT_CONFIG=1
 ```
 
-`run_headless`'s opencode leg (`bin/loom:2411`) sets the **disable
+`run_headless`'s opencode leg (`bin/loom:2520`) sets the **disable
 unconditionally**, on every opencode invocation — implementer, reviewer, scout
 and architect alike — and names the operator's config only when one exists.
 That is a round-4 correction: the disable used to be conditional on
@@ -390,16 +395,16 @@ baseline no longer moves silently), and a residual by
 construction.** This one cannot be
 closed from outside git; what follows is the boundary, drawn honestly.
 
-**Where.** `bin/loom:447` (the `GIT_CONFIG_PARAMETERS` export) and
-`bin/loom:458` (`GIT_PAGER=cat`); `bin/loom:807` onward (the task pin:
+**Where.** `bin/loom:464` (the `GIT_CONFIG_PARAMETERS` export) and
+`bin/loom:476` (`GIT_PAGER=cat`); `bin/loom:879` onward (the task pin:
 `config_sidecar`, `config_py`, `config_snapshot`, `config_wt`,
-`config_summary`, `config_programs` at `bin/loom:1542`,
-`require_recorded_config`); `bin/loom:1653` onward (the REPOSITORY baseline:
+`config_summary`, `config_programs` at `bin/loom:1588`,
+`require_recorded_config`); `bin/loom:1729` onward (the REPOSITORY baseline:
 `repo_config_file`, `repo_config_read`, `repo_config_write`,
-`repo_config_repin`, and `require_recorded_config_repo` at `bin/loom:1863`),
-read from `scout_root` (`bin/loom:5453`) and `cmd_plan`, written by
-`cmd_pin_config` (`bin/loom:5255`); `scout_mirror_config_check`
-(`bin/loom:5413`) for the one scope neither pin can cover; and the
+`repo_config_repin`, and `require_recorded_config_repo` at `bin/loom:1939`),
+read from `scout_root` (`bin/loom:6032`) and `cmd_plan`, written by
+`cmd_pin_config` (`bin/loom:5833`); `scout_mirror_config_check`
+(`bin/loom:5992`) for the one scope neither pin can cover; and the
 `--no-ext-diff` / `--upload-pack=` / `--receive-pack=` spelled out at the diff,
 fetch and push call sites.
 
@@ -691,7 +696,7 @@ narrative and the three checks live in ARCHITECTURE.md § 5 ("A worktree is
 judged only once it is proved to be ours"); this entry exists so that the gap
 list is the list, and so the trap is written down where the other traps are.
 
-**Where.** `require_wt_is_ours` (`bin/loom:2108`), called from
+**Where.** `require_wt_is_ours` (`bin/loom:2216`), called from
 `require_wt_on_branch` (which covers `require_worktree`, `loom run` and
 `loom loop`), from `cmd_drop` before `git worktree remove`, and from
 `scout_root` for the shared mirror.
@@ -736,10 +741,10 @@ what that directory is. Cleaning it up is the operator's, by hand.
 generalises: it is the only directory in this system that loom writes to on the
 agent's side of the fence.
 
-**Where.** `reviews_dir` (`bin/loom:3482`), the write sites in `cmd_run`
+**Where.** `reviews_dir` (`bin/loom:3851`), the write sites in `cmd_run`
 (gate log), `cmd_check` (patch + review), `cmd_diff` (patch) and `cmd_loop`
 (the review text it appends to the task spec), the `--add-dir` sandbox root in
-`run_headless` (`bin/loom:2273`), and the pathspec in `wt_dirty`.
+`run_headless` (`bin/loom:2382`), and the pathspec in `wt_dirty`.
 
 **What it was.** `reviews_dir` was `mkdir -p "$wt/.agents/reviews"` and nothing
 else, and every caller then spelled the path out again. `mkdir -p` on a path
@@ -852,10 +857,10 @@ is gap 6's residual, and it is unchanged.
 asking the same question one level lower.
 
 **Where.** `place_file`, `resolve_under_wt`, `probe_agent_file`, `link_count`
-and `reviews_entries_plain` (`bin/loom:3530`), the write sites in `cmd_run`
+and `reviews_entries_plain` (`bin/loom:4106`), the write sites in `cmd_run`
 (the gate log, and the `-blocked.md` probe), `cmd_check` (patch + review),
 `cmd_diff` (patch) and `cmd_loop` (the append to `.agents/tasks/<task>.md`),
-the artifact copies at `state_artifact` (`bin/loom:1944`), and the pathspec in
+the artifact copies at `state_artifact` (`bin/loom:2020`), and the pathspec in
 `wt_dirty`.
 
 **What it was.** Gap 8 resolved the DIRECTORY before every write and had each
@@ -925,8 +930,8 @@ cost one `ln -s`.
 the shape recurs: loom keeps directories of its own beside the task worktrees
 under `$LOOM_WORKTREES`, and a task id is a directory name there.
 
-**Where.** `state_file` (`bin/loom:537`), asked by `cmd_new` before anything is
-created (`bin/loom:4180`).
+**Where.** `state_file` (`bin/loom:605`), asked by `cmd_new` before anything is
+created (`bin/loom:4590`).
 
 **What it was.** `_scout` is the shared scout mirror — one directory, reset,
 `clean -xdff`'d and re-fenced on every `loom scout`, deliberately under the
@@ -945,3 +950,64 @@ own directory would collide with.
 
 **The residual.** None worth the word: an operator who wants a task called
 `_scout` renames it.
+
+---
+
+## 11. External review (PR #7 @ `7da0cc4`) — reconciliation
+
+An independent review of `feat/fence-profiles` (three reviewers, three
+verifiers, one delta pass; throwaway repos, stubbed `claude`/`codex`/
+`opencode`/`curl`, scratch `XDG_CONFIG_HOME`; no model or network call) was
+opened as a draft PR against `tobyjaguar/coding-harness`, pinned at `7da0cc4`.
+Its Status table is reproduced here in full, with what each id is at THIS tip
+— round 16 — and the test letter that holds it. "Round N" is the fix round in
+this branch's history; a letter in brackets is a case in
+`tests/fence-profiles.sh`.
+
+The three blockers it named — `refs/replace`, root verification at file scope,
+and a widened `[fence]` stranding a worktree — are all closed here. The one
+thing it asks for that is deliberately NOT closed is P1(e), which is a claim
+rather than a bug: see the row, and the README sentence it is now stated in.
+
+| id | the review's verdict on `7da0cc4` | at this tip |
+|---|---|---|
+| P1 (a) `update-ref` on trunk refs | RESOLVED | closed before this round — the base is a literal OID in the operator record |
+| P1 (b) `refs/replace` blinds every diff | **OPEN — blocker**, reproduced to origin | **CLOSED, round 16 (cc)** — `core.useReplaceRefs=false` + `GIT_NO_REPLACE_OBJECTS=1` on every git loom spawns, and `require_no_replace_refs` refuses while any such ref exists (check, diff, land, run, loop, rebase, new) |
+| P1 (c) — | not raised separately | — |
+| P1 (d) remote swap | RESOLVED (`require_recorded_origin`) | closed, unchanged |
+| P1 (e) the record file is writable by an unsandboxed role | OPEN — "docs honest below the fold, headline false" | **documented residual, not a defect.** The record is 0600 outside every repo and `require_sane_record` is a shape check; an agent running as the operator with no OS sandbox can write `$HOME` (gap 3) and therefore this file. There is no same-uid-proof fix — an HMAC key is readable by the same uid. What round 16 changed is the CLAIM: "operator integrity, not tamper-proofing" is now in the README paragraph that states the base guarantee, not only in the section below it |
+| P2a gate ran from the worktree | RESOLVED | closed, unchanged — the gate is the operator's copy |
+| P2b provider keys in the gate's environment | OPEN — 56 vars, `ZHIPU_API_KEY` among them | **CLOSED, round 16 (ce)** — one `run_gate` for both sites, `env -u` for every exported name matching `*_API_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD` or a provider prefix; never `env -i`. KNOWN-GAPS 3 now says what the gate is |
+| P2c `.agents/gate.sh` edit auto-committed | PARTIAL — no hook ⇒ committed, `check` reviews it, only `land` refuses | **CLOSED, round 16 (cf)** — `cmd_run` applies the guard's rule itself between `git add -A` and the commit; `check`, `diff` and each `loop` round run `hand_reconcile_history` |
+| P3 opencode project config | RESOLVED | closed, unchanged |
+| C1 root verification at file scope | **OPEN — blocker (regression)**: `help`, `zone`, `tier`, `guard` and the operator's own `git commit` all die | **CLOSED, round 16 (cd)** — normalisation stays at file scope, the verdict moved into `require_roots`; `doctor` reports a bad root as one FAIL and finishes |
+| C2 unpushed trunk commits | RESOLVED | closed, unchanged |
+| C3 widened fence strands worktrees | **OPEN — blocker (regression)** | **CLOSED, round 16 (ci)** — operator-side discriminator: `[fence]` now vs `git show <recorded base>:.agents/zones.toml`. Added-since-the-base ⇒ re-fence + one note; already-there ⇒ dies as before |
+| C4 arg-position `security_base` | RESOLVED | closed, unchanged |
+| C5 `review_base` clamp / PR #5 dead code | RESOLVED | closed, unchanged |
+| C6 doctor vs `LOOM_BASE_REF` | MOOT — variable gone | moot |
+| C7 no way back after `drop --keep-branch` | OPEN — loom recommends the step that makes the task unreachable | **CLOSED, round 16 (cj)** — `loom attach <task>`: fresh worktree, fresh record, base = merge-base with the trunk, `reviewed=` empty. The `land --pr` hint names it |
+| C8 | nit, unchanged | open, nit |
+| C9 `writes_role` `build` | not a defect | not a defect |
+| C10 | nit, unchanged | open, nit |
+| N1, N2, N4, N5 landing hazards | MOOT — the branch merged `main` itself, cleanly | moot |
+| N3 `cmd_doctor`'s `bad` shadow | OPEN, worse — `unbound variable` with no summary, or a model name in the failures slot and exit 2 with zero real failures | **CLOSED, round 16 (cg)** — the loop variable is `chainbad`; the summary's shape and the exit code are asserted together |
+| P4 committed symlink at an assist path | OPEN — `create mode 120000`, every future worktree reads `core/` through it | **CLOSED, round 16 (ch)** — lexical escape test on mode-120000 entries, in the worktree's index (`fence_reconcile`) and in the tree at the pinned tip (`check`/`diff`/`loop`/`land`) |
+| P6 docs overclaim | PARTIAL — confinement table honest, base sentences false | **CLOSED, round 16** — README's two base sentences carry the `refs/replace` caveat and the "operator integrity, not tamper-proofing" statement |
+| P7 | nit, unchanged | open, nit |
+| T1/T2 suite portability (macOS) | OPEN — 13 `$TMPDIR` + 4 `timeout` failures | **CLOSED, round 16** — `$TMP` is resolved with `pwd -P`; `timeout` is shimmed when absent. No change on Linux |
+| T5 `loop` coverage | improved — 1 invocation | open, nit |
+| T6, T8, T10, T11 | nit, unchanged | open, nit |
+| T12 `TASK_TEMPLATE` "DOCUMENTATION ONLY" | OPEN — a declaration turns `loom new` into a refusal | **CLOSED, round 16** — the template says what the key does |
+| T13–T16 landing hazards | MOOT | moot |
+
+**What is open, in one place.** P1(e) as a documented residual (above);
+C8, C10, P7, T5, T6, T8, T10 and T11 as nits the review itself left as nits.
+Everything else on that table is closed or moot.
+
+**The honest limits that did not change.** A diff between two endpoints still
+says nothing about a fenced path added and removed again between two `loom`
+commands, and nothing at all about what a model *read* — that is gap 4's
+exfiltration class, and no check of this shape reaches it. The gate is still
+your build running as you (gap 3). And `.agents/loom.env` is still `.`-sourced
+shell from a tracked path.

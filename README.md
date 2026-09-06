@@ -307,6 +307,15 @@ part of the branch that still changes your runs:
   them could collapse the range a fence check looked at to nothing. That also
   fixes a false refusal in the other direction: your own unpushed commits on
   `main` used to count as the branch's.
+  Be exact about what this is worth, in the same breath as the claim: it is
+  **operator integrity, not tamper-proofing.** An unsandboxed agent runs as you
+  and can write `$HOME` — `docs/KNOWN-GAPS.md` § 3 concedes that capability —
+  and this file is in `$HOME`. There is no same-uid-proof version of it: an
+  HMAC key would be readable by the same uid. What the move removes is the
+  whole class of "one git command inside the worktree rewrites the input to its
+  own security check", which is a different and much cheaper attack. It does
+  not make the record unforgeable, and nothing here should be read as saying it
+  does.
   The record is outside the repository; the OBJECTS it names are not, and that
   is a separate lever — `refs/replace/<oid>` redirects the object an OID names
   for every git command, and those refs live in the shared `.git` too. So
