@@ -29,6 +29,11 @@ want_not_in() { # want_not_in <label> <haystack> <needle>
 }
 want_file()   { if [ -e "$2" ]; then ok "$1"; else bad "$1 — missing: $2"; fi; }
 want_absent() { if [ -e "$2" ]; then bad "$1 — present but should not be: $2"; else ok "$1"; fi; }
+# `[ -e ]` is FALSE for a symlink whose target is missing, so a fenced-out link
+# needs the -L arm as well: the question is whether the ENTRY is there.
+want_gone() { # want_gone <label> <path>
+  if [ -L "$2" ] || [ -e "$2" ]; then bad "$1 — present but should not be: $2"; else ok "$1"; fi
+}
 want_fail()   { if [ "$2" -ne 0 ]; then ok "$1"; else bad "$1 — the command exited 0"; fi; }
 sedi() { if sed --version >/dev/null 2>&1; then sed -i -e "$1" "$2"; else sed -i '' -e "$1" "$2"; fi; }
 want_ne()     { if [ "$2" != "$3" ]; then ok "$1"; else bad "$1 — both are '$2'"; fi; }
@@ -4053,6 +4058,50 @@ want_not_in "(ck) ... and not the trunk's own"                      "$out" "k5d1
 "$LOOM" drop 0116-ck5 > /dev/null 2>&1 || true
 git rm -q -r --cached k5d1 > /dev/null; rm -rf k5d1
 git commit -qm "(ck) and the trunk's link taken back out"
+
+# --- (cl) an escaping symlink the TRUNK already carries ---------------------
+# `ln -s /etc/hostname backend/hostname`, committed on the trunk before this
+# branch existed: `loom new` succeeded and then run/check/diff/land ALL died
+# ("has tracked symlinks that point OUTSIDE it … Remove them, or start clean:
+# loom drop <task-id>") — and `loom drop` + `loom new` provably did not help,
+# because the link is not the branch's. The repository was unusable and `doctor`
+# said nothing. The doorway is real whoever opened it, but loom cannot rewrite
+# the consumer's trunk: so what the AGENT added is refused, and what the trunk
+# carries is FENCED OUT of every worktree loom builds and warned about instead.
+ln -s /etc/hostname backend/hostname
+git add backend/hostname
+git commit -qm "(cl) a link the trunk itself carries, out of the tree"
+out="$("$LOOM" new 0117-cl 2>&1)"; rc=$?
+want_eq   "(cl) loom new succeeds on a trunk that carries one"      "$rc" "0"
+want_in   "(cl) ... and WARNs, naming it"                           "$out" "backend/hostname"
+want_in   "(cl) ... saying every worktree would read through it"    "$out" "would read through them"
+CL="$WTU/0117-cl"
+want_gone "(cl) ... and it is absent from the agent's worktree"     "$CL/backend/hostname"
+want_file "(cl) ... while the working surface is still there"       "$CL/backend/main.go"
+out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 "$LOOM" run 0117-cl 2>&1)"; rc=$?
+want_eq   "(cl) loom run proceeds — this used to be a dead stop"    "$rc" "0"
+want_file "(cl) ... with the implementer's edit committed"          "$CL/backend/from-implementer.txt"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0117-cl 2>&1)"; rc=$?
+want_eq   "(cl) loom check proceeds too"                            "$rc" "0"
+out="$("$LOOM" land 0117-cl 2>&1)"; rc=$?
+want_eq   "(cl) and loom land lands it"                             "$rc" "0"
+out="$(timeout 180 "$LOOM" doctor 2>&1)"
+want_in   "(cl) doctor warns about the trunk's link"                "$out" "trunk symlink points OUTSIDE the tree: backend/hostname"
+# The agent's OWN link, on the same trunk, is still refused — and the refusal no
+# longer offers `loom drop`, which was never the fix for either case.
+out="$("$LOOM" new 0118-cl2 2>&1)"; rc=$?
+want_eq "(cl) setup: a second task on the same trunk"               "$rc" "0"
+CL2="$WTU/0118-cl2"
+( cd "$CL2" && ln -s /etc backend/etc && git add -A && git commit -qm "work on cl2" )
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0118-cl2 2>&1)"; rc=$?
+want_fail   "(cl) a link the AGENT added is still refused"          "$rc"
+want_in     "(cl) ... naming it"                                    "$out" "backend/etc"
+want_in     "(cl) ... as the branch's own"                          "$out" "on this branch"
+want_not_in "(cl) ... with no 'loom drop' remedy"                   "$out" "loom drop"
+want_not_in "(cl) ... and the trunk's link is not named"            "$out" "backend/hostname"
+"$LOOM" drop 0118-cl2 > /dev/null 2>&1 || true
+git rm -q --cached backend/hostname > /dev/null; rm -f backend/hostname
+git commit -qm "(cl) and the trunk's link removed"
 
 # --- (j)/(t)/(cg) doctor lists the profiles, touches no network, and counts -
 # (cg): `local pname pprov prel role m mp bad` inside the [fence_profiles] loop

@@ -3224,10 +3224,20 @@ via git plumbing."
 # the flag as a literal pattern), so set the mode with `init --no-cone`
 # (>= 2.25, worktree-scoped config) and let `set` inherit it.
 fence_apply() { # fence_apply <worktree>
-  local wt="$1" g
+  local wt="$1" g lp esc
   local -a pats=()
   load_fence
+  # The trunk's own escaping symlinks (round 17, B2): not this branch's doing,
+  # so not a refusal — but a doorway all the same, and one loom CAN close in the
+  # tree it builds. Literal paths, anchored with a leading '/' and with the
+  # gitignore metacharacters escaped, appended AFTER the profile-filtered
+  # patterns so that no profile can release them (last match wins).
+  link_fence_load "$ROOT" "${FENCE_BASE:-}"
   while IFS= read -r g; do [ -n "$g" ] && pats+=("!$g"); done <<< "$FENCE_PATTERNS"
+  for lp in ${LINK_FENCE[0]+"${LINK_FENCE[@]}"}; do
+    esc="${lp//\\/\\\\}"; esc="${esc//\*/\\*}"; esc="${esc//\?/\\?}"; esc="${esc//[/\\[}"
+    pats+=("!/$esc")
+  done
   if [ "${#pats[@]}" -eq 0 ]; then
     # Nothing left to fence. With a profile active that can mean it released
     # every pattern, and a worktree built before the profile may still carry
@@ -3246,7 +3256,18 @@ fence_apply() { # fence_apply <worktree>
 # an UNTRACKED file at all. Check the tree — the real one, on disk — not the
 # config and not the index.
 fence_verify() { # fence_verify <worktree>
-  local wt="$1" left
+  local wt="$1" left lp still=""
+  # The inherited-symlink exclusions first, for the same reason the fence
+  # patterns are re-checked at all: applying a rule is not proof it took.
+  link_fence_load "$ROOT" "${FENCE_BASE:-}"
+  for lp in ${LINK_FENCE[0]+"${LINK_FENCE[@]}"}; do
+    if [ -L "$wt/$lp" ] || [ -e "$wt/$lp" ]; then still="$still
+  $lp"; fi
+  done
+  [ -z "$still" ] || die "symlinks the trunk carries out of the tree are STILL present in $wt:$still
+loom removes them from every worktree it builds, because whatever they name is
+readable through them and the fence cannot close a doorway. Delete them here, or
+better, remove them from your trunk."
   left="$(zones_py fence-present "$wt")" || die "cannot verify the fence in $wt"
   [ -z "$left" ] && return 0
   die "fenced paths are STILL present in $wt:
@@ -3262,8 +3283,10 @@ delete the untracked files, or start clean with: loom drop <task-id>"
 # otherwise hand the fenced paths straight to the implementer.
 fence_enforce() { # fence_enforce <worktree>
   # Runs with a profile active even when the effective fence is empty: the
-  # worktree may still be carrying the sparse rules of the full fence.
-  has_fence || [ -n "$FENCE_PROFILE" ] || return 0
+  # worktree may still be carrying the sparse rules of the full fence — and with
+  # an inherited escaping symlink to exclude even when there is no [fence] at all.
+  link_fence_load "$ROOT" "${FENCE_BASE:-}"
+  has_fence || [ -n "$FENCE_PROFILE" ] || [ "${#LINK_FENCE[@]}" -gt 0 ] || return 0
   fence_apply "$1"
   fence_verify "$1"
 }
@@ -3299,13 +3322,27 @@ fence_enforce() { # fence_enforce <worktree>
 # substituted and followed — including a PREFIX of the walked path, so `a/b/c`
 # where `a/b` is a link goes through it. A chain more than 40 hops deep, or one
 # that closes on itself, is "unresolvable" and is REFUSED rather than guessed at.
-links_py() { # links_py judge <dir> <spec>
+#
+# WHAT IS JUDGED is a second question, and it is not the same one (round 17).
+# A trunk that already carries `backend/hostname -> /etc/hostname` — committed
+# before the branch existed — is not the branch's doing, and loom cannot rewrite
+# the consumer's trunk: refusing every command made such a repository
+# permanently unusable, with `loom drop` + `loom new` provably no help. So an
+# entry whose path AND target match the task's recorded base is INHERITED. It is
+# not a refusal; it is FENCED OUT of the worktree instead (fence_apply, below),
+# so the doorway is never materialised, and the operator is warned at `loom new`,
+# `loom attach` and `loom doctor`. It stays in the resolution MAP either way, so
+# a chain THROUGH an inherited link is caught like any other. With no base, or
+# one that cannot be read, nothing is inherited and every entry is judged —
+# which is the refusing answer.
+links_py() { # links_py judge <dir> <spec> [<base-spec>] | escaping <dir> <spec>
   python3 - "$@" << 'PY'
 import os, subprocess, sys
 
 mode = sys.argv[1]
 d    = sys.argv[2]
 spec = sys.argv[3]
+base = sys.argv[4] if len(sys.argv) > 4 else ""
 
 def die(msg):
     sys.stderr.write("loom: %s\n" % msg)
@@ -3317,15 +3354,19 @@ def dec(b):
 def emit(s):
     sys.stdout.buffer.write(s.encode("utf-8", "surrogateescape"))
 
-def link_map(what):
+def link_map(what, soft=False):
     """{path: target} for every mode-120000 entry of <what>. ':index' is the
-    index of <d>; anything else is a rev, read as a tree."""
+    index of <d>; anything else is a rev, read as a tree. `soft` is for the
+    BASE leg: a base that cannot be read means nothing is inherited, which
+    judges everything — the closed answer, not a dead stop."""
     if what == ":index":
         cmd, shafield = ["git", "-C", d, "ls-files", "-s", "-z"], 1
     else:
         cmd, shafield = ["git", "-C", d, "ls-tree", "-r", "-z", what], 2
     p = subprocess.run(cmd, stdout=subprocess.PIPE)
     if p.returncode != 0:
+        if soft:
+            return {}
         die("cannot list the symlinks of '%s' in %s — refusing to guess what "
             "they point at" % (what, d))
     shas, paths = [], []
@@ -3348,6 +3389,8 @@ def link_map(what):
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     data, _ = q.communicate(b"\n".join(shas) + b"\n")
     if q.returncode != 0:
+        if soft:
+            return {}
         die("cannot read the symlink targets of '%s' in %s" % (what, d))
     out, pos = {}, 0
     for path in paths:
@@ -3419,13 +3462,20 @@ def resolve(path, target, m):
 
 links = link_map(spec)
 if mode == "judge":
+    inherited = link_map(base, soft=True) if base else {}
     for p in sorted(links):
         t = links[p]
+        if p in inherited and inherited[p] == t:
+            continue                   # the trunk's doing, not this branch's
         kind, where = resolve(p, t, links)
         if kind == "escape":
             emit("\n  %s -> %s  (resolves to %s, outside the tree)" % (p, t, where))
         elif kind == "unresolvable":
             emit("\n  %s -> %s  (unresolvable link chain: %s)" % (p, t, where))
+elif mode == "escaping":
+    for p in sorted(links):
+        if resolve(p, links[p], links)[0] != "inside":
+            emit(p + "\0")
 else:
     die("internal error: unknown links mode '%s'" % mode)
 PY
@@ -3434,22 +3484,61 @@ PY
 # The tracked symlinks in a worktree's INDEX that leave it. The index, not the
 # disk: under a fence the entry may not be checked out, and an untracked link an
 # agent made for itself is not the thing that survives into the next worktree —
-# a COMMITTED one is.
+# a COMMITTED one is. <base> is the task's recorded base; without it nothing
+# counts as inherited.
 #
 # The die is the CALLER's, on the exit status, and that is not a style choice:
 # this is read as `x="$(wt_escaping_links …)"`, where a `die` inside the function
 # ends the command substitution's subshell and hands the caller an empty answer —
 # "no escaping links", on exactly the input an agent controls.
-wt_escaping_links() { # wt_escaping_links <worktree>  -> offending lines
-  links_py judge "$1" ":index"
+wt_escaping_links() { # wt_escaping_links <worktree> [<base>]  -> offending lines
+  links_py judge "$1" ":index" "${2:-}"
 }
 
 # The same question asked of a COMMIT's tree, for the history checks: a worktree
 # can be re-fenced or the link removed from disk, and the commit still carries
 # mode 120000 into the review patch, the merge and every future worktree built
 # from it.
-tree_escaping_links() { # tree_escaping_links <dir> <rev>  -> offending lines
-  links_py judge "$1" "$2"
+tree_escaping_links() { # tree_escaping_links <dir> <rev> [<base>] -> offending lines
+  links_py judge "$1" "$2" "${3:-}"
+}
+
+# The escaping symlinks a TRUNK commit already carries, as NUL-separated paths.
+# Judged against that commit's own map with no base, so "escaping" here means
+# escaping on its own terms. These are the ones loom fences out rather than
+# refuses; see fence_apply.
+LINK_FENCE=()
+LINK_FENCE_SEEN=""      # the base $LINK_FENCE was computed for; "" = not yet
+link_fence_load() { # link_fence_load <dir> <base>
+  local d="$1" base="$2" p out
+  if [ -z "$base" ]; then LINK_FENCE=(); LINK_FENCE_SEEN=""; return 0; fi
+  [ "$LINK_FENCE_SEEN" = "$base" ] && return 0
+  LINK_FENCE=()
+  out="$(mktemp "${TMPDIR:-/tmp}/loom-linkfence.XXXXXX")" \
+    || die "cannot create a temporary file for the inherited-symlink scan"
+  tmp_track "$out"
+  links_py escaping "$d" "$base" > "$out" \
+    || die "cannot read the symlinks at this task's base commit — refusing to guess"
+  while IFS= read -r -d '' p; do
+    [ -n "$p" ] && LINK_FENCE+=("$p")
+  done < "$out"
+  rm -f "$out"
+  LINK_FENCE_SEEN="$base"
+}
+
+# One WARN, said where a worktree is BUILT (`loom new`, `loom attach`) and again
+# by `loom doctor`: the doorway is real whoever opened it, loom closes it in the
+# tree it builds, and only the operator can close it at the source.
+link_inherited_warn() { # link_inherited_warn <dir> <base>
+  link_fence_load "$1" "$2"
+  [ "${#LINK_FENCE[@]}" -gt 0 ] || return 0
+  local p
+  echo "loom: WARN: this trunk carries tracked symlinks that point OUTSIDE the tree:" >&2
+  for p in ${LINK_FENCE[0]+"${LINK_FENCE[@]}"}; do
+    echo "loom: WARN:   $p" >&2
+  done
+  echo "loom: WARN: every worktree built from this trunk would read through them;" >&2
+  echo "loom: WARN: loom fences them out of the ones it builds. Remove them from the trunk." >&2
 }
 
 link_refuse_history() { # link_refuse_history <offending-lines>
@@ -3459,14 +3548,14 @@ branch checks it out, and whatever it names is then readable through it — the
 fence removes PATHS, and it cannot remove a doorway to one. Targets are resolved
 through this tree's OWN links and never followed on disk, so this is what the
 links say, not what happens to be there today.
-Replace them with links that stay inside the tree, or throw the branch away:
-  loom drop <task-id>"
+These are the branch's own — the trunk does not carry them, or they would not be
+named here. Rewrite the commits that added them, and re-run."
 }
 
-link_reconcile_history() { # link_reconcile_history <dir> <rev>
+link_reconcile_history() { # link_reconcile_history <dir> <base> <rev>
   local bad
-  bad="$(tree_escaping_links "$1" "$2")" \
-    || die "cannot read the symlinks in the tree of $2 — refusing to guess what they point at"
+  bad="$(tree_escaping_links "$1" "$3" "$2")" \
+    || die "cannot read the symlinks in the tree of $3 — refusing to guess what they point at"
   [ -n "$bad" ] || return 0
   link_refuse_history "$bad"
 }
@@ -3520,14 +3609,17 @@ fence_reconcile() { # fence_reconcile <worktree> <asserted-profile-or-empty>
   # FIRST, because it is the one thing re-fencing cannot fix: a tracked symlink
   # pointing out of the tree is a doorway the sparse rules do not close, and it
   # is in the index of every worktree built from the branch that carries it.
-  links="$(wt_escaping_links "$wt")" \
+  links="$(wt_escaping_links "$wt" "${FENCE_BASE:-}")" \
     || die "cannot read the tracked symlinks of $wt — refusing to guess what they point at"
-  [ -z "$links" ] || die "worktree $wt has tracked symlinks that point OUTSIDE it:$links
+  [ -z "$links" ] || die "worktree $wt has tracked symlinks that point OUTSIDE it, added or
+changed on this branch:$links
 The fence removes PATHS from a worktree; it cannot remove a doorway to one, and
 this tree has one — whatever those links name is readable here whether it was
-fenced or not. Targets are read as text and never followed, so this is what the
-link says, not what happens to be there today.
-Remove them, or start clean:  loom drop <task-id>"
+fenced or not. Targets are resolved through this tree's OWN links and never
+followed on disk, so this is what the links say, not what happens to be there
+today.
+These are the branch's own — a link the trunk already carried is fenced out
+instead, not refused. Remove them, or point them back inside the tree."
   present="$(zones_py fence-present-full "$wt")" \
     || die "cannot tell which fenced paths are present in $wt — refusing to guess"
 
@@ -4759,6 +4851,12 @@ fenced paths into this worktree. Confirm it on the command line:
   # `loom rebase` refuses to replay onto it without checking what came with it.
   local newbase; newbase="$(git rev-parse HEAD)" \
     || die "cannot resolve HEAD in $ROOT — there is no branch point to record"
+  # The base the SYMLINK rules are judged against, set before anything is built:
+  # `fence_apply` reads it to exclude the escaping links the trunk already
+  # carries, and the operator is told about them once, here, where it is their
+  # own file that is the problem.
+  FENCE_BASE="$newbase"
+  link_inherited_warn "$ROOT" "$newbase"
   # The remote as it is right now — the URL AND the refspec — so that a later
   # `loom rebase` / `loom land --pr` can tell that it still is. Both come out of
   # .git/config, which every linked worktree can write, and a config value can
@@ -4807,7 +4905,10 @@ fenced paths into this worktree. Confirm it on the command line:
             "config=$newconfig" "reviewed="
   config_write_sidecar "$task" "$newcfgdump"
   rm -f "$newcfgdump"
-  if has_fence; then
+  # `has_fence` is not the only reason to build this tree through the sparse
+  # rules: an escaping symlink the trunk carries is excluded the same way, and a
+  # repository with no [fence] at all can still have one.
+  if has_fence || [ "${#LINK_FENCE[@]}" -gt 0 ]; then
     fence_apply "$wt"
     git -C "$wt" checkout >&2
     fence_verify "$wt"
@@ -4921,6 +5022,10 @@ fenced paths into this worktree. Confirm it on the command line:
 measure this branch's work from. That branch does not share history with your
 checkout — inspect it, do not attach it:  git log --oneline $br"
   [ -n "$newbase" ] || die "cannot find a merge-base between $br and your HEAD"
+  # As in `loom new`: the base the symlink rules are judged against, and the one
+  # WARN about the links the trunk itself carries.
+  FENCE_BASE="$newbase"
+  link_inherited_warn "$ROOT" "$newbase"
   local neworigin newfetch newpushurl
   neworigin="$(origin_url)"
   newfetch="$(origin_fetch)"
@@ -4952,7 +5057,10 @@ checkout — inspect it, do not attach it:  git log --oneline $br"
             "config=$newconfig" "reviewed="
   config_write_sidecar "$task" "$newcfgdump"
   rm -f "$newcfgdump"
-  if has_fence; then
+  # `has_fence` is not the only reason to build this tree through the sparse
+  # rules: an escaping symlink the trunk carries is excluded the same way, and a
+  # repository with no [fence] at all can still have one.
+  if has_fence || [ "${#LINK_FENCE[@]}" -gt 0 ]; then
     fence_apply "$wt"
     git -C "$wt" checkout >&2
     fence_verify "$wt"
@@ -5117,7 +5225,7 @@ cmd_check() {
   # ordinary diff — reviewed, approved, and refused only at the very end. A
   # reviewer is never handed a hand-zone diff as if it were authorised.
   hand_reconcile_history "$ROOT" "$base" "$PINNED_TIP"
-  link_reconcile_history "$ROOT" "$PINNED_TIP"
+  link_reconcile_history "$ROOT" "$base" "$PINNED_TIP"
   # BEFORE the patch, for the same reason the history check is: writing it runs
   # `git diff` in this repository, and a `diff.<d>.textconv` or a
   # `filter.<d>.clean` named by a config planted since `loom new` is a program
@@ -5265,7 +5373,7 @@ cmd_loop() {
     base="$(security_base "$task")"
     fence_reconcile_history "$task" "$base" "$FENCE_PROFILE"
     hand_reconcile_history "$ROOT" "$base" "$PINNED_TIP"
-    link_reconcile_history "$ROOT" "$PINNED_TIP"
+    link_reconcile_history "$ROOT" "$base" "$PINNED_TIP"
     cmd_check "$task" ${passthru[0]+"${passthru[@]}"}
     verdict="$(grep '^VERDICT:' "$review" 2>/dev/null | tail -1 || true)"
     # No verdict line at all means a truncated or derailed review, not a
@@ -5334,7 +5442,7 @@ cmd_diff() {
   base="$(security_base "$task")"
   fence_reconcile_history "$task" "$base" "$FENCE_PROFILE"
   hand_reconcile_history "$ROOT" "$base" "$PINNED_TIP"   # same range, same reason
-  link_reconcile_history "$ROOT" "$PINNED_TIP"
+  link_reconcile_history "$ROOT" "$base" "$PINNED_TIP"
   require_recorded_config "$task" diff       # same reason as `loom check`
   # Same order and the same reason as `loom check`: the directory is resolved
   # before a byte of the patch is written, and the patch goes to what it
@@ -5426,7 +5534,7 @@ Commit it in the worktree, or discard it, then re-run:  loom check $task"
   base="$(security_base "$task")"
   fence_reconcile_history "$task" "$base" "$FENCE_PROFILE"
   hand_reconcile_history "$ROOT" "$base" "$PINNED_TIP"
-  link_reconcile_history "$ROOT" "$PINNED_TIP"
+  link_reconcile_history "$ROOT" "$base" "$PINNED_TIP"
   # The tip a reviewer actually read. A branch that moved since — an extra
   # commit, an `update-ref` from a gate script, a force-push into the ref — is
   # not the thing that was reviewed, and `--force` does not skip this either.
@@ -6345,6 +6453,41 @@ cmd_doctor() {
       fail "zones.toml unreadable (agent/* commits are BLOCKED until this is fixed): ${perr#loom: }"
     fi
   else note "no zones.toml — everything defaults to assist"; fi
+  # TWO DEAD STOPS THAT WERE SILENT HERE. doctor is the machine's acceptance
+  # test, and both of these refuse every real command while saying nothing in
+  # the one report an operator reads before they start.
+  #
+  #   * a `refs/replace/*` ref redirects the OBJECT every check is cut from, so
+  #     `loom` refuses outright beside one (require_no_replace_refs). It lives
+  #     in the shared .git, which every agent worktree can write.
+  #   * a tracked symlink at HEAD that points out of the tree is a doorway the
+  #     fence cannot close. loom fences the trunk's own out of the worktrees it
+  #     builds (round 17, B2) rather than refusing — which makes saying so here
+  #     the ONLY place the operator is told their trunk carries one.
+  local rrefs rref
+  if rrefs="$(git -C "$ROOT" for-each-ref --format='%(refname) -> %(objectname)' refs/replace/ 2>/dev/null)"; then
+    if [ -n "$rrefs" ]; then
+      while IFS= read -r rref; do
+        [ -n "$rref" ] && fail "git REPLACEMENT ref: $rref — every loom command refuses beside one; inspect with 'git replace -l', remove with 'git replace -d <oid>'"
+      done <<< "$rrefs"
+    else
+      pass "no refs/replace/* (a replacement redirects the commit every check is cut from)"
+    fi
+  else
+    fail "cannot list refs/replace/* in $ROOT — loom will not run beside refs it cannot read"
+  fi
+  local dhead dl
+  dhead="$(git -C "$ROOT" rev-parse --verify --quiet HEAD 2>/dev/null || true)"
+  if [ -n "$dhead" ]; then
+    link_fence_load "$ROOT" "$dhead"
+    if [ "${#LINK_FENCE[@]}" -eq 0 ]; then
+      pass "no tracked symlink at HEAD points out of the tree"
+    else
+      for dl in ${LINK_FENCE[0]+"${LINK_FENCE[@]}"}; do
+        note "trunk symlink points OUTSIDE the tree: $dl — every worktree built from this trunk would read through it; loom fences it out of the ones it builds, but remove it here"
+      done
+    fi
+  fi
   # A hook written before the aw→loom rename calls `aw guard`, and its own
   # "not on PATH" branch exits 0 — so the hand-zone guard is silently disarmed
   # rather than broken. That has to read as a failure, not a warning.
