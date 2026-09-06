@@ -791,7 +791,10 @@ Semantics:
   through it in every worktree built from that branch, fence or no fence — the
   fence removes PATHS and cannot remove a doorway to one. So mode-120000 entries
   are checked in the worktree's INDEX (`fence_reconcile`, so on every command)
-  and in the tree at `$PINNED_TIP` (`check`, `diff`, `loop`, `rebase`, `land`).
+  and in the branch's HISTORY: `check`, `diff`, `loop` and `land` cut that at
+  `$PINNED_TIP`, while `rebase` cuts it from the REPLAYED branch tip against the
+  `new_base` it is about to record — because the replay is the history it is
+  judging, and the base decides what is inherited.
   Targets are read as TEXT and nothing is followed on disk — under a fence half
   the tree is not checked out, so `realpath` has nothing to resolve — but the
   text is resolved **within the tree's own link map**: every mode-120000 entry

@@ -3824,11 +3824,16 @@ want_fail   "(ch) loom check refuses a symlink out of the worktree" "$rc"
 want_in     "(ch) ... naming the path"                              "$out" "backend/allofit"
 want_in     "(ch) ... and saying it points outside"                 "$out" "OUTSIDE"
 want_absent "(ch) ... with no review patch written"                 "$CH/.agents/reviews/0103-ch.patch"
+# The trunk tip BEFORE the land, so "merged nothing" is the trunk being
+# untouched — not `merge-base --is-ancestor <branch> HEAD`, which reads "no" both
+# when nothing merged AND when land SUCCEEDED (land deletes the branch, so the
+# ref is gone and the ancestor test fails). (N8.)
+ch_head_before="$(git rev-parse HEAD)"
 out="$("$LOOM" land 0103-ch 2>&1)"; rc=$?
 want_fail   "(ch) loom land refuses it too"                         "$rc"
 want_in     "(ch) ... naming the path"                              "$out" "backend/allofit"
-want_eq     "(ch) ... and merged nothing" \
-            "$(git merge-base --is-ancestor refs/heads/agent/0103-ch HEAD 2>/dev/null && echo merged || echo no)" "no"
+want_eq     "(ch) ... and merged nothing — trunk tip unchanged" \
+            "$(git rev-parse HEAD)" "$ch_head_before"
 # The HISTORY leg on its own: drop the entry from the worktree's index, so the
 # disk scan has nothing to say, and the commit is still carrying it.
 git -C "$CH" rm -q --cached backend/allofit
@@ -4032,11 +4037,12 @@ want_fail   "(ck) loom check refuses the two-hop chain"             "$rc"
 want_in     "(ck) ... naming the link the agent added"              "$out" "backend/loot"
 want_in     "(ck) ... and where it RESOLVES, not just what it says" "$out" "../../repo/core"
 want_absent "(ck) ... with no review patch written"                 "$CK/.agents/reviews/0112-ck.patch"
+ck_head_before="$(git rev-parse HEAD)"   # trunk tip; "merged nothing" = unchanged (N8)
 out="$("$LOOM" land 0112-ck 2>&1)"; rc=$?
 want_fail   "(ck) loom land refuses it too"                         "$rc"
 want_in     "(ck) ... naming the path"                              "$out" "backend/loot"
-want_eq     "(ck) ... and merged nothing" \
-            "$(git merge-base --is-ancestor refs/heads/agent/0112-ck HEAD 2>/dev/null && echo merged || echo no)" "no"
+want_eq     "(ck) ... and merged nothing — trunk tip unchanged" \
+            "$(git rev-parse HEAD)" "$ck_head_before"
 "$LOOM" drop 0112-ck > /dev/null 2>&1 || true
 # The DISK leg on its own: staged, never committed, so only the index carries it.
 out="$("$LOOM" new 0113-ck2 2>&1)"; rc=$?
