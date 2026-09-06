@@ -204,7 +204,8 @@ for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p \
          0041-ar2 \
          0043-at 0044-at2 0045-at3 0046-au 0047-au2 0048-av 0049-av2 \
          0050-loom 0051-ax 0052-ax2 0053-au3 \
-         0054-az 0055-az2 0056-az3 0057-ba 0058-bb 0059-bc 0060-bd 0061-ba2 0062-bf; do mk_task "$t"; done
+         0054-az 0055-az2 0056-az3 0057-ba 0058-bb 0059-bc 0060-bd 0061-ba2 0062-bf \
+         0063-bh 0064-bi 0065-bj; do mk_task "$t"; done
 mk_task 0040-ar  codex
 mk_task 0042-as  codex
 mk_task 0005-f codex
@@ -1755,6 +1756,253 @@ want_ne "(bf) ... the branch that moved is NOT deleted"   "$(sha_of agent/0062-b
 want_in "(bf) ... and loom says why it kept it"           "$out" "moved after the review"
 want_in "(bf) ... naming both shas"                       "$out" "$bf_tip"
 git branch -D agent/0062-bf > /dev/null 2>&1 || true
+
+# ==========================================================================
+# ROUND-7 fixes. Every case below FAILS against the pre-fix bin/loom (7da0cc4).
+#
+# The theme: the things that are still WRITABLE from a worktree once the refs
+# and the record are locked down. `.git/config` is shared, and several of its
+# keys name a PROGRAM git runs — including where a push goes. And round 6's own
+# blanket `unset GIT_*` took away the temporary index git hands a pre-commit
+# hook, which silently disarmed the hand-zone guard for `git commit -a`.
+# ==========================================================================
+
+# --- (bg) the guard reads the index git HANDS it -------------------------
+# `git commit -a`, `git commit -- <path>`, `--only` and `--include` do not
+# touch the standard index: git builds a TEMPORARY one for the commit and
+# names it in $GIT_INDEX_FILE for the hook. Round 6 unset that variable along
+# with GIT_DIR and friends once both env files had been sourced, so
+# `cmd_guard`'s `git diff --cached --name-only` read the standard index,
+# found nothing staged, and exited 0 — printing nothing at all. The commit went
+# through.
+ln -sf "$LOOM" "$TMP/stubs/loom"          # the hook calls `loom guard` by name
+out="$("$LOOM" install-hooks 2>&1)"; rc=$?
+want_eq "(bg) setup: the pre-commit hook installs"        "$rc" "0"
+want_file "(bg) ... at .git/hooks/pre-commit"             "$REPO/.git/hooks/pre-commit"
+git checkout -q -b agent/guard-bg
+bg_head="$(git rev-parse HEAD)"
+echo "// the agent edits a hand path" >> core/lib.rs
+# 1. `git commit -a`: nothing is staged, the content lives only in git's own
+#    temporary index.
+out="$(git commit -a -m "sneak a hand path past the guard" 2>&1)"; rc=$?
+want_fail   "(bg) 'git commit -a' on a hand path is BLOCKED"  "$rc"
+want_in     "(bg) ... by the guard, naming the path"          "$out" "core/lib.rs"
+want_in     "(bg) ... with the guard's own message"           "$out" "touches hand-zone paths"
+want_eq     "(bg) ... and nothing was committed"              "$(git rev-parse HEAD)" "$bg_head"
+# 2. `git commit -- <path>`: same temporary index, by a different route.
+out="$(git commit -m "sneak it in path-limited" -- core/lib.rs 2>&1)"; rc=$?
+want_fail   "(bg) 'git commit -- <hand path>' is BLOCKED too" "$rc"
+want_in     "(bg) ... naming the path"                        "$out" "core/lib.rs"
+want_eq     "(bg) ... and still nothing committed"            "$(git rev-parse HEAD)" "$bg_head"
+# 3. the control: an ordinary staged commit was blocked before this fix and
+#    must still be.
+git add core/lib.rs
+out="$(git commit -m "the staged form" 2>&1)"; rc=$?
+want_fail   "(bg) control: a staged hand-zone commit is blocked" "$rc"
+want_in     "(bg) ... naming the path"                        "$out" "core/lib.rs"
+want_eq     "(bg) ... and nothing was committed"              "$(git rev-parse HEAD)" "$bg_head"
+# 4. ... and an assist-zone path still commits, so the guard is not simply
+#    refusing everything now.
+git reset -q --hard
+echo "ordinary work" > backend/bg-ok.txt
+git add backend/bg-ok.txt
+out="$(git commit -m "an assist-zone commit" 2>&1)"; rc=$?
+want_eq     "(bg) an assist-zone commit still goes through"   "$rc" "0"
+want_ne     "(bg) ... and really committed"                   "$(git rev-parse HEAD)" "$bg_head"
+git reset -q --hard "$bg_head"
+git checkout -q main
+git branch -D agent/guard-bg > /dev/null 2>&1 || true
+rm -f "$REPO/.git/hooks/pre-commit" "$TMP/stubs/loom"
+
+# --- (bh) the PUSH destination is pinned, not just the fetch URL ----------
+# `git remote get-url origin` answers the FETCH url. A push goes somewhere
+# else the moment `remote.origin.pushurl` is set, or a
+# `url.<decoy>.pushInsteadOf = <the real origin>` rewrite exists — both in the
+# shared .git/config, both invisible to the URL the record pinned, and
+# `loom land --pr` is the one command here that publishes an agent's commits to
+# a host.
+git init -q --bare "$TMP/origin-bh.git"
+git init -q --bare "$TMP/decoy-bh.git"
+git remote add origin "$TMP/origin-bh.git"
+git push -q origin main
+out="$("$LOOM" new 0063-bh 2>&1)"; rc=$?
+want_eq "(bh) setup: a task cut against a real origin"    "$rc" "0"
+want_eq "(bh) ... with the PUSH url in the operator record" \
+        "$(state_field 0063-bh pushurl)" "$TMP/origin-bh.git"
+BHW="$WTU/0063-bh"
+echo "benign" > "$BHW/backend/bh.txt"
+git -C "$BHW" add backend/bh.txt
+git -C "$BHW" commit -qm "benign work on bh"
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0063-bh 2>&1)"; rc=$?
+want_eq "(bh) setup: it is reviewed"                      "$rc" "0"
+bh_refs() { git -C "$1" for-each-ref --format='%(refname)' | grep -c . || true; }
+# 1. remote.origin.pushurl, set from inside the worktree
+git -C "$BHW" config remote.origin.pushurl "$TMP/decoy-bh.git"
+out="$("$LOOM" land 0063-bh --pr 2>&1)"; rc=$?
+want_eq "(bh) land --pr refuses a re-aimed remote.origin.pushurl" "$rc" "1"
+want_in "(bh) ... naming the push url"                    "$out" "PUSH url"
+want_in "(bh) ... and the decoy configured now"           "$out" "decoy-bh.git"
+want_eq "(bh) ... and the decoy received no refs"         "$(bh_refs "$TMP/decoy-bh.git")" "0"
+git config --unset remote.origin.pushurl
+# 2. url.<decoy>.pushInsteadOf: the same redirection with the pushurl key
+#    never set, and `git remote get-url origin` still answering the real one.
+git config "url.$TMP/decoy-bh.git.pushInsteadOf" "$TMP/origin-bh.git"
+want_eq "(bh) setup: the FETCH url still reads as the real origin" \
+        "$(git remote get-url origin)" "$TMP/origin-bh.git"
+out="$("$LOOM" land 0063-bh --pr 2>&1)"; rc=$?
+want_eq "(bh) land --pr refuses a pushInsteadOf rewrite"  "$rc" "1"
+want_in "(bh) ... naming the decoy it would have gone to" "$out" "decoy-bh.git"
+want_eq "(bh) ... which received no refs either"          "$(bh_refs "$TMP/decoy-bh.git")" "0"
+git config --remove-section "url.$TMP/decoy-bh.git"
+# 3. ext::<program> — refused before any transport is opened, so the program
+#    named in the URL never runs.
+cat > "$TMP/bh-ext.sh" << EXT
+#!/usr/bin/env bash
+: > "$TMP/bh-ext-ran"
+exit 1
+EXT
+chmod +x "$TMP/bh-ext.sh"
+git config remote.origin.pushurl "ext::$TMP/bh-ext.sh"
+out="$("$LOOM" land 0063-bh --pr 2>&1)"; rc=$?
+want_eq     "(bh) land --pr refuses an ext:: push url"    "$rc" "1"
+want_in     "(bh) ... naming it"                          "$out" "ext::"
+want_absent "(bh) ... and the program it names never ran" "$TMP/bh-ext-ran"
+git config --unset remote.origin.pushurl
+# ... and with the recorded push url back, the push really happens
+out="$("$LOOM" land 0063-bh --pr 2>&1)"; rc=$?
+want_eq "(bh) with the recorded push url back, land --pr pushes" "$rc" "0"
+want_ne "(bh) ... and origin now carries the branch" \
+        "$(git -C "$TMP/origin-bh.git" rev-parse --verify --quiet refs/heads/agent/0063-bh || echo GONE)" "GONE"
+"$LOOM" drop 0063-bh > /dev/null 2>&1 || true
+git remote remove origin
+
+# --- (bi) repo-local git config is not a code channel --------------------
+# `.git/config` is in the SHARED git directory, so `git -C <worktree> config
+# core.pager /tmp/x` is one command from inside an agent's tree — and several
+# of those keys name a PROGRAM git runs, in YOUR session, the next time loom
+# touches the repository. loom exports its own GIT_CONFIG_PARAMETERS (which
+# outranks every config file) and spells out --no-ext-diff / --receive-pack /
+# --upload-pack where a config value would otherwise win.
+git init -q --bare "$TMP/origin-bi.git"
+git remote add origin "$TMP/origin-bi.git"
+git push -q origin main
+for n in pager fsmonitor extdiff; do
+  cat > "$TMP/bi-$n.sh" << BI
+#!/usr/bin/env bash
+: > "$TMP/bi-$n-ran"
+BI
+done
+printf 'exec cat\n' >> "$TMP/bi-pager.sh"
+printf 'echo /\n'   >> "$TMP/bi-fsmonitor.sh"     # fsmonitor v1: "everything is dirty"
+printf 'exit 0\n'   >> "$TMP/bi-extdiff.sh"
+cat > "$TMP/bi-receivepack.sh" << BI
+#!/usr/bin/env bash
+: > "$TMP/bi-receivepack-ran"
+exec git receive-pack "\$@"
+BI
+chmod +x "$TMP/bi-pager.sh" "$TMP/bi-fsmonitor.sh" "$TMP/bi-extdiff.sh" "$TMP/bi-receivepack.sh"
+out="$("$LOOM" new 0064-bi 2>&1)"; rc=$?
+want_eq "(bi) setup: a task against a real origin"        "$rc" "0"
+BIW="$WTU/0064-bi"
+echo "benign" > "$BIW/backend/bi.txt"
+git -C "$BIW" add backend/bi.txt
+git -C "$BIW" commit -qm "benign work on bi"
+# the agent, from its worktree, into the shared config
+git -C "$BIW" config core.pager                "$TMP/bi-pager.sh"
+git -C "$BIW" config core.fsmonitor            "$TMP/bi-fsmonitor.sh"
+git -C "$BIW" config diff.external             "$TMP/bi-extdiff.sh"
+git -C "$BIW" config remote.origin.receivepack "$TMP/bi-receivepack.sh"
+# the OPERATOR's gate, which loom runs with its own environment: it reports what
+# every git subprocess loom spawns actually resolves these keys to.
+cp .agents/gate.sh "$TMP/gate.bi"
+cat > .agents/gate.sh << 'GATE'
+#!/usr/bin/env bash
+{ printf 'pager=%s\n'     "$(git config --get core.pager || true)"
+  printf 'fsmonitor=%s\n' "$(git config --get core.fsmonitor || true)"
+  printf 'extallow=%s\n'  "$(git config --get protocol.ext.allow || true)"
+  printf 'editor=%s\n'    "$(git config --get core.editor || true)"
+} > "${LOOM_TEST_TMP:?}/bi-gate-config.txt"
+exit 0
+GATE
+chmod +x .agents/gate.sh
+out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0064-bi 2>&1)"; rc=$?
+want_eq "(bi) loom check still succeeds"                  "$rc" "0"
+out="$("$LOOM" diff 0064-bi 2>&1)"; rc=$?
+want_eq "(bi) loom diff still succeeds"                   "$rc" "0"
+want_in "(bi) ... and really shows the patch"             "$out" "backend/bi.txt"
+out="$("$LOOM" land 0064-bi --pr 2>&1)"; rc=$?
+cp "$TMP/gate.bi" .agents/gate.sh
+want_eq "(bi) land --pr succeeds against the recorded origin" "$rc" "0"
+want_absent "(bi) core.fsmonitor never ran"               "$TMP/bi-fsmonitor-ran"
+want_absent "(bi) diff.external never ran"                "$TMP/bi-extdiff-ran"
+want_absent "(bi) core.pager never ran"                   "$TMP/bi-pager-ran"
+want_absent "(bi) remote.origin.receivepack never ran"    "$TMP/bi-receivepack-ran"
+want_ne "(bi) ... and the push really happened" \
+        "$(git -C "$TMP/origin-bi.git" rev-parse --verify --quiet refs/heads/agent/0064-bi || echo GONE)" "GONE"
+bi_cfg="$(cat "$TMP/bi-gate-config.txt" 2>/dev/null || true)"
+want_in "(bi) every git subprocess loom spawns sees core.pager=cat"  "$bi_cfg" "pager=cat"
+want_in "(bi) ... core.fsmonitor=false"                   "$bi_cfg" "fsmonitor=false"
+want_in "(bi) ... protocol.ext.allow=never"               "$bi_cfg" "extallow=never"
+want_in "(bi) ... core.editor=true"                       "$bi_cfg" "editor=true"
+"$LOOM" drop 0064-bi > /dev/null 2>&1 || true
+git config --unset core.pager
+git config --unset core.fsmonitor
+git config --unset diff.external
+git config --unset remote.origin.receivepack
+git remote remove origin
+
+# --- (bj) what a rebase may replay onto, and what it may bury ------------
+# Two rules, and they are the same rule twice: a rebase MOVES the recorded base,
+# so loom must be able to refresh what it replays onto, and the operator must
+# have seen what goes under.
+out="$("$LOOM" new 0065-bj 2>&1)"; rc=$?
+want_eq "(bj) setup: an unprofiled worktree"              "$rc" "0"
+BJW="$WTU/0065-bj"
+echo "benign" > "$BJW/backend/bj.txt"
+git -C "$BJW" add backend/bj.txt
+git -C "$BJW" commit -qm "the task's own work"
+bj_base_before="$(state_field 0065-bj base)"
+bj_tip_before="$(git rev-parse agent/0065-bj)"
+# an upstream commit in the ASSIST zone only: nothing fenced, nothing in [hand].
+# The old gate was "the range touches a fenced or hand-zone path", so this range
+# moved the base in silence.
+echo "assist only" > backend/bj-upstream.txt
+git add backend/bj-upstream.txt
+git commit -qm "upstream: an assist-zone commit"
+bj_up="$(git rev-parse HEAD)"
+out="$("$LOOM" rebase 0065-bj main 2>&1)"; rc=$?
+want_eq "(bj) an assist-only buried range is refused without the flag" "$rc" "1"
+want_in "(bj) ... printing the commits it would bury"     "$out" "upstream: an assist-zone commit"
+want_in "(bj) ... with the fenced list"                   "$out" "fenced paths:"
+want_in "(bj) ... the hand-zone list"                     "$out" "hand-zone paths:"
+want_in "(bj) ... both empty"                             "$out" "(none)"
+want_in "(bj) ... and every path in the range"            "$out" "backend/bj-upstream.txt"
+want_in "(bj) ... naming the one escape"                  "$out" "--accept-upstream"
+want_eq "(bj) ... the base did not move"                  "$(state_field 0065-bj base)" "$bj_base_before"
+want_eq "(bj) ... and the branch is back where it was"    "$(git rev-parse agent/0065-bj)" "$bj_tip_before"
+out="$("$LOOM" rebase 0065-bj main --accept-upstream 2>&1)"; rc=$?
+want_eq "(bj) ... and proceeds with the flag"             "$rc" "0"
+want_eq "(bj) ... moving the base onto main's tip"        "$(state_field 0065-bj base)" "$bj_up"
+want_in "(bj) ... saying the range was accepted unreviewed" "$out" "accepted under the base, unreviewed"
+# an upstream on a remote loom cannot refresh: only origin/<b> gets a refspec,
+# so `upstream/main` was replayed onto whatever refs/remotes/upstream/main said.
+git remote add upstream "$TMP/origin-bh.git"
+git update-ref refs/remotes/upstream/main "$bj_up"
+out="$("$LOOM" rebase 0065-bj upstream/main 2>&1)"; rc=$?
+want_eq "(bj) an upstream on another remote is refused"   "$rc" "1"
+want_in "(bj) ... naming the rule"                        "$out" "only origin/<b> or a local branch"
+want_in "(bj) ... and the remote it cannot refresh"       "$out" "cannot refresh 'upstream'"
+want_eq "(bj) ... with the base left alone"               "$(state_field 0065-bj base)" "$bj_up"
+git remote remove upstream
+git update-ref -d refs/remotes/upstream/main 2>/dev/null || true
+# ... and origin/<b> in a repo that has no origin at all: refs/remotes/origin/main
+# is then a purely local ref, refreshed by nothing, one update-ref from anything.
+out="$("$LOOM" rebase 0065-bj origin/main 2>&1)"; rc=$?
+want_eq "(bj) origin/<b> with no 'origin' remote is refused" "$rc" "1"
+want_in "(bj) ... saying the repository has none"         "$out" "this repository has none"
+want_in "(bj) ... and what it would have replayed onto"   "$out" "refs/remotes/origin/main"
+want_eq "(bj) ... with the base left alone"               "$(state_field 0065-bj base)" "$bj_up"
+"$LOOM" drop 0065-bj > /dev/null 2>&1 || true
 
 # --- (j)/(t) doctor lists the profiles, and touches no network ------------
 out="$(timeout 180 "$LOOM" doctor 2>&1 || true)"
