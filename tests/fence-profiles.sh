@@ -3684,7 +3684,6 @@ git add .agents/gate.sh
 git commit -qm "(ce) a gate that reports its own environment"
 out="$("$LOOM" new 0100-ce 2>&1)"; rc=$?
 want_eq "(ce) setup: a task"                                        "$rc" "0"
-CE="$WTU/0100-ce"
 : > "$TMP/ce-gate-env.log"
 out="$(ZHIPU_API_KEY=FAKE-KEY DEEPSEEK_API_KEY=FAKE-KEY MY_SECRET=FAKE-KEY \
        GITHUB_TOKEN=FAKE-KEY ADMIN_PASSWORD=FAKE-KEY \
