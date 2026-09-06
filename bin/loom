@@ -3457,8 +3457,13 @@ reviews_dir() { # reviews_dir <worktree>  -> the RESOLVED review directory
 #   1. the worktree and the target's parent chain are RE-RESOLVED immediately
 #      before the write (`resolve_under_wt`) — never trusted from earlier in
 #      the command, because the agent has had a turn in this tree since;
-#   2. the content is written to a fresh `mktemp` INSIDE the resolved parent;
-#   3. that temp is RENAMED onto the target. rename(2) replaces the target's
+#   2. the resolved parent is then HELD as the working directory, and the
+#      content is written to a fresh `mktemp` named relative to it (`./…`) —
+#      a cwd is an inode, so a later rename of `reviews` or `.agents` cannot
+#      move the write, which spelling the path out again at every syscall
+#      would have let it do;
+#   3. that temp is RENAMED onto the target (also relative to the held
+#      directory). rename(2) replaces the target's
 #      directory ENTRY: a symlink there is overwritten as a link, a hardlinked
 #      name keeps the old inode and the old bytes, and neither ever sees what
 #      loom wrote;
@@ -3475,11 +3480,15 @@ link_count() { # link_count <path> -> its hard-link count, or "" if neither stat
 }
 
 place_file() { # place_file <worktree> <relative-path> <source-file> -> the path written
-  local wt="$1" rel="$2" src="$3" parent base rdir target tmp n what=""
+  local wt="$1" rel="$2" src="$3" parent base rdir target
   parent="$(dirname "$rel")"; base="$(basename "$rel")"
   case "$base" in
     ""|.|..) die "internal error: place_file was given no file name in '$rel'" ;;
   esac
+  # The source is read with the RESOLVED DIRECTORY as the cwd (below), so a
+  # relative source path would resolve somewhere else entirely. Every caller
+  # passes an absolute `mktemp` path; this is the guard, not a conversion.
+  case "$src" in /*) ;; *) src="$PWD/$src" ;; esac
   # `|| die` in place_file's OWN shell, deliberately. resolve_under_wt answers
   # through `$( )`, so its refusal is a subshell exit and the assignment simply
   # fails — and `loom run` reaches this from `loom loop` through `|| rc=$?`,
@@ -3489,24 +3498,54 @@ place_file() { # place_file <worktree> <relative-path> <source-file> -> the path
     || die "refusing to write $rel in $wt: its $parent could not be resolved inside
 the worktree. Inspect it, do not re-run."
   target="$rdir/$base"
-  tmp="$(mktemp "$rdir/.loom-place.XXXXXX")" \
-    || die "cannot create a temporary file in $rdir — refusing to write $rel"
-  cat "$src" > "$tmp" || { rm -f "$tmp"; die "cannot write $rel in $wt"; }
-  mv -T "$tmp" "$target" 2>/dev/null \
-    || python3 -c 'import os,sys; os.rename(sys.argv[1], sys.argv[2])' "$tmp" "$target" \
-    || { rm -f "$tmp"; die "cannot place $rel in $wt — the rename onto $target failed"; }
-  n="$(link_count "$target")"
-  if [ -L "$target" ]; then what="a symlink"
-  elif [ "$n" != "1" ]; then what="a file with ${n:-an unreadable number of} hard link(s)"
-  fi
-  if [ -n "$what" ]; then
-    rm -f "$target"
-    die "refusing to leave $rel in $wt: right after loom renamed its own file onto
+  # And the write happens INSIDE the directory that was just resolved, with
+  # every path in it relative to that cwd. A cwd is an INODE, not a name: once
+  # this subshell is standing in the resolved directory, renaming `reviews` (or
+  # `.agents` above it) aside and putting a symlink in its place moves nothing
+  # under this shell's feet — `./.loom-place.XXXXXX` and `./<base>` still name
+  # entries in the directory that was checked. Spelling the temp and the target
+  # as `$rdir/...` instead would re-walk that path at every syscall, which is
+  # the window this closes: resolve, then hold, then write.
+  #
+  # `die` inside the subshell is a subshell exit, so the caller's shell has to
+  # act on it — hence `|| exit 1`, which is `die`'s own exit code with the
+  # message already printed by the leg that failed.
+  (
+    cd -P "$rdir" \
+      || die "refusing to write $rel in $wt: its $parent could not be entered.
+Something replaced it — inspect it, do not re-run."
+    # The one gap `cd` cannot close on its own: the resolve and the cd are two
+    # syscalls, so the NAME could have been swapped between them. Once the
+    # directory is held, ask it what it is — a link put there in that window
+    # answers with a different physical path, and this is the last moment
+    # anything is checked by name.
+    [ "$(pwd -P)" = "$rdir" ] \
+      || die "refusing to write $rel in $wt: $parent was replaced between the check and
+the write — loom resolved
+  $rdir
+and is now standing in
+  $(pwd -P)
+Inspect it, do not re-run."
+    local tmp n what=""
+    tmp="$(mktemp ./.loom-place.XXXXXX)" \
+      || die "cannot create a temporary file in $rdir — refusing to write $rel"
+    cat "$src" > "$tmp" || { rm -f "$tmp"; die "cannot write $rel in $wt"; }
+    mv -T "$tmp" "./$base" 2>/dev/null \
+      || python3 -c 'import os,sys; os.rename(sys.argv[1], sys.argv[2])' "$tmp" "./$base" \
+      || { rm -f "$tmp"; die "cannot place $rel in $wt — the rename onto $target failed"; }
+    n="$(link_count "./$base")"
+    if [ -L "./$base" ]; then what="a symlink"
+    elif [ "$n" != "1" ]; then what="a file with ${n:-an unreadable number of} hard link(s)"
+    fi
+    if [ -n "$what" ]; then
+      rm -f "./$base"
+      die "refusing to leave $rel in $wt: right after loom renamed its own file onto
   $target
 that path is $what. loom writes a fresh file and renames it, so the only way
 this reads as anything but one plain file is that something else is writing the
 same directory. The file has been removed. Inspect the worktree, do not re-run."
-  fi
+    fi
+  ) || exit 1
   printf '%s\n' "$target"
 }
 
