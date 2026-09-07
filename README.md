@@ -56,11 +56,14 @@ vscode/tasks.json          optional VS Code tasks (gate as the default build tas
 
 ## Requirements
 
-`git`, `bash`, `python3` ≥ 3.11 (for `tomllib`) — or any python3 with the
-`tomli` backport installed (`pip install tomli`) — plus `jq`, `curl`, and
+`git`, `bash` (the stock macOS `/bin/bash` 3.2 included), `python3` ≥ 3.11
+(for `tomllib`) — or any python3 with the `tomli` backport installed
+(`pip install tomli`) — plus `jq`, `curl`, and
 [`opencode`](https://opencode.ai) and the `claude` CLI (logged in to your
 subscription). `tmux` optional (for `loom-session`). Everything is
-GNU/BSD-portable — the same scripts run on macOS and Linux; `loom doctor`
+GNU/BSD-portable — the same scripts run on macOS and Linux, and `bin/loom`
+checks that it parses under the bash running it before doing anything else
+(a stray bash-4 construct exits 2 with a message, not 0); `loom doctor`
 verifies a new machine in one shot. `codex` optional (a second subscription
 reviewer — see below); without it the reviewer chain just starts one entry
 later.

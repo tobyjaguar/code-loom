@@ -61,6 +61,29 @@ TMP="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/loom-fence-profiles.XXXXXX")" && pwd -P)
 trap 'rm -rf "$TMP"' EXIT
 REPO="$TMP/repo"
 
+# --- (cw) bin/loom parses under the bash that runs it -----------------------
+# FIRST, because nothing below means anything if it does not. bash reads a
+# script one top-level command at a time, so a construct this bash cannot parse
+# fails only when execution reaches it — and with loom's EXIT trap armed, bash
+# 3.2 (the only bash on a stock macOS) exited 0 after that error instead of 2.
+# 87b3b72 shipped a `case x)` inside `<( )`, which is exactly that on 3.2, and
+# every `loom` command, `loom guard` in the pre-commit hook included, became a
+# silent success there while this suite stayed green on Linux bash 5. Checked
+# under the bash loom's `#!/usr/bin/env bash` resolves to, which is the one
+# every `"$LOOM"` call below runs under.
+loom_bash_version="$(bash -c 'printf %s "$BASH_VERSION"')"
+out="$(bash -n "$LOOM" 2>&1)"; rc=$?
+want_eq "(cw) bin/loom parses under bash $loom_bash_version"  "$rc" "0"
+want_eq "(cw) ... with nothing to say about it"               "$out" ""
+# ... and loom's own guard against the class: a copy with a syntax error
+# injected AFTER the EXIT trap must refuse with exit 2 and say why, on every
+# bash — not exit 0 with bash's error on stderr, which is what 3.2 did.
+cp "$LOOM" "$TMP/loom-broken"; printf 'esac\n' >> "$TMP/loom-broken"; chmod +x "$TMP/loom-broken"
+out="$("$TMP/loom-broken" help 2>&1)"; rc=$?
+want_eq "(cw) a loom that does not parse exits 2, trap or no trap" "$rc" "2"
+want_in "(cw) ... and says so, rather than leaving it to bash"  "$out" "does not parse under"
+rm -f "$TMP/loom-broken"
+
 # ------------------------------------------------------------------- stubs
 # Every model call must land here, never on a provider. Every network call must
 # land on the curl stub, which records itself so a test can prove it never ran.
