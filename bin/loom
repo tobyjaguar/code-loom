@@ -123,6 +123,21 @@
 
 set -euo pipefail
 
+# Parse the WHOLE file before anything else runs. bash reads a script one
+# top-level command at a time, so a construct further down that this bash
+# cannot parse surfaces only when execution reaches it — and once the EXIT
+# trap below (cfg_cleanup) is armed, bash 3.2 exits 0 after a syntax error
+# instead of 2. That turned every `loom` command, `loom guard` in the
+# pre-commit hook included, into a silent success on a stock macOS (87b3b72,
+# a `case x)` inside `<( )`). The sessions that develop loom test on Linux
+# bash 5, which parses more than 3.2 does; this line is what a 3.2 user gets
+# instead of an exit 0. Cost: about 16 ms per invocation.
+"${BASH:-bash}" -n "$0" || {
+  printf 'loom: %s does not parse under %s (bash %s); refusing to run\n' \
+    "$0" "${BASH:-bash}" "${BASH_VERSION:-?}" >&2
+  exit 2
+}
+
 # This script's own path, resolved BEFORE the cd below: `loom help` prints the
 # header block by reading the file back, and a relative `$0` ("./bin/loom",
 # "../bin/loom") stops resolving the moment we cd to $ROOT — which now happens
@@ -4855,8 +4870,13 @@ run_gate() { # run_gate <worktree> [<logfile>]
     shopt -s nocasematch
     while IFS= read -r n; do
       [ -n "$n" ] || continue
+      # The pattern opens with `(`, on purpose: this `case` sits inside `<( )`,
+      # and bash 3.2 — the only bash on a stock macOS — finds the end of a
+      # `<( )` or `$( )` by counting parens, so a bare `)` closing a pattern
+      # here is a syntax error there. `(pattern)` is POSIX and every bash
+      # accepts it. Keep it that way in any `case` under a substitution.
       case "$n" in
-        *api_key*|*token*|*secret*|*password*|*passwd*|*auth*|*credential*|\
+        (*api_key*|*token*|*secret*|*password*|*passwd*|*auth*|*credential*|\
         *access_key*|*key_id*|*key*|*bearer*|*netrc*|*kubeconfig*|*cookie*|\
         *mnemonic*|*seed*|*passphrase*|*rsa*|\
         aws_*|anthropic_*|openai_*|codex_*|opencode_*|zai_*|zhipu_*|deepseek_*|moonshot_*|stripe_*)

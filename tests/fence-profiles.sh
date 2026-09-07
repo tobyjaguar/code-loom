@@ -48,6 +48,28 @@ want_not_link() { # want_not_link <label> <path>
   else ok "$1"; fi
 }
 
+# `git sparse-checkout disable` is how a case below widens a fenced tree, and
+# what it leaves in the worktree's OWN config scope depends on the git: 2.34
+# UNSETS core.sparseCheckout, core.sparseCheckoutCone and index.sparse, while
+# newer git (Apple git 2.50, measured) writes all three as `false` — and
+# the `init --no-cone` / `set` that re-fence afterwards put only the first two
+# back the way `loom new` wrote them. `index.sparse=false` stays behind, the
+# config pin sees a key it never recorded, and the command refuses on config
+# drift BEFORE it reaches the refusal the case is about (measured: (v), (x),
+# (y), (al) and (am), all green on git 2.34, all "+ index.sparse=false
+# [worktree-task]" on 2.50). So every widening is bracketed: the scope's file
+# is saved first and put back byte for byte after the re-fence. The TREE stays
+# exactly as the case left it; only git's bookkeeping goes back to what loom
+# wrote. Restored here rather than allowlisted in loom on purpose — a key that
+# appears in that scope is a fact the operator should see, and these cases are
+# not about that fact.
+wtcfg_of() { # wtcfg_of <worktree> -> absolute path of its config.worktree
+  (cd "$1" && p="$(git rev-parse --git-path config.worktree)" \
+     && case "$p" in /*) printf '%s' "$p" ;; *) printf '%s/%s' "$PWD" "$p" ;; esac)
+}
+wtcfg_save()    { cp "$(wtcfg_of "$1")" "$TMP/wtcfg.saved"; }
+wtcfg_restore() { cp "$TMP/wtcfg.saved" "$(wtcfg_of "$1")"; }
+
 # GNU coreutils' `timeout` is not on a stock macOS. Nothing here needs it for
 # correctness — every network call is stubbed — so where it is missing it
 # becomes "drop the duration and run the command".
@@ -60,6 +82,29 @@ command -v timeout >/dev/null 2>&1 || timeout() { shift; "$@"; }
 TMP="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/loom-fence-profiles.XXXXXX")" && pwd -P)"
 trap 'rm -rf "$TMP"' EXIT
 REPO="$TMP/repo"
+
+# --- (cw) bin/loom parses under the bash that runs it -----------------------
+# FIRST, because nothing below means anything if it does not. bash reads a
+# script one top-level command at a time, so a construct this bash cannot parse
+# fails only when execution reaches it — and with loom's EXIT trap armed, bash
+# 3.2 (the only bash on a stock macOS) exited 0 after that error instead of 2.
+# 87b3b72 shipped a `case x)` inside `<( )`, which is exactly that on 3.2, and
+# every `loom` command, `loom guard` in the pre-commit hook included, became a
+# silent success there while this suite stayed green on Linux bash 5. Checked
+# under the bash loom's `#!/usr/bin/env bash` resolves to, which is the one
+# every `"$LOOM"` call below runs under.
+loom_bash_version="$(bash -c 'printf %s "$BASH_VERSION"')"
+out="$(bash -n "$LOOM" 2>&1)"; rc=$?
+want_eq "(cw) bin/loom parses under bash $loom_bash_version"  "$rc" "0"
+want_eq "(cw) ... with nothing to say about it"               "$out" ""
+# ... and loom's own guard against the class: a copy with a syntax error
+# injected AFTER the EXIT trap must refuse with exit 2 and say why, on every
+# bash — not exit 0 with bash's error on stderr, which is what 3.2 did.
+cp "$LOOM" "$TMP/loom-broken"; printf 'esac\n' >> "$TMP/loom-broken"; chmod +x "$TMP/loom-broken"
+out="$("$TMP/loom-broken" help 2>&1)"; rc=$?
+want_eq "(cw) a loom that does not parse exits 2, trap or no trap" "$rc" "2"
+want_in "(cw) ... and says so, rather than leaving it to bash"  "$out" "does not parse under"
+rm -f "$TMP/loom-broken"
 
 # ------------------------------------------------------------------- stubs
 # Every model call must land here, never on a provider. Every network call must
@@ -74,13 +119,16 @@ printf '%s\n' "$@" >> "${LOOM_TEST_TMP:?}/called-claude.log"
 # worktree the harness just fenced, then look rate-limited so `loom` falls back
 # to the next model in the chain with the widened tree already on disk.
 if [ -n "${LOOM_TEST_RELAX_SPARSE:-}" ]; then
-  git sparse-checkout disable > /dev/null 2>&1 || true
-  # ... and put loom's own bookkeeping back. `sparse-checkout disable` empties
-  # the worktree's own config.worktree, which is a SCOPE the config pin covers,
+  # ... and put loom's own bookkeeping back, byte for byte. `sparse-checkout
+  # disable` rewrites the worktree's own config.worktree (git 2.34 empties it,
+  # git 2.50 writes three `false` keys), which is a SCOPE the config pin covers,
   # so without this the pin would refuse attempt 2 before the fence reconciler
   # ever looked at the tree — and (x) is the case about the reconciler. The
   # TREE stays widened either way; only the config bookkeeping is restored.
-  git config --worktree core.sparseCheckout true > /dev/null 2>&1 || true
+  wtcfg="$(git rev-parse --git-path config.worktree)"
+  cp "$wtcfg" "$wtcfg.saved"
+  git sparse-checkout disable > /dev/null 2>&1 || true
+  mv "$wtcfg.saved" "$wtcfg"
   echo "429 rate limit exceeded"
   exit 1
 fi
@@ -695,12 +743,14 @@ git branch -D agent/0014-u > /dev/null 2>&1 || true
 out="$("$LOOM" new 0016-v 2>&1)"; rc=$?
 want_eq "(v) setup: an unprofiled worktree"               "$rc" "0"
 VW="$WTU/0016-v"
+wtcfg_save "$VW"
 git -C "$VW" sparse-checkout disable                       # the agent widens it
 echo "// smuggled" >> "$VW/core/lib.rs"
 git -C "$VW" add core/lib.rs
 git -C "$VW" commit -qm "touch a fenced path"
 git -C "$VW" sparse-checkout init --no-cone                # ... and re-fences
 git -C "$VW" sparse-checkout set '/*' '!core/**' '!ios/**' '!docs/audits/**'
+wtcfg_restore "$VW"
 want_absent "(v) setup: the tree no longer shows the fenced path" "$VW/core/lib.rs"
 rm -f "$VW/.agents/reviews/0016-v.patch"
 out="$(LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0016-v 2>&1)"; rc=$?
@@ -777,12 +827,14 @@ want_eq "(x) ... and the SECOND model never launched"     \
 out="$("$LOOM" new 0019-y 2>&1)"; rc=$?
 want_eq "(y) setup: an unprofiled worktree"               "$rc" "0"
 YW="$WTU/0019-y"
+wtcfg_save "$YW"
 git -C "$YW" sparse-checkout disable
 echo "// smuggled" >> "$YW/core/lib.rs"
 git -C "$YW" add core/lib.rs
 git -C "$YW" commit -qm "touch a fenced path"
 git -C "$YW" sparse-checkout init --no-cone
 git -C "$YW" sparse-checkout set '/*' '!core/**' '!ios/**' '!docs/audits/**'
+wtcfg_restore "$YW"
 head_before="$(git rev-parse HEAD)"
 out="$("$LOOM" land 0019-y 2>&1)"; rc=$?
 want_eq "(y) land refuses a branch whose commits touch a fenced path" "$rc" "1"
@@ -886,12 +938,14 @@ want_absent "(ac) ... and it released nothing"            "$WTU/0022-ad/core/lib
 # patch to a reviewer. The base is now the OPERATOR RECORD, a file outside the
 # repo; the branch config below is not read at all, in either direction.
 taint() { # taint <task> <worktree>   materialise a fenced path, commit, re-fence
+  wtcfg_save "$2"
   git -C "$2" sparse-checkout disable
   echo "// smuggled by $1" >> "$2/core/lib.rs"
   git -C "$2" add core/lib.rs
   git -C "$2" commit -qm "touch a fenced path"
   git -C "$2" sparse-checkout init --no-cone
   git -C "$2" sparse-checkout set '/*' '!core/**' '!ios/**' '!docs/audits/**'
+  wtcfg_restore "$2"
 }
 out="$("$LOOM" new 0024-ad 2>&1)"; rc=$?
 want_eq "(ad) setup: an unprofiled worktree"              "$rc" "0"
@@ -2755,10 +2809,12 @@ PROG
 chmod +x "$TMP/bq-hooks/pre-commit" "$TMP/bq-prog.sh"
 # The decoy, built the way one would actually be built: its own repository, the
 # SAME BRANCH NAME (so the branch question is answered correctly),
-# extensions.worktreeConfig on and core.sparseCheckout in the holder's own
-# scope (so the config pin, which reads the task worktree's scope through
-# `git -C "$wt"`, sees what it saw before), and the two programs the pin exists
-# for — a clean filter and a hooksPath.
+# extensions.worktreeConfig on and the task worktree's own config scope copied
+# into the holder's byte for byte (so the config pin, which reads that scope
+# through `git -C "$wt"`, sees what it saw before — spelling out
+# `core.sparseCheckout true` was that on git 2.34 and one key short on 2.50,
+# where loom's own `init --no-cone` also pins `core.sparseCheckoutCone=false`),
+# and the two programs the pin exists for — a clean filter and a hooksPath.
 (
   cd "$TMP" || exit 1
   git init -q bq-decoy
@@ -2775,7 +2831,7 @@ chmod +x "$TMP/bq-hooks/pre-commit" "$TMP/bq-prog.sh"
   git add -A
   git commit -qm "the decoy"
   git worktree add -q -b agent/0076-bq "$TMP/bq-holder" HEAD
-  git -C "$TMP/bq-holder" config --worktree core.sparseCheckout true
+  cp "$(wtcfg_of "$BQW")" "$(wtcfg_of "$TMP/bq-holder")"
 ) > /dev/null 2>&1
 # Building the decoy runs its OWN hook (on its commit) and its own smudge (on
 # the worktree checkout), which is the cheapest possible proof that both plants
@@ -3372,8 +3428,17 @@ wait "$bx_swapper" 2>/dev/null || true
   && mv "$BX/.agents/reviews-stash" "$BX/.agents/reviews"
 rm -rf "$BX/.agents/reviews-stash"
 mkdir -p "$BX/.agents/reviews"
+# What counts is a file loom PLACED there — the patch, renamed onto a name that
+# had been swapped under it. A bare `.loom-place.*` in the victim is the
+# swapper's own doing: its rip step moves whatever sits in the stash, and that
+# includes loom's temp when the swap lands in the mktemp-to-rename window of a
+# CORRECT place_file (the held directory is the stash at that instant). loom
+# then fails its rename and dies, which is the refusal, not the leak. On Linux
+# that window is one `mv -T`; on macOS BSD `mv` has no -T, the python fallback
+# takes tens of milliseconds, and the swapper does land in it (measured: one
+# `.loom-place.*` in the victim, nothing else, on a full run under bash 3.2).
 want_eq "(bx) nothing loom wrote reached the victim tree across the swap race" \
-        "$(find "$BXV" -mindepth 1 2>/dev/null | tr '\n' ' ')" ""
+        "$(find "$BXV" -mindepth 1 ! -name '.loom-place.*' 2>/dev/null | tr '\n' ' ')" ""
 "$LOOM" drop 0093-bx > /dev/null 2>&1 || true
 
 # --- (by) $TMPDIR is pinned exactly like the OPENCODE_* set -----------------

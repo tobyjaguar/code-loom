@@ -39,9 +39,9 @@ new t5` fenced the new task with the agent's `zones.toml` (an emptied one means
 no fence at all) and `.`-sourced the agent's `.agents/loom.env` as shell, in
 your environment.
 
-**What closes it.** `bin/loom:164` (`ROOT="$(cd "$(dirname "$_common")" …)"`,
-from `git rev-parse --git-common-dir` at `bin/loom:160`) and `bin/loom:189`
-(`AGENTS_DIR="$ROOT/.agents"`); the guard's own reads are `bin/loom:3979`
+**What closes it.** `bin/loom:179` (`ROOT="$(cd "$(dirname "$_common")" …)"`,
+from `git rev-parse --git-common-dir` at `bin/loom:175`) and `bin/loom:204`
+(`AGENTS_DIR="$ROOT/.agents"`); the guard's own reads are `bin/loom:3994`
 onward. `$ROOT` is now the **main checkout** for every command:
 `git rev-parse --git-common-dir` answers `.git` from the main checkout and the
 absolute path of the main `.git` from a linked worktree, so its parent is the
@@ -52,7 +52,7 @@ profiles), `loom.env`, `.opencode/`, and `.agents/gate.sh`.
 One thing still comes from the invoking tree, and only one: **`loom guard`'s
 subject.** The commit is happening in that worktree, so the branch, the staged
 file list and the tree the reconciler inspects are read from `$INVOKED_ROOT`
-(`bin/loom:156`)
+(`bin/loom:171`)
 while the zones they are judged by come from `$ROOT`. `loom` says so in one line
 whenever the two differ. `tests/fence-profiles.sh` (av) asserts both halves:
 `loom new` from inside a worktree with an emptied `zones.toml` still applies the
@@ -87,7 +87,7 @@ own. That is not worth plugging: the entire hook is dominated by `git commit
 
 ## 2. `loom plan` runs the architect unfenced, in your own tree
 
-**Where.** `bin/loom:6320`, in `cmd_plan` (`bin/loom:6293`):
+**Where.** `bin/loom:6340`, in `cmd_plan` (`bin/loom:6313`):
 `run_role architect "$ROOT" "$prompt"` (and the
 interactive leg, `claude --append-system-prompt … "$prompt"`, likewise in
 `$ROOT`). The architect's chain at every tier ends in cheap third-party
@@ -109,7 +109,7 @@ say so out loud.
 
 ## 3. `.agents/loom.env` is sourced as shell
 
-**Where.** `bin/loom:285`:
+**Where.** `bin/loom:300`:
 
 ```sh
 if [ -f "$ROOT/.agents/loom.env" ]; then set -a; . "$ROOT/.agents/loom.env"; set +a; fi
@@ -282,7 +282,7 @@ that one form or the README changes with it.
 used to read "granted for the whole worktree root". It is not that any more;
 what is left is a confirmation.
 
-**Where.** `bin/loom:2500`, in `run_headless` (`bin/loom:2395`), the opencode leg:
+**Where.** `bin/loom:2515`, in `run_headless` (`bin/loom:2410`), the opencode leg:
 
 ```sh
 perm="$(printf '{"external_directory":{"%s/*":"allow","%s/**":"allow"}}' "$wd" "$wd")"
@@ -352,7 +352,7 @@ OPENCODE_CONFIG=$ROOT/.opencode/opencode.json     # (and OPENCODE_CONFIG_DIR)
 OPENCODE_DISABLE_PROJECT_CONFIG=1
 ```
 
-`run_headless`'s opencode leg (`bin/loom:2533`) sets the **disable
+`run_headless`'s opencode leg (`bin/loom:2548`) sets the **disable
 unconditionally**, on every opencode invocation — implementer, reviewer, scout
 and architect alike — and names the operator's config only when one exists.
 That is a round-4 correction: the disable used to be conditional on
@@ -410,16 +410,16 @@ baseline no longer moves silently), and a residual by
 construction.** This one cannot be
 closed from outside git; what follows is the boundary, drawn honestly.
 
-**Where.** `bin/loom:464` (the `GIT_CONFIG_PARAMETERS` export) and
-`bin/loom:476` (`GIT_PAGER=cat`); `bin/loom:885` onward (the task pin:
+**Where.** `bin/loom:479` (the `GIT_CONFIG_PARAMETERS` export) and
+`bin/loom:491` (`GIT_PAGER=cat`); `bin/loom:900` onward (the task pin:
 `config_sidecar`, `config_py`, `config_snapshot`, `config_wt`,
-`config_summary`, `config_programs` at `bin/loom:1594`,
-`require_recorded_config`); `bin/loom:1735` onward (the REPOSITORY baseline:
+`config_summary`, `config_programs` at `bin/loom:1609`,
+`require_recorded_config`); `bin/loom:1750` onward (the REPOSITORY baseline:
 `repo_config_file`, `repo_config_read`, `repo_config_write`,
-`repo_config_repin`, and `require_recorded_config_repo` at `bin/loom:1945`),
-read from `scout_root` (`bin/loom:6387`) and `cmd_plan`, written by
-`cmd_pin_config` (`bin/loom:6188`); `scout_mirror_config_check`
-(`bin/loom:6347`) for the one scope neither pin can cover; and the
+`repo_config_repin`, and `require_recorded_config_repo` at `bin/loom:1960`),
+read from `scout_root` (`bin/loom:6407`) and `cmd_plan`, written by
+`cmd_pin_config` (`bin/loom:6208`); `scout_mirror_config_check`
+(`bin/loom:6367`) for the one scope neither pin can cover; and the
 `--no-ext-diff` / `--upload-pack=` / `--receive-pack=` spelled out at the diff,
 fetch and push call sites.
 
@@ -711,7 +711,7 @@ narrative and the three checks live in ARCHITECTURE.md § 5 ("A worktree is
 judged only once it is proved to be ours"); this entry exists so that the gap
 list is the list, and so the trap is written down where the other traps are.
 
-**Where.** `require_wt_is_ours` (`bin/loom:2229`), called from
+**Where.** `require_wt_is_ours` (`bin/loom:2244`), called from
 `require_wt_on_branch` (which covers `require_worktree`, `loom run` and
 `loom loop`), from `cmd_drop` before `git worktree remove`, and from
 `scout_root` for the shared mirror.
@@ -756,10 +756,10 @@ what that directory is. Cleaning it up is the operator's, by hand.
 generalises: it is the only directory in this system that loom writes to on the
 agent's side of the fence.
 
-**Where.** `reviews_dir` (`bin/loom:4137`), the write sites in `cmd_run`
+**Where.** `reviews_dir` (`bin/loom:4152`), the write sites in `cmd_run`
 (gate log), `cmd_check` (patch + review), `cmd_diff` (patch) and `cmd_loop`
 (the review text it appends to the task spec), the `--add-dir` sandbox root in
-`run_headless` (`bin/loom:2395`), and the pathspec in `wt_dirty`.
+`run_headless` (`bin/loom:2410`), and the pathspec in `wt_dirty`.
 
 **What it was.** `reviews_dir` was `mkdir -p "$wt/.agents/reviews"` and nothing
 else, and every caller then spelled the path out again. `mkdir -p` on a path
@@ -872,10 +872,10 @@ is gap 6's residual, and it is unchanged.
 asking the same question one level lower.
 
 **Where.** `place_file`, `resolve_under_wt`, `probe_agent_file`, `link_count`
-and `reviews_entries_plain` (`bin/loom:4392`), the write sites in `cmd_run`
+and `reviews_entries_plain` (`bin/loom:4407`), the write sites in `cmd_run`
 (the gate log, and the `-blocked.md` probe), `cmd_check` (patch + review),
 `cmd_diff` (patch) and `cmd_loop` (the append to `.agents/tasks/<task>.md`),
-the artifact copies at `state_artifact` (`bin/loom:2026`), and the pathspec in
+the artifact copies at `state_artifact` (`bin/loom:2041`), and the pathspec in
 `wt_dirty`.
 
 **What it was.** Gap 8 resolved the DIRECTORY before every write and had each
@@ -945,8 +945,8 @@ cost one `ln -s`.
 the shape recurs: loom keeps directories of its own beside the task worktrees
 under `$LOOM_WORKTREES`, and a task id is a directory name there.
 
-**Where.** `state_file` (`bin/loom:611`), asked by `cmd_new` before anything is
-created (`bin/loom:4894`).
+**Where.** `state_file` (`bin/loom:626`), asked by `cmd_new` before anything is
+created (`bin/loom:4914`).
 
 **What it was.** `_scout` is the shared scout mirror — one directory, reset,
 `clean -xdff`'d and re-fenced on every `loom scout`, deliberately under the
