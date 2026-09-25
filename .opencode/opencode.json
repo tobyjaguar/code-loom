@@ -53,7 +53,7 @@
     "reviewer": {
       "description": "Reviews a diff against its task spec, printing the review to stdout (loom saves it). Runs on a different provider than the implementer so failure modes are decorrelated.",
       "mode": "all",
-      "model": "moonshotai/kimi-k2.5",
+      "model": "moonshotai/kimi-k2.7-code",
       "temperature": 0.1,
       "prompt": "{file:./prompts/reviewer.md}",
       "permission": {

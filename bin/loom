@@ -2328,18 +2328,18 @@ models_for() {
   if [ -n "$override" ]; then echo "$override"; return 0; fi
   case "$TIER:$role" in
     deep:architect|standard:architect)
-                         echo "claude-sub zai-coding-plan/glm-5.3 moonshotai/kimi-k2.5" ;;
-    lean:architect)      echo "zai-coding-plan/glm-5.3 moonshotai/kimi-k2.5 deepseek/deepseek-v4-pro" ;;
+                         echo "claude-sub zai-coding-plan/glm-5.3 moonshotai/kimi-k2.7-code" ;;
+    lean:architect)      echo "zai-coding-plan/glm-5.3 moonshotai/kimi-k2.7-code deepseek/deepseek-v4-pro" ;;
 
     deep:implementer)    echo "zai-coding-plan/glm-5.3 moonshotai/kimi-k2.7-code deepseek/deepseek-v4-pro" ;;
     standard:implementer|lean:implementer)
-                         echo "zai-coding-plan/glm-5.3 deepseek/deepseek-v4-pro moonshotai/kimi-k2.5" ;;
+                         echo "zai-coding-plan/glm-5.3 deepseek/deepseek-v4-pro moonshotai/kimi-k2.7-code" ;;
 
-    deep:reviewer)       echo "codex-sub claude-sub moonshotai/kimi-k2.5 deepseek/deepseek-v4-pro" ;;
-    standard:reviewer)   echo "codex-sub moonshotai/kimi-k2.5 deepseek/deepseek-v4-pro zai-coding-plan/glm-5.3" ;;
-    lean:reviewer)       echo "deepseek/deepseek-v4-flash zai-coding-plan/glm-5.3-flash" ;;
+    deep:reviewer)       echo "codex-sub claude-sub moonshotai/kimi-k2.7-code deepseek/deepseek-v4-pro" ;;
+    standard:reviewer)   echo "codex-sub moonshotai/kimi-k2.7-code deepseek/deepseek-v4-pro zai-coding-plan/glm-5.3" ;;
+    lean:reviewer)       echo "deepseek/deepseek-flash zai-coding-plan/glm-5.3-flash" ;;
 
-    *:scout)             echo "zai-coding-plan/glm-5.3-flash deepseek/deepseek-v4-flash" ;;
+    *:scout)             echo "zai-coding-plan/glm-5.3-flash deepseek/deepseek-flash" ;;
     *)                   echo "zai-coding-plan/glm-5.3" ;;
   esac
 }

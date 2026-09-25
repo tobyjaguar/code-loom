@@ -215,8 +215,8 @@ chmod +x "$TMP/stubs/"*
 cat > "$TMP/cache/loom/models-dev.json" << 'JSON'
 {
   "zai-coding-plan": {"models": {"glm-5.3": {"id": "glm-5.3"}, "glm-5.3-flash": {"id": "glm-5.3-flash"}}},
-  "moonshotai":      {"models": {"kimi-k2.5": {"id": "kimi-k2.5"}, "kimi-k2.7-code": {"id": "kimi-k2.7-code"}}},
-  "deepseek":        {"models": {"deepseek-v4-pro": {"id": "deepseek-v4-pro"}, "deepseek-v4-flash": {"id": "deepseek-v4-flash"}}}
+  "moonshotai":      {"models": {"kimi-k2.7-code": {"id": "kimi-k2.7-code"}}},
+  "deepseek":        {"models": {"deepseek-v4-pro": {"id": "deepseek-v4-pro"}, "deepseek-flash": {"id": "deepseek-flash"}}}
 }
 JSON
 
@@ -799,7 +799,7 @@ want_eq   "(w) ... and loom drop finds it there"                  "$rc" "0"
 want_absent "(w) ... and removed it"                            "$TMP/wt3-profiled/0023-ae"
 
 rm -f "$TMP/called-opencode.log"
-out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-flash" \
        "$LOOM" scout "where is main" 2>&1)"; rc=$?
 sc="$(cat "$TMP/called-opencode.log" 2>/dev/null || true)"
 want_in     "(w) the scout grant is its own mirror"       "$sc" "$WTU/_scout/**"
@@ -1217,20 +1217,20 @@ want_in "(ao) implementer: the operator's config"         "$oc" "OPENCODE_CONFIG
 want_in "(ao) implementer: the project's config OFF"      "$oc" "OPENCODE_DISABLE_PROJECT_CONFIG=1"
 want_in "(ao) implementer: the operator's config dir"     "$oc" "OPENCODE_CONFIG_DIR=$REPO/.opencode"
 rm -f "$TMP/called-opencode.log"
-out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_reviewer="deepseek/deepseek-v4-flash" \
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_reviewer="deepseek/deepseek-flash" \
        "$LOOM" check 0036-ao 2>&1)"; rc=$?
 want_eq "(ao) setup: an opencode reviewer runs"           "$rc" "0"
 oc="$(cat "$TMP/called-opencode.log" 2>/dev/null || true)"
 want_in "(ao) reviewer: the operator's config"            "$oc" "OPENCODE_CONFIG=$REPO/.opencode/opencode.json"
 want_in "(ao) reviewer: the project's config OFF"         "$oc" "OPENCODE_DISABLE_PROJECT_CONFIG=1"
 rm -f "$TMP/called-opencode.log"
-out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-flash" \
        "$LOOM" scout "where is main" 2>&1)"; rc=$?
 oc="$(cat "$TMP/called-opencode.log" 2>/dev/null || true)"
 want_in "(ao) scout: the operator's config"               "$oc" "OPENCODE_CONFIG=$REPO/.opencode/opencode.json"
 want_in "(ao) scout: the project's config OFF"            "$oc" "OPENCODE_DISABLE_PROJECT_CONFIG=1"
 rm -f "$TMP/called-opencode.log"
-out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_architect="deepseek/deepseek-v4-flash" \
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_architect="deepseek/deepseek-flash" \
        "$LOOM" plan -p "a topic" 2>&1)"; rc=$?
 oc="$(cat "$TMP/called-opencode.log" 2>/dev/null || true)"
 want_in "(ao) architect: the operator's config"           "$oc" "OPENCODE_CONFIG=$REPO/.opencode/opencode.json"
@@ -2681,7 +2681,7 @@ git -C "$BPW" config core.attributesFile "$TMP/bp-attrs"
 # smudge, and it is the first thing `loom scout` used to do.
 git -C "$WTU/_scout" sparse-checkout set '/.agents/' > /dev/null 2>&1
 bp_oc_before="$(wc -l < "$TMP/called-opencode.log" 2>/dev/null || echo 0)"
-out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-flash" \
        "$LOOM" scout "where is main" 2>&1)"; rc=$?
 want_eq     "(bp) loom scout refuses a config change although it has no task" "$rc" "1"
 want_in     "(bp) ... naming the filter"                  "$out" "+ filter.evil.smudge="
@@ -2692,7 +2692,7 @@ want_in     "(bp) ... pointing at the operator command"   "$out" "loom pin-confi
 want_eq     "(bp) ... and no model was launched" \
             "$(wc -l < "$TMP/called-opencode.log" 2>/dev/null || echo 0)" "$bp_oc_before"
 # `loom plan` is the same launch without the tree: the architect runs in $ROOT.
-out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_architect="deepseek/deepseek-v4-flash" \
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_architect="deepseek/deepseek-flash" \
        "$LOOM" plan -p "a topic" 2>&1)"; rc=$?
 want_eq "(bp) loom plan refuses the same change, before the architect" "$rc" "1"
 want_in "(bp) ... naming the filter"                      "$out" "+ filter.evil.smudge="
@@ -2710,7 +2710,7 @@ want_in "(bp) ... and saying which programs are now the baseline"    "$out" "nam
 want_in "(bp) ... tagged with the scope they live in"                "$out" "[local] filter.evil.smudge="
 # ... and now the scout runs. The smudge firing is what proves the plant was
 # live all along, i.e. that the refusal above was not theatre.
-out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-flash" \
        "$LOOM" scout "where is main" 2>&1)"; rc=$?
 want_eq   "(bp) with the baseline re-recorded, the scout runs"        "$rc" "0"
 want_file "(bp) ... and the planted smudge really does fire"          "$TMP/bp-smudge-ran"
@@ -2726,7 +2726,7 @@ rm -f "$TMP/bp-smudge-ran"
 git -C "$WTU/_scout" config --worktree filter.evil.smudge "$TMP/bp-smudge.sh"
 printf '* filter=evil\n' > "$WTU/_scout/.gitattributes"
 git -C "$WTU/_scout" sparse-checkout set '/.agents/' > /dev/null 2>&1
-out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-flash" \
        "$LOOM" scout "where is main" 2>&1)"; rc=$?
 want_eq     "(bp) loom scout refuses a key in the MIRROR's own worktree scope" "$rc" "1"
 want_in     "(bp) ... naming the key"                     "$out" "filter.evil.smudge"
@@ -2741,7 +2741,7 @@ git -C "$WTU/_scout" config --worktree --unset filter.evil.smudge
 printf 'copied out of a fenced path\n' > "$WTU/_scout/backend/leftover.txt"
 mkdir -p "$WTU/_scout/scratch"
 printf 'notes from the last provider\n' > "$WTU/_scout/scratch/notes.txt"
-out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-flash" \
        "$LOOM" scout "where is main" 2>&1)"; rc=$?
 want_eq     "(bp) with the mirror's scope clear, the scout runs"      "$rc" "0"
 want_absent "(bp) ... and an untracked file planted in it is gone"    "$WTU/_scout/backend/leftover.txt"
@@ -2754,7 +2754,7 @@ want_absent "(bp) ... still fenced, as it always was"                 "$WTU/_sco
 # is the state every repository that has never run `loom new` is in.
 mv "$STATE/config"           "$TMP/bp-baseline"
 mv "$STATE/config.gitconfig" "$TMP/bp-baseline.gitconfig"
-out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-flash" \
        "$LOOM" scout "where is main" 2>&1)"; rc=$?
 want_eq "(bp) with no baseline at all, the scout refuses" "$rc" "1"
 want_in "(bp) ... in the words written for it"            "$out" "no repository config baseline"
@@ -2766,7 +2766,7 @@ want_in   "(bp) ... saying what it pinned"                "$out" "loom: pinned "
 # ... and a baseline that is not one loom wrote is a dead stop, with the one
 # command that can overwrite it still able to.
 printf 'not a digest at all\n' > "$STATE/config"
-out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-flash" \
        "$LOOM" scout "where is main" 2>&1)"; rc=$?
 want_eq "(bp) a baseline loom did not write is a dead stop" "$rc" "1"
 want_in "(bp) ... saying so"                              "$out" "not one loom wrote"
@@ -2976,7 +2976,7 @@ exec cat
 SM
 chmod +x "$TMP/bs-smudge.sh"
 git config filter.evil.smudge "$TMP/bs-smudge.sh"
-out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-flash" \
        "$LOOM" scout "where is main" 2>&1)"; rc=$?
 want_eq "(bs) setup: the operator's scout refuses the planted key" "$rc" "1"
 want_in "(bs) ... naming it"                              "$out" "+ filter.evil.smudge="
@@ -3104,7 +3104,7 @@ for form in True ON ""; do
               "$(tr '\0' '\n' < "$STATE/config.gitconfig")" "worktree-main:core.hookspath"
   # ... and a change to that scope is a refusal for the roles judged against it.
   git config --worktree core.hooksPath "$TMP/bt-hooks-2"
-  out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
+  out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-flash" \
          "$LOOM" scout "where is main" 2>&1)"; rc=$?
   want_eq "(bt) ... a core.hooksPath planted in config.worktree is refused" "$rc" "1"
   want_in "(bt) ... named in the diff"     "$out" "+ core.hookspath=$TMP/bt-hooks-2"
@@ -3299,7 +3299,7 @@ want_in   "(bv) ... for the same reason"                           "$out" "reser
 # infinite: the snapshot whose job is to REFUSE what the config now says
 # instead climbed until the OOM killer arrived.
 git config --local "includeIf.gitdir:/no/such/directory/.path" /dev/zero
-out="$(timeout 30 env DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
+out="$(timeout 30 env DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-flash" \
        "$LOOM" scout "where is main" 2>&1)"; rc=$?
 want_ne   "(bv) an include target of /dev/zero does not hang the snapshot" "$rc" "124"
 want_fail "(bv) ... it is a refusal"                               "$rc"
@@ -4200,7 +4200,7 @@ want_in   "(cl) doctor warns about the trunk's link"                "$out" "trun
 # The SCOUT MIRROR is a model-facing tree too, and `run_role`'s per-attempt
 # reconcile runs on it — so without a base of its own it would both materialise
 # the doorway and refuse `loom scout` outright.
-out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
+out="$(DEEPSEEK_API_KEY=stub LOOM_MODELS_scout="deepseek/deepseek-flash" \
        "$LOOM" scout "where is main" 2>&1)"; rc=$?
 want_eq   "(cl) loom scout proceeds on a trunk that carries one"    "$rc" "0"
 want_gone "(cl) ... and the mirror does not carry the link either"  "$WTU/_scout/backend/hostname"
