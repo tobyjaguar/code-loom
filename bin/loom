@@ -2346,14 +2346,46 @@ models_for() {
   esac
 }
 
-key_for_provider() {
+# ------------------------------------------------------------------ providers
+# ONE table for everything `loom` knows per provider. Four readers used to carry
+# their own list — key_for_provider, model_env_strip's keep table,
+# models_endpoint and doctor's key lines — and agreed only by hand: a provider
+# added to the first and not the second lost its OWN key at launch (an empty
+# keep list drops every provider-shaped name), and the failure read as "not a
+# rate limit", not as the omission it was. Fields:
+#   keyvar    the variable that authenticates it (empty: a CLI login, no key)
+#   keep      env-name prefixes its launch may inherit (model_env_strip); the
+#             union over every provider is what model_env_strip drops
+#   endpoint  the OpenAI-style /models URL `loom doctor` checks the key against
+# claude and codex are CLI logins: they are here for their keep entries only.
+# `loom doctor` fails when a keyed provider is missing a field.
+provider_field() { # provider_field <provider> keyvar|keep|endpoint
+  local keyvar="" keep="" endpoint=""
   case "$1" in
-    zai|zai-coding-plan)
-                echo "${ZHIPU_API_KEY:-}" ;;
-    moonshotai) echo "${MOONSHOT_API_KEY:-}" ;;
-    deepseek)   echo "${DEEPSEEK_API_KEY:-}" ;;
-    *)          echo "" ;;
+    claude)          keep="anthropic_ claude_" ;;
+    codex)           keep="openai_ codex_" ;;
+    zai)             keyvar=ZHIPU_API_KEY;    keep="zhipu_ zai_"; endpoint="https://api.z.ai/api/paas/v4/models" ;;
+    zai-coding-plan) keyvar=ZHIPU_API_KEY;    keep="zhipu_ zai_"; endpoint="https://api.z.ai/api/coding/paas/v4/models" ;;
+    moonshotai)      keyvar=MOONSHOT_API_KEY; keep="moonshot_";   endpoint="https://api.moonshot.ai/v1/models" ;;
+    deepseek)        keyvar=DEEPSEEK_API_KEY; keep="deepseek_";   endpoint="https://api.deepseek.com/models" ;;
   esac
+  case "$2" in
+    keyvar)   printf '%s\n' "$keyvar" ;;
+    keep)     printf '%s\n' "$keep" ;;
+    endpoint) printf '%s\n' "$endpoint" ;;
+    *)        die "internal error: provider_field: no field '$2'" ;;
+  esac
+}
+# The providers a KEY authenticates (the opencode ones), in the order doctor
+# reports them; then every provider, the two CLI logins first.
+key_providers() { echo "zai zai-coding-plan moonshotai deepseek"; }
+all_providers() { echo "claude codex $(key_providers)"; }
+
+key_for_provider() { # key_for_provider <provider> -> the key's VALUE, or empty
+  local v; v="$(provider_field "$1" keyvar)"
+  [ -n "$v" ] || { echo ""; return 0; }
+  # $v is a name from the table above, never data.
+  eval "printf '%s\\n' \"\${$v:-}\""
 }
 
 provider_of() { case "$1" in claude-sub) echo "claude" ;; codex-sub) echo "codex" ;; *) echo "${1%%/*}" ;; esac; }
@@ -2364,10 +2396,15 @@ provider_of() { case "$1" in claude-sub) echo "claude" ;; codex-sub) echo "codex
 # in ~/.config/loom/env used to reach every model — and an opencode role has
 # `bash` and no OS sandbox, so a GLM implementer could `env` its way to the
 # DeepSeek and Moonshot keys (and a claude or codex leg to all three). A leg
-# gets its own vendor's variables and nothing from the others:
+# gets its own vendor's variables and nothing from the others (the `keep`
+# column of provider_field):
 #
-#   claude-sub   ANTHROPIC_* (a subscription login needs none; a gateway or
-#                ANTHROPIC_API_KEY the operator set on purpose still works)
+#   claude-sub   ANTHROPIC_*, CLAUDE_* (a subscription login needs no key; a
+#                gateway or ANTHROPIC_API_KEY the operator set on purpose still
+#                works, and so does CLAUDE_CODE_OAUTH_TOKEN — which is why
+#                CLAUDE_* is a provider prefix here: it used to reach every
+#                opencode and codex leg, matching neither `*api_key*` nor any
+#                prefix)
 #   codex-sub    OPENAI_*, CODEX_*
 #   zai*         ZHIPU_*, ZAI_*
 #   moonshotai   MOONSHOT_*
@@ -2379,27 +2416,25 @@ provider_of() { case "$1" in claude-sub) echo "claude" ;; codex-sub) echo "codex
 # passwords) is run_gate's, and applying it here could take away a credential a
 # CLI needs to log in — the rest of KNOWN-GAPS § 3 still stands.
 model_env_strip() { # model_env_strip <model-token> -> names to unset, one per line
-  local prov keep n
+  local prov keep drop p n
   prov="$(provider_of "$1")"
-  case "$prov" in
-    claude)          keep="anthropic_" ;;
-    codex)           keep="openai_ codex_" ;;
-    zai|zai-coding-plan) keep="zhipu_ zai_" ;;
-    moonshotai)      keep="moonshot_" ;;
-    deepseek)        keep="deepseek_" ;;
-    *)               keep="" ;;
-  esac
+  keep="$(provider_field "$prov" keep)"
+  # What is provider-shaped at all: the union of every provider's prefixes, so
+  # a prefix added to the table is dropped for every OTHER leg by that fact.
+  drop=""
+  for p in $(all_providers); do drop="$drop $(provider_field "$p" keep)"; done
   (
     shopt -s nocasematch
     while IFS= read -r n; do
       [ -n "$n" ] || continue
+      local k hit="" kept=""
       # `(pattern)` form: this runs inside `$( )` at the call site, and bash
       # 3.2 counts parens to find its end (see run_gate).
-      case "$n" in
-        (*api_key*|anthropic_*|openai_*|codex_*|zai_*|zhipu_*|moonshot_*|deepseek_*) ;;
-        (*) continue ;;
-      esac
-      local k kept=""
+      case "$n" in (*api_key*) hit=yes ;; esac
+      for k in $drop; do
+        case "$n" in ("$k"*) hit=yes ;; esac
+      done
+      [ -n "$hit" ] || continue
       for k in $keep; do
         case "$n" in ("$k"*) kept=yes ;; esac
       done
@@ -2455,21 +2490,35 @@ looks_rate_limited() { # looks_rate_limited <logfile>
 }
 
 # The reviewer's verdict is the LAST line of its review that starts with
-# `VERDICT:`, trailing whitespace and a CR (a CRLF transcript) stripped. Empty
-# when there is none.
+# `VERDICT:` — markdown emphasis in front of it allowed (`**VERDICT: APPROVE**`,
+# `**VERDICT:** APPROVE`, a backticked line), since a GPT- or Kimi-family
+# reviewer writes it that way as often as not, and `^VERDICT:` used to answer
+# "no VERDICT line" to an approval. Trailing whitespace and a CR (a CRLF
+# transcript) are stripped, and the emphasis that WRAPS the line is taken off;
+# what is inside is left alone, because this is the text `loom loop` pastes
+# into the task spec and `loom land` quotes back — a `snake_case` name in a
+# REVISE reason has to survive it. Empty when there is none.
 review_verdict() { # review_verdict <review-file>
-  grep '^VERDICT:' "$1" 2>/dev/null | tail -1 | sed 's/[[:space:]]*$//' || true
+  grep -E '^[[:space:]]*[*_`]*[[:space:]]*VERDICT:' "$1" 2>/dev/null | tail -1 \
+    | sed -E 's/[[:space:]]+$//; s/^[[:space:]]*[*_`]*[[:space:]]*//; s/[*_`]+$//; s/[[:space:]]+$//; s/^(VERDICT:[[:space:]]*)[*_`]+/\1/' || true
 }
 
-# APPROVE is that line and nothing else. It used to be a substring match
+# APPROVE is those two words and nothing else. It used to be a substring match
 # (`*APPROVE*`), and a reviewer writes that word inside a rejection as often as
 # not: `VERDICT: REVISE — cannot APPROVE until the tests exist` read as an
-# approval, and `loom loop` stopped there. Anything that is not exactly
-# `VERDICT: APPROVE` — REVISE, a typo, `APPROVED`, a trailing reason — is not an
-# approval. That is the direction to be wrong in: a false REVISE costs a round,
-# a false APPROVE lands a diff nobody accepted.
+# approval, and `loom loop` stopped there. Then it was the exact line, and that
+# cost a full review round for every `**VERDICT: APPROVE**` and every
+# `VERDICT: APPROVE.` — decoration, not disagreement. So the comparison takes
+# off what a markdown-minded reviewer wraps around the same two words: `*`,
+# `_` and backticks anywhere in the line, runs of blanks, one trailing period.
+# Anything that survives that and is still not `VERDICT: APPROVE` — REVISE, a
+# typo, `APPROVED`, a trailing reason, a trailing emoji — is not an approval.
+# That is the direction to be wrong in: a false REVISE costs a round, a false
+# APPROVE lands a diff nobody accepted.
 verdict_approves() { # verdict_approves <verdict-line>
-  [ "$1" = "VERDICT: APPROVE" ]
+  local v
+  v="$(printf '%s' "$1" | tr -d '*_\140' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//; s/\.$//; s/ $//')"
+  [ "$v" = "VERDICT: APPROVE" ] || [ "$v" = "VERDICT:APPROVE" ]
 }
 
 # Headless model calls read stdin for appended message input when it is a
@@ -4957,7 +5006,7 @@ run_gate() { # run_gate <worktree> [<logfile>]
         (*api_key*|*token*|*secret*|*password*|*passwd*|*auth*|*credential*|\
         *access_key*|*key_id*|*key*|*bearer*|*netrc*|*kubeconfig*|*cookie*|\
         *mnemonic*|*seed*|*passphrase*|*rsa*|\
-        aws_*|anthropic_*|openai_*|codex_*|opencode_*|zai_*|zhipu_*|deepseek_*|moonshot_*|stripe_*)
+        aws_*|anthropic_*|claude_*|openai_*|codex_*|opencode_*|zai_*|zhipu_*|deepseek_*|moonshot_*|stripe_*)
           printf '%s\n' "$n" ;;
       esac
     done < <(compgen -e 2>/dev/null || true)
@@ -6604,14 +6653,7 @@ cmd_tier() {
 }
 
 # -------------------------------------------------------------------- doctor
-models_endpoint() {
-  case "$1" in
-    zai)             echo "https://api.z.ai/api/paas/v4/models" ;;
-    zai-coding-plan) echo "https://api.z.ai/api/coding/paas/v4/models" ;;
-    moonshotai) echo "https://api.moonshot.ai/v1/models" ;;
-    deepseek)   echo "https://api.deepseek.com/models" ;;
-  esac
-}
+models_endpoint() { provider_field "$1" endpoint; }   # the table, see provider_field
 
 all_referenced_models() {
   local t r
@@ -6657,9 +6699,28 @@ cmd_doctor() {
   else
     note "no key file at $LOOM_ENV (loom sources it if present)"
   fi
-  [ -n "${ZHIPU_API_KEY:-}" ]    && pass "ZHIPU_API_KEY set (Z.ai)"      || note "ZHIPU_API_KEY not set (ZAI_API_KEY also accepted)"
-  [ -n "${MOONSHOT_API_KEY:-}" ] && pass "MOONSHOT_API_KEY set"          || note "MOONSHOT_API_KEY not set"
-  [ -n "${DEEPSEEK_API_KEY:-}" ] && pass "DEEPSEEK_API_KEY set"          || note "DEEPSEEK_API_KEY not set"
+  # One line per KEY (zai and zai-coding-plan share one), from the table.
+  local ptab_p ptab_kv ptab_seen="" ptab_alias ptab_bad=""
+  for ptab_p in $(key_providers); do
+    ptab_kv="$(provider_field "$ptab_p" keyvar)"
+    case " $ptab_seen " in (*" $ptab_kv "*) continue ;; esac
+    ptab_seen="$ptab_seen $ptab_kv"
+    ptab_alias=""; [ "$ptab_kv" = ZHIPU_API_KEY ] && ptab_alias=" (ZAI_API_KEY also accepted)"
+    if [ -n "$(key_for_provider "$ptab_p")" ]; then pass "$ptab_kv set ($ptab_p)"
+    else note "$ptab_kv not set$ptab_alias"; fi
+  done
+  # ... and the table itself: a provider with a key but no keep list would lose
+  # that key at launch, one with no endpoint gets no live check. This is the
+  # check that the four readers of the table used to have no way to make.
+  for ptab_p in $(all_providers); do
+    [ -n "$(provider_field "$ptab_p" keep)" ] || ptab_bad="$ptab_bad $ptab_p(keep)"
+  done
+  for ptab_p in $(key_providers); do
+    [ -n "$(provider_field "$ptab_p" keyvar)" ]   || ptab_bad="$ptab_bad $ptab_p(keyvar)"
+    [ -n "$(provider_field "$ptab_p" endpoint)" ] || ptab_bad="$ptab_bad $ptab_p(endpoint)"
+  done
+  if [ -z "$ptab_bad" ]; then pass "provider table complete ($(all_providers | wc -w | tr -d ' ') providers: key variable, keep list, endpoint)"
+  else fail "provider table incomplete —$ptab_bad (provider_field in bin/loom)"; fi
   [ -n "${ANTHROPIC_API_KEY:-}" ] && note "ANTHROPIC_API_KEY is set — this system never uses it; unset to be safe"
   if have codex; then
     local cauth="${CODEX_HOME:-$HOME/.codex}/auth.json"
