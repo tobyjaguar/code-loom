@@ -147,6 +147,11 @@ loom diff 0007-c                 # you read it
 loom land 0007-c                 # gate again, merge, clean up, tick the checkbox
 ```
 
+`loom land` refuses unless the review of that exact tip ends in
+`VERDICT: APPROVE` (the whole line, nothing after it). To overrule a REVISE
+deliberately: `loom land 0007-c --accept-verdict`. `--force` skips the gate, not
+the verdict.
+
 Tasks marked `HAND` in the plan you write yourself. That is deliberate —
 `loom plan` produces tutor-mode specs (contract + failing test + `todo!()`) for
 those, and the pre-commit hook enforces the boundary.

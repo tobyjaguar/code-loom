@@ -19,6 +19,8 @@
 #   loom diff  0007-c                  write the task diff, then show it (pager, or $LOOM_DIFF_CMD)
 #   loom land  0007-c                  gate, merge, clean up, tick the checkbox
 #   loom land  0007-c --pr             gate, push agent/0007-c, print PR next steps
+#   loom land  0007-c --accept-verdict ... even when the review did not end in
+#                                    exactly 'VERDICT: APPROVE' (you overrule it)
 #   loom drop  0007-c [--keep-branch]  discard worktree (and branch, unless kept)
 #   loom rebase 0007-c                 rebase the branch onto origin/main; re-point its diff base
 #   loom rebase 0007-c --accept-upstream   ... even when what arrives under the
@@ -2356,6 +2358,56 @@ key_for_provider() {
 
 provider_of() { case "$1" in claude-sub) echo "claude" ;; codex-sub) echo "codex" ;; *) echo "${1%%/*}" ;; esac; }
 
+# The provider credentials a model launch must NOT inherit: every exported name
+# that looks like a model-provider key, except the ones this model's own leg
+# authenticates with. Both env files are sourced under `set -a`, so every key
+# in ~/.config/loom/env used to reach every model — and an opencode role has
+# `bash` and no OS sandbox, so a GLM implementer could `env` its way to the
+# DeepSeek and Moonshot keys (and a claude or codex leg to all three). A leg
+# gets its own vendor's variables and nothing from the others:
+#
+#   claude-sub   ANTHROPIC_* (a subscription login needs none; a gateway or
+#                ANTHROPIC_API_KEY the operator set on purpose still works)
+#   codex-sub    OPENAI_*, CODEX_*
+#   zai*         ZHIPU_*, ZAI_*
+#   moonshotai   MOONSHOT_*
+#   deepseek     DEEPSEEK_*
+#
+# plus any other `*api_key*` name (GEMINI_API_KEY, OPENROUTER_API_KEY, ...)
+# dropped for every leg. Matched case-insensitively, like run_gate's list. It
+# is scoped to PROVIDER keys on purpose: a broader secret filter (tokens, AWS,
+# passwords) is run_gate's, and applying it here could take away a credential a
+# CLI needs to log in — the rest of KNOWN-GAPS § 3 still stands.
+model_env_strip() { # model_env_strip <model-token> -> names to unset, one per line
+  local prov keep n
+  prov="$(provider_of "$1")"
+  case "$prov" in
+    claude)          keep="anthropic_" ;;
+    codex)           keep="openai_ codex_" ;;
+    zai|zai-coding-plan) keep="zhipu_ zai_" ;;
+    moonshotai)      keep="moonshot_" ;;
+    deepseek)        keep="deepseek_" ;;
+    *)               keep="" ;;
+  esac
+  (
+    shopt -s nocasematch
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      # `(pattern)` form: this runs inside `$( )` at the call site, and bash
+      # 3.2 counts parens to find its end (see run_gate).
+      case "$n" in
+        (*api_key*|anthropic_*|openai_*|codex_*|zai_*|zhipu_*|moonshot_*|deepseek_*) ;;
+        (*) continue ;;
+      esac
+      local k kept=""
+      for k in $keep; do
+        case "$n" in ("$k"*) kept=yes ;; esac
+      done
+      [ -n "$kept" ] || printf '%s\n' "$n"
+    done < <(compgen -e 2>/dev/null || true)
+  )
+}
+
 # Roles that EDIT their working directory. `build` runs under your eye in your
 # own tree; `implementer` (which `loom loop`'s auto-fix rounds also go through)
 # owns one worktree. Everything else — reviewer, scout, architect — reads.
@@ -2402,6 +2454,24 @@ looks_rate_limited() { # looks_rate_limited <logfile>
   grep -qiE '429|rate[ _-]?limit|too many request|quota|overloaded|exhaust|usage limit|insufficient[ _-]?(balance|quota|credit)' "$1" 2>/dev/null
 }
 
+# The reviewer's verdict is the LAST line of its review that starts with
+# `VERDICT:`, trailing whitespace and a CR (a CRLF transcript) stripped. Empty
+# when there is none.
+review_verdict() { # review_verdict <review-file>
+  grep '^VERDICT:' "$1" 2>/dev/null | tail -1 | sed 's/[[:space:]]*$//' || true
+}
+
+# APPROVE is that line and nothing else. It used to be a substring match
+# (`*APPROVE*`), and a reviewer writes that word inside a rejection as often as
+# not: `VERDICT: REVISE — cannot APPROVE until the tests exist` read as an
+# approval, and `loom loop` stopped there. Anything that is not exactly
+# `VERDICT: APPROVE` — REVISE, a typo, `APPROVED`, a trailing reason — is not an
+# approval. That is the direction to be wrong in: a false REVISE costs a round,
+# a false APPROVE lands a diff nobody accepted.
+verdict_approves() { # verdict_approves <verdict-line>
+  [ "$1" = "VERDICT: APPROVE" ]
+}
+
 # Headless model calls read stdin for appended message input when it is a
 # non-TTY stream; a caller that keeps stdin open (CI, cron, another agent's
 # shell) therefore hangs the run forever in poll. Found live: `loom run` from a
@@ -2422,6 +2492,14 @@ run_headless() { # run_headless <role> <model> <workdir> <prompt> <logfile>
   # write-capable sandbox, rooted at $wd.
   local -a claude_flags=(-p)
   local -a cflags=(--sandbox read-only)
+  # Only this model's own provider credentials go with it (model_env_strip).
+  # `env -u` per launch, never `unset` here: loom itself still needs every key
+  # to decide what the NEXT attempt in the chain may use.
+  local -a keystrip=()
+  local _ks
+  while IFS= read -r _ks; do
+    [ -n "$_ks" ] && keystrip+=(-u "$_ks")
+  done < <(model_env_strip "$model")
   if writes_role "$role"; then
     claude_flags+=(--permission-mode acceptEdits)
     # acceptEdits pre-approves file edits, but a Bash call still asks — and a
@@ -2480,7 +2558,7 @@ not re-run." ;;
     fi
   fi
   if [ "$model" = claude-sub ]; then
-    ( cd "$wd" && claude "${claude_flags[@]}" \
+    ( cd "$wd" && env ${keystrip[0]+"${keystrip[@]}"} claude "${claude_flags[@]}" \
         --append-system-prompt "$(cat "$PROMPTS_DIR/$role.md")" \
         "$prompt" ) < /dev/null > "$log" 2>&1 || rc=$?
   elif [ "$model" = codex-sub ]; then
@@ -2492,7 +2570,7 @@ not re-run." ;;
     # sidecar and replaces the log on success. A failed run keeps the
     # transcript: looks_rate_limited reads it.
     last="$(mktemp "${TMPDIR:-/tmp}/loom-codex.XXXXXX")"
-    ( cd "$wd" && codex exec "${cflags[@]}" --skip-git-repo-check \
+    ( cd "$wd" && env ${keystrip[0]+"${keystrip[@]}"} codex exec "${cflags[@]}" --skip-git-repo-check \
         --output-last-message "$last" \
         "$(cat "$PROMPTS_DIR/$role.md")
 
@@ -2561,7 +2639,7 @@ $prompt" ) < /dev/null > "$log" 2>&1 || rc=$?
     # baseURL and a set of role prompts without any file `loom` looks at. It is
     # stripped from every launch — no caller wins this one, because there is no
     # way to tell the operator's inline config from an inherited one.
-    ( cd "$wd" && env -u OPENCODE_CONFIG_CONTENT "${ocenv[@]}" \
+    ( cd "$wd" && env -u OPENCODE_CONFIG_CONTENT ${keystrip[0]+"${keystrip[@]}"} "${ocenv[@]}" \
         opencode run --agent "$role" --model "$model" "$prompt" ) \
       < /dev/null > "$log" 2>&1 || rc=$?
   fi
@@ -5527,14 +5605,14 @@ cmd_loop() {
     hand_reconcile_history "$ROOT" "$base" "$PINNED_TIP"
     link_reconcile_history "$ROOT" "$base" "$PINNED_TIP"
     cmd_check "$task" ${passthru[0]+"${passthru[@]}"}
-    verdict="$(grep '^VERDICT:' "$review" 2>/dev/null | tail -1 || true)"
+    verdict="$(review_verdict "$review")"
     # No verdict line at all means a truncated or derailed review, not a
     # rejection — re-implementing on it would act on nothing.
     [ -n "$verdict" ] || die "no VERDICT line in $review — review truncated — re-run loom check $task"
-    case "$verdict" in
-      *APPROVE*) echo "loom: [loop] APPROVE after $i round(s) — next: loom diff $task && loom land $task"
-                 return 0 ;;
-    esac
+    if verdict_approves "$verdict"; then
+      echo "loom: [loop] APPROVE after $i round(s) — next: loom diff $task && loom land $task"
+      return 0
+    fi
     if [ "$i" -eq "$rounds" ]; then
       echo "loom: [loop] still REVISE after $rounds round(s) — escalating to the coordinator." >&2
       echo "loom: [loop] read $review, then fix the task spec by hand." >&2
@@ -5637,19 +5715,20 @@ cmd_diff() {
 
 cmd_land() {
   require_roots
-  local task="" force="" mode="${LOOM_LAND:-merge}" a
+  local task="" force="" accept_verdict="" mode="${LOOM_LAND:-merge}" a
   local wt br base plan title
   scan_fence_flag "$@"
   for a in ${FLAG_ARGS[0]+"${FLAG_ARGS[@]}"}; do
     case "$a" in
       --force)      force=yes ;;
+      --accept-verdict) accept_verdict=yes ;;
       --pr)         mode="pr" ;;
       --merge)      mode="merge" ;;
-      -*)           die "loom land: unknown flag '$a' — usage: loom land <task-id> [--fence-profile <name>] [--pr|--merge] [--force]" ;;
+      -*)           die "loom land: unknown flag '$a' — usage: loom land <task-id> [--fence-profile <name>] [--pr|--merge] [--force] [--accept-verdict]" ;;
       *)            if [ -z "$task" ]; then task="$a"; else die "loom land: unexpected argument '$a'"; fi ;;
     esac
   done
-  [ -n "$task" ] || die "usage: loom land <task-id> [--fence-profile <name>] [--pr|--merge] [--force]"
+  [ -n "$task" ] || die "usage: loom land <task-id> [--fence-profile <name>] [--pr|--merge] [--force] [--accept-verdict]"
   case "$mode" in merge|pr) ;; *) die "LOOM_LAND must be 'merge' or 'pr' (got '$mode')" ;; esac
   require_fence_flag "$task" land
   # The remote first, and only in --pr mode, because a re-aimed URL / refspec /
@@ -5706,6 +5785,30 @@ commits this would publish. Run it first:  loom check $task${FENCE_PROFILE:+ --f
   $br is now:      $PINNED_TIP
 Landing would publish commits nobody read. Re-run the review, then land:
   loom check $task${FENCE_PROFILE:+ --fence-profile $FENCE_PROFILE}"
+  # ... and what the reviewer SAID about it. The stamp above proves a review ran
+  # on this tip; it used to be the only thing checked, so a REVISE landed as
+  # readily as an APPROVE. The verdict is read from the operator's copy of the
+  # review, written by the same `loom check` that stamped `reviewed=` — never
+  # from the worktree's courtesy copy, which the agent can rewrite.
+  # `--accept-verdict` is the operator overruling the reviewer, and says so;
+  # `--force` skips the gate, not this.
+  local verdict review_file
+  review_file="$(state_artifact_dir "$task")/$task-review.md"
+  [ -f "$review_file" ] && [ ! -L "$review_file" ] || die "no operator copy of the review for $task at $review_file.
+The branch was stamped as reviewed, but the review itself is not there to read.
+Re-run the review, then land:  loom check $task${FENCE_PROFILE:+ --fence-profile $FENCE_PROFILE}"
+  verdict="$(review_verdict "$review_file")"
+  if ! verdict_approves "$verdict"; then
+    if [ -z "$accept_verdict" ]; then
+      die "the reviewer did not approve $task:
+  ${verdict:-(no VERDICT line in the review)}
+Read the review:  $review_file
+Fix it and re-review (loom loop $task, or loom run + loom check), or overrule
+the reviewer deliberately:  loom land $task --accept-verdict"
+    fi
+    echo "loom: WARNING — landing over the reviewer's verdict (--accept-verdict):" >&2
+    echo "loom:   ${verdict:-(no VERDICT line in the review)}" >&2
+  fi
   [ -n "$FENCE_PROFILE" ] && echo "loom: fence profile '$FENCE_PROFILE' — this diff may touch $FENCE_RELEASED"
   if [ -z "$force" ]; then
     echo "loom: running gate in worktree before landing"
@@ -6334,7 +6437,14 @@ file outside .agents/."
   local first; first="$(pick_model architect)"
   if [ "$first" = claude-sub ] && [ -z "$headless" ]; then
     echo "loom: architect on your Claude subscription (interactive). Ctrl-D to end."
-    claude --append-system-prompt "$(cat "$PROMPTS_DIR/architect.md")" "$prompt" \
+    # The same key scoping as run_headless. The architect's `loom scout` calls
+    # still reach the scout's provider: loom re-reads $LOOM_ENV on every start.
+    local -a keystrip=()
+    local _ks
+    while IFS= read -r _ks; do
+      [ -n "$_ks" ] && keystrip+=(-u "$_ks")
+    done < <(model_env_strip claude-sub)
+    env ${keystrip[0]+"${keystrip[@]}"} claude --append-system-prompt "$(cat "$PROMPTS_DIR/architect.md")" "$prompt" \
       || { echo "loom: claude exited non-zero — if rate-limited, try: eval \"\$(loom tier lean)\" && loom plan -p \"$topic\"" >&2; return 1; }
   else
     run_role architect "$ROOT" "$prompt"

@@ -1026,7 +1026,11 @@ Semantics:
   state — and only then *places* a copy in `.agents/reviews/` for the agent to
   read. That copy is 0600 too: `place_file` renames a `mktemp` into place, and
   0600 is mktemp's mode. `loom loop` takes its VERDICT, and the REVISE text it pastes into the
-  task spec, from that copy; `loom land` takes `reviewed` from the record. The
+  task spec, from that copy; `loom land` takes `reviewed` from the record, and
+  the verdict from the same operator copy. Only the exact line
+  `VERDICT: APPROVE` approves — a substring match read "REVISE — cannot APPROVE
+  until …" as an approval — and `loom land` refuses anything else unless the
+  operator passes `--accept-verdict` (`--force` skips the gate, not this). The
   tree being judged does not get to write what judges it.
 - **The gate `loom` acts on is the operator's.** `loom run` (green -> commit) and
   `loom land` (green -> merge/push) execute `<main checkout>/.agents/gate.sh`

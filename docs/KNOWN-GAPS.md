@@ -190,6 +190,26 @@ you, and a credential in a file the gate can read was never in scope. The
 comment above `run_gate` used to claim "every variable whose NAME looks like a
 credential"; it now says what the code does.
 
+**The model launches are the same class of fact, and narrower still.** Both
+env files are sourced under `set -a`, so every provider key in them used to be
+exported into EVERY model launch: a GLM implementer on opencode — `bash:
+allow`, no OS sandbox — could `env` its way to the DeepSeek and Moonshot keys,
+and a claude or codex leg to all of them. `run_headless` and the interactive
+`loom plan` now launch each model through `env -u` with `model_env_strip`: every
+exported name matching `*api_key*` or a provider prefix (`anthropic_`,
+`openai_`, `codex_`, `zai_`, `zhipu_`, `moonshot_`, `deepseek_`) is dropped
+except the ones that model's own leg authenticates with — `ANTHROPIC_*` for
+claude-sub, `OPENAI_*`/`CODEX_*` for codex-sub, `ZHIPU_*`/`ZAI_*`,
+`MOONSHOT_*` or `DEEPSEEK_*` for the matching opencode provider
+(`tests/fence-profiles.sh` (cz)). Be exact about what that is worth. It closes
+**inheritance**; it does not close **reading**: `$LOOM_ENV` (by default
+`~/.config/loom/env`) is a file in `$HOME`, and an opencode role with a shell,
+or a codex sandbox that can read the filesystem, can still `cat` it. It is
+also scoped to PROVIDER keys on purpose — the broader secret filter is the
+gate's, and applying it to a model launch could take away a credential a CLI
+logs in with — so an operator's `GITHUB_TOKEN` or `AWS_*` still reaches the
+model. Keeping keys out of a readable file is the fix this does not make.
+
 There used to be a second, `LOOM_BASE_REF`: the ref the security base was
 measured from, snapshotted before the file was sourced and restored after. That
 variable no longer exists. The base every history check uses is the **operator
