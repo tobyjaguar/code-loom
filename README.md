@@ -148,7 +148,10 @@ loom land 0007-c                 # gate again, merge, clean up, tick the checkbo
 ```
 
 `loom land` refuses unless the review of that exact tip ends in
-`VERDICT: APPROVE` (the whole line, nothing after it). To overrule a REVISE
+`VERDICT: APPROVE` — those two words and nothing else. Markdown emphasis
+around them and a trailing period are tolerated (`**VERDICT: APPROVE**`,
+`VERDICT: APPROVE.`), since some reviewers write it that way; `APPROVED`, a
+trailing reason, or a REVISE is not an approval. To overrule a REVISE
 deliberately: `loom land 0007-c --accept-verdict`. `--force` skips the gate, not
 the verdict.
 

@@ -117,7 +117,7 @@ cat > "$TMP/stubs/claude" << 'STUB'
 printf '%s\n' "$@" >> "${LOOM_TEST_TMP:?}/called-claude.log"
 # Which provider credentials this launch inherited, by NAME, for (cz): each
 # model leg must see its own vendor's keys and nobody else's.
-compgen -e | grep -iE 'api_key|^(anthropic|openai|codex|zai|zhipu|moonshot|deepseek)_' | sort | tr '\n' ' ' \
+compgen -e | grep -iE 'api_key|^(anthropic|claude|openai|codex|zai|zhipu|moonshot|deepseek)_' | sort | tr '\n' ' ' \
   > "${LOOM_TEST_TMP:?}/keys-claude.log"
 # A hostile first attempt, for the per-attempt reconcile test: widen the
 # worktree the harness just fenced, then look rate-limited so `loom` falls back
@@ -181,17 +181,22 @@ cat > "$TMP/stubs/codex" << 'STUB'
 printf '%s\n' "$@" >> "${LOOM_TEST_TMP:?}/called-codex.log"
 # Which provider credentials this launch inherited, by NAME, for (cz): each
 # model leg must see its own vendor's keys and nobody else's.
-compgen -e | grep -iE 'api_key|^(anthropic|openai|codex|zai|zhipu|moonshot|deepseek)_' | sort | tr '\n' ' ' \
+compgen -e | grep -iE 'api_key|^(anthropic|claude|openai|codex|zai|zhipu|moonshot|deepseek)_' | sort | tr '\n' ' ' \
   > "${LOOM_TEST_TMP:?}/keys-codex.log"
 echo "stub codex done"
 # The stub reviewer APPROVES unless a case says otherwise: `loom land` refuses
 # anything but `VERDICT: APPROVE`, and the cases that land are about something
 # else. LOOM_TEST_VERDICT sets the verdict for the cases about the verdict (and
 # for `loom loop`); LOOM_TEST_VERDICT=none prints no VERDICT line at all.
-case "${LOOM_TEST_VERDICT:-APPROVE}" in
-  none) ;;
-  *)    echo "VERDICT: ${LOOM_TEST_VERDICT:-APPROVE}" ;;
-esac
+# LOOM_TEST_VERDICT_RAW is the whole line, verbatim — for the cases about what
+# a markdown-minded reviewer wraps around the two words ((da), (db), (dc)).
+if [ -n "${LOOM_TEST_VERDICT_RAW:-}" ]; then printf '%s\n' "$LOOM_TEST_VERDICT_RAW"
+else
+  case "${LOOM_TEST_VERDICT:-APPROVE}" in
+    none) ;;
+    *)    echo "VERDICT: ${LOOM_TEST_VERDICT:-APPROVE}" ;;
+  esac
+fi
 exit 0
 STUB
 cat > "$TMP/stubs/opencode" << 'STUB'
@@ -199,15 +204,18 @@ cat > "$TMP/stubs/opencode" << 'STUB'
 printf '%s\n' "$@" >> "${LOOM_TEST_TMP:?}/called-opencode.log"
 # Which provider credentials this launch inherited, by NAME, for (cz): each
 # model leg must see its own vendor's keys and nobody else's.
-compgen -e | grep -iE 'api_key|^(anthropic|openai|codex|zai|zhipu|moonshot|deepseek)_' | sort | tr '\n' ' ' \
+compgen -e | grep -iE 'api_key|^(anthropic|claude|openai|codex|zai|zhipu|moonshot|deepseek)_' | sort | tr '\n' ' ' \
   > "${LOOM_TEST_TMP:?}/keys-opencode.log"
 # The same default verdict as the codex stub, when this launch is the reviewer.
 case " $* " in
   *" --agent reviewer "*)
-    case "${LOOM_TEST_VERDICT:-APPROVE}" in
-      none) ;;
-      *)    echo "VERDICT: ${LOOM_TEST_VERDICT:-APPROVE}" ;;
-    esac ;;
+    if [ -n "${LOOM_TEST_VERDICT_RAW:-}" ]; then printf '%s\n' "$LOOM_TEST_VERDICT_RAW"
+    else
+      case "${LOOM_TEST_VERDICT:-APPROVE}" in
+        none) ;;
+        *)    echo "VERDICT: ${LOOM_TEST_VERDICT:-APPROVE}" ;;
+      esac
+    fi ;;
 esac
 # The directory grant and the CONFIG are the things under test: record both
 # verbatim. opencode resolves its project config from the cwd, which is a
@@ -359,7 +367,8 @@ for t in 0001-a 0002-b 0003-c 0004-e 0006-g 0007-h 0008-k 0009-l 0010-m 0013-p \
          0117-cl 0118-cl2 0119-cm 0120-cm2 0121-cn 0122-cn2 \
          0123-cp 0124-cp2 0125-cq \
          0126-cr 0127-cr2 0128-cr3 0129-cr4 0130-cs 0131-ct 0132-ct2 0133-cu 0134-cv \
-         0135-cx 0136-cy 0137-cy2 0138-cz; do mk_task "$t"; done
+         0135-cx 0136-cy 0137-cy2 0138-cz \
+         0139-da 0140-da2 0141-da3 0142-db 0143-dc 0144-dc2; do mk_task "$t"; done
 mk_task 0040-ar  codex
 mk_task 0042-as  codex
 mk_task 0005-f codex
@@ -3782,6 +3791,7 @@ out="$(ZHIPU_API_KEY=FAKE-KEY DEEPSEEK_API_KEY=FAKE-KEY MY_SECRET=FAKE-KEY \
        NPM_CONFIG__AUTH=FAKE-KEY DOCKER_AUTH_CONFIG=FAKE-KEY PGPASSWORD=FAKE-KEY \
        GOOGLE_APPLICATION_CREDENTIALS=FAKE-KEY openai_api_key=FAKE-KEY \
        ID_RSA=FAKE-KEY MNEMONIC=FAKE-KEY BEARER=FAKE-KEY stripe_sk=FAKE-KEY \
+       CLAUDE_CODE_OAUTH_TOKEN=FAKE-KEY CLAUDE_CONFIG_DIR=FAKE-KEY \
        LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 \
        "$LOOM" run 0100-ce 2>&1)"; rc=$?
 want_eq "(ce) loom run reaches a green gate"                        "$rc" "0"
@@ -3798,6 +3808,10 @@ want_not_in "(ce) run: nor a *_PASSWORD"                            "$ce_run" "A
 # credential, and every one of them reached the gate.
 want_not_in "(ce) run: nor AWS_SECRET_ACCESS_KEY"                   "$ce_run" "AWS_SECRET_ACCESS_KEY="
 want_not_in "(ce) run: nor AWS_ACCESS_KEY_ID"                       "$ce_run" "AWS_ACCESS_KEY_ID="
+# `claude_` joined the provider prefixes with the model-launch strip (cz): the
+# OAuth token was already `*token*`, the config dir is the prefix rule itself.
+want_not_in "(ce) run: nor CLAUDE_CODE_OAUTH_TOKEN"                 "$ce_run" "CLAUDE_CODE_OAUTH_TOKEN="
+want_not_in "(ce) run: nor CLAUDE_CONFIG_DIR (claude_ is a provider prefix)" "$ce_run" "CLAUDE_CONFIG_DIR="
 want_not_in "(ce) run: nor NPM_CONFIG__AUTH"                        "$ce_run" "NPM_CONFIG__AUTH="
 want_not_in "(ce) run: nor DOCKER_AUTH_CONFIG"                      "$ce_run" "DOCKER_AUTH_CONFIG="
 want_not_in "(ce) run: nor PGPASSWORD"                              "$ce_run" "PGPASSWORD="
@@ -4650,6 +4664,11 @@ want_ne "(cg) the summary line counts three NUMBERS"      "$docsum" ""
 want_in "(cg) ... and the failures slot is a count, not a model" "$docsum" " 0 failures"
 want_eq "(cg) ... so doctor exits 0 when it says 0 failures" "$rc" "0"
 want_not_in "(cg) doctor never aborted on an unbound variable" "$out" "unbound variable"
+# One provider table (provider_field) feeds key_for_provider, model_env_strip,
+# models_endpoint and doctor; doctor is where a keyed provider missing a keep
+# list or an endpoint is reported, since that used to surface only as a launch
+# that "failed (not a rate limit)".
+want_in "(dd) doctor checks the provider table"           "$out" "provider table complete"
 
 # --- (cx) a REVISE that mentions APPROVE is not an approval -------------------
 # `loom loop` matched the verdict line as `*APPROVE*`, so the reviewer's own
@@ -4718,7 +4737,7 @@ out="$("$LOOM" new 0138-cz 2>&1)"; rc=$?
 want_eq "(cz) setup: a task"                                     "$rc" "0"
 rm -f "$TMP"/keys-*.log
 cz_env=(ZHIPU_API_KEY=FAKE-Z DEEPSEEK_API_KEY=FAKE-D MOONSHOT_API_KEY=FAKE-M
-        OPENAI_API_KEY=FAKE-O GEMINI_API_KEY=FAKE-G)
+        OPENAI_API_KEY=FAKE-O GEMINI_API_KEY=FAKE-G CLAUDE_CODE_OAUTH_TOKEN=FAKE-C)
 out="$(env "${cz_env[@]}" LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 \
        "$LOOM" run 0138-cz 2>&1)"; rc=$?
 want_eq "(cz) the claude implementer ran"                        "$rc" "0"
@@ -4729,12 +4748,16 @@ want_not_in "(cz) claude: no MOONSHOT_API_KEY"                   "$cz" "MOONSHOT
 want_not_in "(cz) claude: no OPENAI_API_KEY"                     "$cz" "OPENAI_API_KEY"
 want_not_in "(cz) claude: no other *_API_KEY either"             "$cz" "GEMINI_API_KEY"
 want_not_in "(cz) claude: the stub did record"                   "$cz" "MISSING"
+# The `claude` CLI logs in with this one; it matched neither `*api_key*` nor a
+# prefix, so every opencode and codex leg used to inherit it.
+want_in     "(cz) claude: keeps CLAUDE_CODE_OAUTH_TOKEN"           "$cz" "CLAUDE_CODE_OAUTH_TOKEN"
 out="$(env "${cz_env[@]}" LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0138-cz 2>&1)"; rc=$?
 cz="$(cat "$TMP/keys-codex.log" 2>/dev/null || echo MISSING)"
 want_in     "(cz) codex: keeps OPENAI_API_KEY"                   "$cz" "OPENAI_API_KEY"
 want_in     "(cz) codex: keeps CODEX_HOME"                       "$cz" "CODEX_HOME"
 want_not_in "(cz) codex: no ZHIPU_API_KEY"                       "$cz" "ZHIPU_API_KEY"
 want_not_in "(cz) codex: no DEEPSEEK_API_KEY"                    "$cz" "DEEPSEEK_API_KEY"
+want_not_in "(cz) codex: no CLAUDE_CODE_OAUTH_TOKEN"              "$cz" "CLAUDE_CODE_OAUTH_TOKEN"
 out="$(env "${cz_env[@]}" LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
        "$LOOM" scout "where is main" 2>&1)"; rc=$?
 cz="$(cat "$TMP/keys-opencode.log" 2>/dev/null || echo MISSING)"
@@ -4743,7 +4766,65 @@ want_not_in "(cz) opencode/deepseek: no ZHIPU_API_KEY"           "$cz" "ZHIPU_AP
 want_not_in "(cz) opencode/deepseek: no MOONSHOT_API_KEY"        "$cz" "MOONSHOT_API_KEY"
 want_not_in "(cz) opencode/deepseek: no OPENAI_API_KEY"          "$cz" "OPENAI_API_KEY"
 want_not_in "(cz) opencode/deepseek: no CODEX_HOME"              "$cz" "CODEX_HOME"
+want_not_in "(cz) opencode/deepseek: no CLAUDE_CODE_OAUTH_TOKEN"  "$cz" "CLAUDE_CODE_OAUTH_TOKEN"
 "$LOOM" drop 0138-cz > /dev/null 2>&1 || true
+
+# --- (da) emphasis or a period around APPROVE still approves -----------------
+# A GPT- or Kimi-family reviewer writes `**VERDICT: APPROVE**`, `**VERDICT:**
+# APPROVE` or `VERDICT: APPROVE.` as readily as the bare line. Under the exact
+# match each was "no VERDICT line" or a non-approval — safe, and a whole review
+# round lost to decoration. Each lands now; (db) is where the tolerance stops.
+for da_case in "0139-da|**VERDICT: APPROVE**" "0140-da2|**VERDICT:** APPROVE" "0141-da3|VERDICT: APPROVE."; do
+  da_task="${da_case%%|*}"; da_line="${da_case#*|}"
+  out="$("$LOOM" new "$da_task" 2>&1)"; rc=$?
+  want_eq "(da) setup: a task ($da_task)"                          "$rc" "0"
+  out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 "$LOOM" run "$da_task" 2>&1)"; rc=$?
+  want_eq "(da) setup: it runs and commits ($da_task)"             "$rc" "0"
+  out="$(LOOM_TEST_VERDICT_RAW="$da_line" LOOM_MODELS_reviewer="codex-sub" "$LOOM" check "$da_task" 2>&1)"; rc=$?
+  want_eq "(da) setup: the reviewer wrote '$da_line'"              "$rc" "0"
+  da_head="$(git rev-parse HEAD)"
+  out="$("$LOOM" land "$da_task" 2>&1)"; rc=$?
+  want_eq     "(da) '$da_line' lands"                              "$rc" "0"
+  want_not_in "(da) ... without the override warning"              "$out" "landing over the reviewer's verdict"
+  want_ne     "(da) ... and the merge happened"                    "$(git rev-parse HEAD)" "$da_head"
+done
+
+# --- (db) ... and the tolerance stops at the two words -----------------------
+out="$("$LOOM" new 0142-db 2>&1)"; rc=$?
+want_eq "(db) setup: a task"                                       "$rc" "0"
+out="$(LOOM_MODELS_implementer="claude-sub" LOOM_MAX_ATTEMPTS=1 "$LOOM" run 0142-db 2>&1)"; rc=$?
+want_eq "(db) setup: it runs and commits"                          "$rc" "0"
+db_head="$(git rev-parse HEAD)"
+for db_line in "VERDICT: APPROVE — looks good" "**VERDICT: APPROVED.**" "VERDICT: APPROVE ✅" \
+               "**VERDICT: REVISE** — cannot APPROVE, the error_path is untested"; do
+  out="$(LOOM_TEST_VERDICT_RAW="$db_line" LOOM_MODELS_reviewer="codex-sub" "$LOOM" check 0142-db 2>&1)"; rc=$?
+  want_eq   "(db) setup: the reviewer wrote '$db_line'"            "$rc" "0"
+  out="$("$LOOM" land 0142-db 2>&1)"; rc=$?
+  want_fail "(db) '$db_line' does not land"                        "$rc"
+  want_in   "(db) ... the reviewer did not approve"                "$out" "did not approve"
+done
+# The last one is a REVISE with a snake_case name in its reason: the refusal
+# quotes it, and the tolerance in the COMPARISON did not mangle the TEXT.
+want_in   "(db) the quoted REVISE keeps its reason intact"         "$out" "the error_path is untested"
+want_eq   "(db) nothing was merged by any of those"                "$(git rev-parse HEAD)" "$db_head"
+"$LOOM" drop 0142-db > /dev/null 2>&1 || true
+
+# --- (dc) the same two answers from loom loop --------------------------------
+out="$(LOOM_TEST_VERDICT_RAW="**VERDICT: REVISE** — cannot APPROVE until the tests exist" \
+       LOOM_LOOP_ROUNDS=1 LOOM_MAX_ATTEMPTS=1 \
+       LOOM_MODELS_implementer="claude-sub" LOOM_MODELS_reviewer="codex-sub" \
+       "$LOOM" loop 0143-dc 2>&1)"; rc=$?
+want_fail   "(dc) loom loop does not stop on a bold REVISE that mentions APPROVE" "$rc"
+want_not_in "(dc) ... it reports no approval"                      "$out" "APPROVE after"
+want_in     "(dc) ... it escalates it as a REVISE"                 "$out" "still REVISE"
+"$LOOM" drop 0143-dc > /dev/null 2>&1 || true
+out="$(LOOM_TEST_VERDICT_RAW="**VERDICT: APPROVE.**" \
+       LOOM_LOOP_ROUNDS=1 LOOM_MAX_ATTEMPTS=1 \
+       LOOM_MODELS_implementer="claude-sub" LOOM_MODELS_reviewer="codex-sub" \
+       "$LOOM" loop 0144-dc2 2>&1)"; rc=$?
+want_eq     "(dc) loom loop stops on a bold, period-terminated APPROVE" "$rc" "0"
+want_in     "(dc) ... and says so"                                 "$out" "APPROVE after 1 round"
+"$LOOM" drop 0144-dc2 > /dev/null 2>&1 || true
 
 echo ""
 echo "tests/fence-profiles.sh: $npass passed, $nfail failed"

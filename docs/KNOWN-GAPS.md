@@ -41,7 +41,7 @@ your environment.
 
 **What closes it.** `bin/loom:181` (`ROOT="$(cd "$(dirname "$_common")" …)"`,
 from `git rev-parse --git-common-dir` at `bin/loom:177`) and `bin/loom:206`
-(`AGENTS_DIR="$ROOT/.agents"`); the guard's own reads are `bin/loom:4072`
+(`AGENTS_DIR="$ROOT/.agents"`); the guard's own reads are `bin/loom:4121`
 onward. `$ROOT` is now the **main checkout** for every command:
 `git rev-parse --git-common-dir` answers `.git` from the main checkout and the
 absolute path of the main `.git` from a linked worktree, so its parent is the
@@ -87,7 +87,7 @@ own. That is not worth plugging: the entire hook is dominated by `git commit
 
 ## 2. `loom plan` runs the architect unfenced, in your own tree
 
-**Where.** `bin/loom:6450`, in `cmd_plan` (`bin/loom:6416`):
+**Where.** `bin/loom:6499`, in `cmd_plan` (`bin/loom:6465`):
 `run_role architect "$ROOT" "$prompt"` (and the
 interactive leg, `claude --append-system-prompt … "$prompt"`, likewise in
 `$ROOT`). The architect's chain at every tier ends in cheap third-party
@@ -170,8 +170,8 @@ variable whose NAME matches, **case-insensitively**, `*api_key*`, `*token*`,
 `*secret*`, `*password*`, `*passwd*`, `*auth*`, `*credential*`, `*access_key*`,
 `*key_id*`, `*key*`, `*bearer*`, `*netrc*`, `*kubeconfig*`, `*cookie*`,
 `*mnemonic*`, `*seed*`, `*passphrase*`, `*rsa*`, or a provider prefix (`aws_`,
-`anthropic_`, `openai_`, `codex_`, `opencode_`, `zai_`, `zhipu_`, `deepseek_`,
-`moonshot_`, `stripe_`) is dropped for the length of the gate (`run_gate`,
+`anthropic_`, `claude_`, `openai_`, `codex_`, `opencode_`, `zai_`, `zhipu_`,
+`deepseek_`, `moonshot_`, `stripe_`) is dropped for the length of the gate (`run_gate`,
 `env -u`). Round 17 widened that list from the four SUFFIXES it used to be
 (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`): the survivors it measured
 were `AWS_SECRET_ACCESS_KEY`, `AWS_ACCESS_KEY_ID`, `NPM_CONFIG__AUTH`,
@@ -197,11 +197,21 @@ allow`, no OS sandbox — could `env` its way to the DeepSeek and Moonshot keys,
 and a claude or codex leg to all of them. `run_headless` and the interactive
 `loom plan` now launch each model through `env -u` with `model_env_strip`: every
 exported name matching `*api_key*` or a provider prefix (`anthropic_`,
-`openai_`, `codex_`, `zai_`, `zhipu_`, `moonshot_`, `deepseek_`) is dropped
-except the ones that model's own leg authenticates with — `ANTHROPIC_*` for
-claude-sub, `OPENAI_*`/`CODEX_*` for codex-sub, `ZHIPU_*`/`ZAI_*`,
-`MOONSHOT_*` or `DEEPSEEK_*` for the matching opencode provider
-(`tests/fence-profiles.sh` (cz)). Be exact about what that is worth. It closes
+`claude_`, `openai_`, `codex_`, `zai_`, `zhipu_`, `moonshot_`, `deepseek_`) is
+dropped except the ones that model's own leg authenticates with —
+`ANTHROPIC_*`/`CLAUDE_*` for claude-sub, `OPENAI_*`/`CODEX_*` for codex-sub,
+`ZHIPU_*`/`ZAI_*`, `MOONSHOT_*` or `DEEPSEEK_*` for the matching opencode
+provider (`tests/fence-profiles.sh` (cz)). The prefixes, the key variable and
+the `/models` endpoint of each provider live in ONE table, `provider_field`,
+read by `key_for_provider`, `model_env_strip`, `models_endpoint` and
+`loom doctor` alike; they used to be four lists that agreed by hand, and a
+provider added to the first but not the second lost its own key at launch.
+`loom doctor` now fails on a keyed provider missing any field. `CLAUDE_*` is
+in the list because `CLAUDE_CODE_OAUTH_TOKEN` — a credential the `claude` CLI
+logs in with — matched neither `*api_key*` nor a prefix and reached every
+opencode and codex leg (measured on 2026-09-30: a Claude Code session's own
+`CLAUDE_CODE_MESSAGING_TOKEN` arrived in a GLM implementer's environment). Be
+exact about what that is worth. It closes
 **inheritance**; it does not close **reading**: `$LOOM_ENV` (by default
 `~/.config/loom/env`) is a file in `$HOME`, and an opencode role with a shell,
 or a codex sandbox that can read the filesystem, can still `cat` it. It is
@@ -302,7 +312,7 @@ that one form or the README changes with it.
 used to read "granted for the whole worktree root". It is not that any more;
 what is left is a confirmation.
 
-**Where.** `bin/loom:2593`, in `run_headless` (`bin/loom:2480`), the opencode leg:
+**Where.** `bin/loom:2642`, in `run_headless` (`bin/loom:2529`), the opencode leg:
 
 ```sh
 perm="$(printf '{"external_directory":{"%s/*":"allow","%s/**":"allow"}}' "$wd" "$wd")"
@@ -372,7 +382,7 @@ OPENCODE_CONFIG=$ROOT/.opencode/opencode.json     # (and OPENCODE_CONFIG_DIR)
 OPENCODE_DISABLE_PROJECT_CONFIG=1
 ```
 
-`run_headless`'s opencode leg (`bin/loom:2626`) sets the **disable
+`run_headless`'s opencode leg (`bin/loom:2675`) sets the **disable
 unconditionally**, on every opencode invocation — implementer, reviewer, scout
 and architect alike — and names the operator's config only when one exists.
 That is a round-4 correction: the disable used to be conditional on
@@ -437,9 +447,9 @@ closed from outside git; what follows is the boundary, drawn honestly.
 `require_recorded_config`); `bin/loom:1752` onward (the REPOSITORY baseline:
 `repo_config_file`, `repo_config_read`, `repo_config_write`,
 `repo_config_repin`, and `require_recorded_config_repo` at `bin/loom:1962`),
-read from `scout_root` (`bin/loom:6517`) and `cmd_plan`, written by
-`cmd_pin_config` (`bin/loom:6311`); `scout_mirror_config_check`
-(`bin/loom:6477`) for the one scope neither pin can cover; and the
+read from `scout_root` (`bin/loom:6566`) and `cmd_plan`, written by
+`cmd_pin_config` (`bin/loom:6360`); `scout_mirror_config_check`
+(`bin/loom:6526`) for the one scope neither pin can cover; and the
 `--no-ext-diff` / `--upload-pack=` / `--receive-pack=` spelled out at the diff,
 fetch and push call sites.
 
@@ -776,10 +786,10 @@ what that directory is. Cleaning it up is the operator's, by hand.
 generalises: it is the only directory in this system that loom writes to on the
 agent's side of the fence.
 
-**Where.** `reviews_dir` (`bin/loom:4230`), the write sites in `cmd_run`
+**Where.** `reviews_dir` (`bin/loom:4279`), the write sites in `cmd_run`
 (gate log), `cmd_check` (patch + review), `cmd_diff` (patch) and `cmd_loop`
 (the review text it appends to the task spec), the `--add-dir` sandbox root in
-`run_headless` (`bin/loom:2480`), and the pathspec in `wt_dirty`.
+`run_headless` (`bin/loom:2529`), and the pathspec in `wt_dirty`.
 
 **What it was.** `reviews_dir` was `mkdir -p "$wt/.agents/reviews"` and nothing
 else, and every caller then spelled the path out again. `mkdir -p` on a path
@@ -892,7 +902,7 @@ is gap 6's residual, and it is unchanged.
 asking the same question one level lower.
 
 **Where.** `place_file`, `resolve_under_wt`, `probe_agent_file`, `link_count`
-and `reviews_entries_plain` (`bin/loom:4485`), the write sites in `cmd_run`
+and `reviews_entries_plain` (`bin/loom:4534`), the write sites in `cmd_run`
 (the gate log, and the `-blocked.md` probe), `cmd_check` (patch + review),
 `cmd_diff` (patch) and `cmd_loop` (the append to `.agents/tasks/<task>.md`),
 the artifact copies at `state_artifact` (`bin/loom:2043`), and the pathspec in
@@ -966,7 +976,7 @@ the shape recurs: loom keeps directories of its own beside the task worktrees
 under `$LOOM_WORKTREES`, and a task id is a directory name there.
 
 **Where.** `state_file` (`bin/loom:628`), asked by `cmd_new` before anything is
-created (`bin/loom:4992`).
+created (`bin/loom:5041`).
 
 **What it was.** `_scout` is the shared scout mirror — one directory, reset,
 `clean -xdff`'d and re-fenced on every `loom scout`, deliberately under the
