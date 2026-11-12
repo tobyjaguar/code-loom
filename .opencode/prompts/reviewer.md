@@ -20,7 +20,8 @@ Check, in order:
    documented invariants beyond what the plan allows?
 
 Be concrete and terse; cite file:line for every finding. Do not restate the
-diff or praise the code. End with exactly one final line:
+diff or praise the code. End with exactly one final line, as plain text — no
+markdown emphasis around it, no trailing period:
 VERDICT: APPROVE
 or
 VERDICT: REVISE — <one-line reason>

@@ -147,6 +147,14 @@ loom diff 0007-c                 # you read it
 loom land 0007-c                 # gate again, merge, clean up, tick the checkbox
 ```
 
+`loom land` refuses unless the review of that exact tip ends in
+`VERDICT: APPROVE` — those two words and nothing else. Markdown emphasis
+around them and a trailing period are tolerated (`**VERDICT: APPROVE**`,
+`VERDICT: APPROVE.`), since some reviewers write it that way; `APPROVED`, a
+trailing reason, or a REVISE is not an approval. To overrule a REVISE
+deliberately: `loom land 0007-c --accept-verdict`. `--force` skips the gate, not
+the verdict.
+
 Tasks marked `HAND` in the plan you write yourself. That is deliberate —
 `loom plan` produces tutor-mode specs (contract + failing test + `todo!()`) for
 those, and the pre-commit hook enforces the boundary.
@@ -268,6 +276,14 @@ particular, a fenced path the build needs will break the build in the worktree.
 `loom zone <path>` reports fencing, and `loom doctor` warns about fence patterns
 that match no tracked file. Both are repo-wide, not task-scoped: they always
 report the whole `[fence]`, never one task's relaxation of it.
+
+Every role loom launches in a task worktree gets the fence it has just
+re-applied stated at the top of its prompt (`LOOM-DISPATCH: role=… (fence: N
+pattern(s) …)`). If your `AGENTS.md` tells agents to run `loom doctor` before
+working, let a dispatched role rely on that line instead. A read-only reviewer
+(codex `--sandbox read-only`) cannot run doctor at all, because doctor writes
+temp files. A role that ran doctor would only re-count the main checkout's
+`zones.toml` anyway, not check its own worktree.
 
 #### Fence profiles
 
