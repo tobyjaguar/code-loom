@@ -91,7 +91,7 @@ own. That is not worth plugging: the entire hook is dominated by `git commit
 `run_role architect "$ROOT" "$prompt"` (and the
 interactive leg, `claude --append-system-prompt … "$prompt"`, likewise in
 `$ROOT`). The architect's chain at every tier ends in cheap third-party
-providers — `zai-coding-plan/glm-5.3`, `moonshotai/kimi-k2.5`,
+providers — `zai-coding-plan/glm-5.3`, `moonshotai/kimi-k2.7-code`,
 `deepseek/deepseek-v4-pro` — and none of the fence machinery is on this path:
 no worktree, no sparse checkout, no `fence_reconcile`.
 

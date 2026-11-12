@@ -145,7 +145,7 @@ without them disarms the checks that judge the agent.
 ## 2. The chains for a profiled task — per command, not in `loom.env`
 
 The default implementer chain is GLM/DeepSeek/Kimi and the default reviewer
-chain is `codex-sub moonshotai/kimi-k2.5 deepseek/deepseek-v4-pro
+chain is `codex-sub moonshotai/kimi-k2.7-code deepseek/deepseek-v4-pro
 zai-coding-plan/glm-5.3`. **Neither is usable under this profile**, and that is
 the point: `loom` walks the WHOLE chain, not the first entry, because a fallback
 fires on a rate limit without asking anyone. A rate-limited Codex falling
