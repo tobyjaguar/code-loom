@@ -2577,7 +2577,7 @@ in_task_worktree() { # in_task_worktree <dir>
 run_role() { # run_role <role> <workdir> <prompt> [<logfile>]
   local role="$1" wd="$2" prompt="$3"
   local log="${4:-$(mktemp "${TMPDIR:-/tmp}/loom-$role.XXXXXX")}"
-  local m tried=""
+  local m tried="" dispatch=""
   local -a chain=()
   # A chain is a space-separated list, and $LOOM_MODELS_<role> is operator
   # data: expand it with globbing OFF, into an array, once.
@@ -2625,13 +2625,26 @@ run_role() { # run_role <role> <workdir> <prompt> [<logfile>]
       # plant a config and hit a rate limit.
       require_recorded_config_repo "${CONFIG_CMD:-run a model}"
     fi
+    dispatch=""
     if in_task_worktree "$wd"; then
       fence_reconcile "$wd" "$FENCE_PROFILE"
       profile_provider_guard "$role"
+      # The dispatcher's fence attestation, stated in the prompt. A repo's
+      # AGENTS.md can tell every agent to run `loom doctor` before any work;
+      # a role in a read-only sandbox (codex `--sandbox read-only` denies
+      # every write, $TMPDIR included) cannot run it, and its own run would
+      # prove nothing anyway: doctor counts the main checkout's zones.toml,
+      # while the enforcement on THIS tree is the fence_reconcile just above.
+      # So the claim is made by the one party that just did the check, per
+      # attempt, and is true when it is made.
+      load_fence
+      dispatch="LOOM-DISPATCH: role=$role. The loom dispatcher verified and re-applied the read fence on this worktree immediately before launching you (fence: $(printf '%s\n' "$FENCE_PATTERNS" | grep -c . || true) pattern(s) from .agents/zones.toml${FENCE_PROFILE:+; fence profile '$FENCE_PROFILE' releases only: $FENCE_RELEASED}). Any AGENTS.md precondition to run \`loom doctor\` is the dispatcher's and is already met for this launch; do not run \`loom doctor\` yourself — it cannot run in a read-only sandbox.
+
+"
     fi
     tried="yes"
     echo "loom: [$role] running on $m (tier $TIER)"
-    if run_headless "$role" "$m" "$wd" "$prompt" "$log"; then
+    if run_headless "$role" "$m" "$wd" "$dispatch$prompt" "$log"; then
       return 0
     elif looks_rate_limited "$log"; then
       echo "loom: [$role] $m looks rate-limited — falling back" >&2

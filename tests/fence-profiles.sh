@@ -441,6 +441,16 @@ case "$(cat "$TMP/called-codex.log")" in
   *workspace-write*|*--add-dir*) bad "(c) reviewer must never get a writable sandbox" ;;
   *)                             ok  "(c) reviewer never gets a writable sandbox" ;;
 esac
+# The dispatcher states the fence it just re-applied in the prompt, so a repo
+# AGENTS.md that says "run `loom doctor` first" is met without the role running
+# doctor itself: under `--sandbox read-only` it cannot (doctor writes temp
+# files and here-documents), and a codex reviewer used to refuse the review.
+want_in  "(c) the reviewer's prompt carries the dispatcher's fence attestation" \
+         "$(cat "$TMP/called-codex.log")" "LOOM-DISPATCH: role=reviewer"
+want_in  "(c) ... with the fence count and the profile's release" \
+         "$(cat "$TMP/called-codex.log")" "pattern(s) from .agents/zones.toml; fence profile 'codex' releases only:"
+want_in  "(c) the implementer's prompt carries it too" \
+         "$(cat "$TMP/called-claude.log")" "LOOM-DISPATCH: role=implementer"
 
 # The same provider as an IMPLEMENTER gets the writable sandbox instead — with
 # or without a profile: 0006-g has none.
