@@ -4768,7 +4768,7 @@ want_in     "(cz) codex: keeps CODEX_HOME"                       "$cz" "CODEX_HO
 want_not_in "(cz) codex: no ZHIPU_API_KEY"                       "$cz" "ZHIPU_API_KEY"
 want_not_in "(cz) codex: no DEEPSEEK_API_KEY"                    "$cz" "DEEPSEEK_API_KEY"
 want_not_in "(cz) codex: no CLAUDE_CODE_OAUTH_TOKEN"              "$cz" "CLAUDE_CODE_OAUTH_TOKEN"
-out="$(env "${cz_env[@]}" LOOM_MODELS_scout="deepseek/deepseek-v4-flash" \
+out="$(env "${cz_env[@]}" LOOM_MODELS_scout="deepseek/deepseek-flash" \
        "$LOOM" scout "where is main" 2>&1)"; rc=$?
 cz="$(cat "$TMP/keys-opencode.log" 2>/dev/null || echo MISSING)"
 want_in     "(cz) opencode/deepseek: keeps DEEPSEEK_API_KEY"     "$cz" "DEEPSEEK_API_KEY"
