@@ -147,6 +147,14 @@ loom diff 0007-c                 # you read it
 loom land 0007-c                 # gate again, merge, clean up, tick the checkbox
 ```
 
+`loom land` refuses unless the review of that exact tip ends in
+`VERDICT: APPROVE` — those two words and nothing else. Markdown emphasis
+around them and a trailing period are tolerated (`**VERDICT: APPROVE**`,
+`VERDICT: APPROVE.`), since some reviewers write it that way; `APPROVED`, a
+trailing reason, or a REVISE is not an approval. To overrule a REVISE
+deliberately: `loom land 0007-c --accept-verdict`. `--force` skips the gate, not
+the verdict.
+
 Tasks marked `HAND` in the plan you write yourself. That is deliberate —
 `loom plan` produces tutor-mode specs (contract + failing test + `todo!()`) for
 those, and the pre-commit hook enforces the boundary.
